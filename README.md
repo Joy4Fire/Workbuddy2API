@@ -55,6 +55,20 @@ cd frontend
 pnpm dev        # 起 Vite dev server（端口 5173），API 已代理到后端 8787
 ```
 
+## 首次使用（clone 之后）
+
+**数据库不随仓库上传**（含账号凭证、应用 Key 密钥、使用记录等敏感数据，不应进公开仓库）。
+首次启动时会**自动初始化**：创建 `data/` 目录、建表（`accounts`/`apps`/`usage_logs` 等）、生成应用 Key 加密主密钥（`data/.secret_key`）。**无需手动建库**。
+
+clone 后按以下步骤开始使用：
+
+1. **启动**（见上方「快速开始」），打开 `http://127.0.0.1:8787`
+2. **添加账号**：在「账号」页上传本地 auth 文件，或点「扫码登录」用 WorkBuddy/CodeBuddy 手机扫码（也可命令行 `--login`）
+3. **创建应用 Key**：在「应用」页创建一个 API Key（`sk-...`），用于访问 `/v1/*` 推理端点
+4. **调用 API**：用上一步的应用 Key 作为 `Authorization: Bearer <sk-...>` 访问 `/v1/chat/completions`、`/v1/models` 等
+
+> **注意**：`/v1/*` 端点**始终要求应用 Key**（在 WebUI「应用」页创建），不依赖 `API_KEY` 环境变量——这样每条使用记录都能追溯到具体应用。
+
 ## 配置
 
 可通过环境变量覆盖，或复制为 `.env`：
@@ -63,7 +77,6 @@ pnpm dev        # 起 Vite dev server（端口 5173），API 已代理到后端 
 |---|---|---|
 | `HOST` | `127.0.0.1` | 监听地址 |
 | `PORT` | `8787` | 监听端口 |
-| `API_KEY` | 空 | 对外 API 鉴权（`sk-` Key）。为空则不鉴权 |
 | `ADMIN_TOKEN` | 空 | 管理接口/WebUI 鉴权 Token。为空仅允许本机回环访问 |
 | `AUTH_DIR` | 自动 | 本地 auth 文件目录（留空自动探测） |
 | `DB_PATH` | `data/workbuddy.db` | SQLite 数据库文件 |

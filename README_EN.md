@@ -55,6 +55,25 @@ cd frontend
 pnpm dev        # starts Vite dev server (port 5173), API proxied to backend 8787
 ```
 
+## First Run (after clone)
+
+**The database is not uploaded with the repo** (it holds credentials, encrypted app keys, usage logs —
+sensitive data that must not go into a public repo). On first start the server **auto-initializes**:
+it creates the `data/` dir, tables (`accounts`/`apps`/`usage_logs` etc.) and the app-key master key
+(`data/.secret_key`). **No manual DB setup needed.**
+
+After cloning:
+
+1. **Start** (see Quick Start) and open `http://127.0.0.1:8787`
+2. **Add an account**: on the Accounts page upload a local auth file, or scan the QR with the
+   WorkBuddy/CodeBuddy mobile app (or run `--login` on the CLI)
+3. **Create an app key**: on the Apps page create an API key (`sk-...`) to use the `/v1/*` endpoints
+4. **Call the API**: use that app key as `Authorization: Bearer <sk-...>` for
+   `/v1/chat/completions`, `/v1/models`, etc.
+
+> **Note**: `/v1/*` endpoints **always require an app key** (created in the WebUI Apps page) — they do
+> not depend on the `API_KEY` env var, so every usage record can be traced to a specific app.
+
 ## Configuration
 
 Set via environment variables, or copy as `.env`:
@@ -63,7 +82,6 @@ Set via environment variables, or copy as `.env`:
 |---|---|---|
 | `HOST` | `127.0.0.1` | Listen address |
 | `PORT` | `8787` | Listen port |
-| `API_KEY` | empty | Auth for external `/v1/*` API (`sk-` key). Empty = no auth |
 | `ADMIN_TOKEN` | empty | Auth token for admin API / WebUI. Empty = loopback-only |
 | `AUTH_DIR` | auto | Local auth file dir (auto-detected when empty) |
 | `DB_PATH` | `data/workbuddy.db` | SQLite database file |
