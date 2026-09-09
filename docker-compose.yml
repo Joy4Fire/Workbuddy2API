@@ -1,0 +1,29 @@
+version: "3.8"
+
+services:
+  workbuddy2api:
+    build: .
+    container_name: workbuddy2api
+    ports:
+      - "8787:8787"
+    environment:
+      - HOST=0.0.0.0
+      - PORT=8787
+      # 下面按需填写；不填则 admin 不鉴权、API 不鉴权
+      - API_KEY=${API_KEY:-}
+      - ADMIN_TOKEN=${ADMIN_TOKEN:-}
+      # 认证目录（挂载宿主机 CodeBuddy auth 或本项目的 auths）
+      - AUTH_DIR=/app/auths
+      - DB_PATH=/app/data/workbuddy.db
+      # 签到 / 额度刷新
+      - CHECKIN_HOURS=9,21
+      - CREDIT_REFRESH_MIN=30
+      # 增强
+      - DESENSITIZE=1
+      - RATELIMIT=1
+      - RATELIMIT_INTERVAL=1.5
+    volumes:
+      - ./data:/app/data
+      # 如需读取宿主机桌面端 auth：取消注释并调整路径
+      # - "$LOCALAPPDATA/CodeBuddyExtension/Data/Public/auth:/app/auths:ro"
+    restart: unless-stopped

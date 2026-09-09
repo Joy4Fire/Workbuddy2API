@@ -1,0 +1,27 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+.uv-cache/
+
+# 运行时数据
+data/
+*.db
+*.db-wal
+*.db-shm
+auths/
+
+# 环境配置
+.env
+
+# 前端构建
+frontend/node_modules/
+frontend/dist/
+frontend/.pnpm-store/
+
+# 系统
+.DS_Store
+Thumbs.db
+.tmp/
