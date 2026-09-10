@@ -220,6 +220,35 @@ function short(s: string | null | undefined, n = 8) {
   return str.length > n ? str.slice(0, n) + '…' : (str || '-')
 }
 
+// 积分到期倒计时（秒时间戳 → "x 天后 / 今天到期 / 已到期 / -"）
+function expiryText(ts: number | null | undefined): string {
+  if (!ts) return '-'
+  const diffDays = (ts - Date.now() / 1000) / 86400
+  if (diffDays <= 0) return '已到期'
+  if (diffDays < 1) return '今天到期'
+  if (diffDays < 30) return `${Math.ceil(diffDays)} 天后`
+  return `${Math.round(diffDays / 30)} 个月后`
+}
+function expiryColor(ts: number | null | undefined): string {
+  if (!ts) return ''
+  const diffDays = (ts - Date.now() / 1000) / 86400
+  if (diffDays <= 3) return '#ef4444'
+  if (diffDays <= 7) return '#f59e0b'
+  return '#4ade80'
+}
+
+// 优先级编辑
+const editingPriority = ref<Record<string, number>>({})
+async function savePriority(acc: AccountInfo) {
+  const val = Math.max(0, Math.min(100, Math.round(editingPriority.value[acc.uid] ?? acc.priority ?? 0)))
+  editingPriority.value[acc.uid] = val
+  try {
+    await api.setPriority(acc.uid, val)
+    message.success(`已设置优先级 ${val}`)
+    load()
+  } catch { /* 拦截器已提示 */ }
+}
+
 onMounted(() => {
   load()
   timer = setInterval(load, REFRESH_MS)
@@ -290,6 +319,28 @@ onUnmounted(() => {
         </a-table-column>
         <a-table-column title="额度总量" data-index="credits_total" key="credits_total" :width="90">
           <template #default="{ record }">{{ record.credits_total ?? '-' }}</template>
+        </a-table-column>
+        <a-table-column title="积分到期" key="expiry" :width="110">
+          <template #default="{ record }">
+            <a-tooltip v-if="record.credits_expire_at" :title="new Date(record.credits_expire_at * 1000).toLocaleString()">
+              <span :style="{ color: expiryColor(record.credits_expire_at), fontWeight: 600 }">{{ expiryText(record.credits_expire_at) }}</span>
+            </a-tooltip>
+            <span v-else>-</span>
+          </template>
+        </a-table-column>
+        <a-table-column title="优先级" key="priority" :width="150">
+          <template #default="{ record }">
+            <a-input-number
+              :value="editingPriority[record.uid] ?? record.priority ?? 0"
+              :min="0"
+              :max="100"
+              :step="1"
+              size="small"
+              style="width: 90px"
+              @change="(v: number | null) => { editingPriority[record.uid] = v ?? 0 }"
+            />
+            <a-button size="small" type="link" style="padding: 0 4px" @click="savePriority(record)">保存</a-button>
+          </template>
         </a-table-column>
         <a-table-column title="失败数" data-index="failure_count" key="failure_count" :width="70" />
         <a-table-column title="操作" key="action" :width="150">

@@ -15,7 +15,6 @@ from datetime import datetime
 import httpx
 
 from .config import config
-
 # 官方计费商品码（逆向自 Electron 客户端 app.asar）。#97550 重构后按码集分派：
 # 付费包走 paid-packages、免费/赠送/体验包走 free-packages；PackageCodes 为必填。
 PAID_PACKAGE_CODES = [
@@ -81,10 +80,16 @@ def _extract_accounts(data: dict) -> list:
     return []
 
 
-def _summarize(accounts: list) -> tuple[float, float]:
-    """汇总 Accounts 的剩余/总量积分（兼容周期容量与普通容量字段）。"""
+def _summarize(accounts: list) -> tuple[float, float, float | None]:
+    """汇总 Accounts 的剩余/总量积分（兼容周期容量与普通容量字段），并提取最早到期时间。
+
+    返回 (remain, total, expire_at)：expire_at 为最早到期时间戳（秒），无则 None。
+    到期时间来源：CycleEndTime（"YYYY-MM-DD HH:MM:SS"）、ExpiredTime（同上）、
+    DeductionEndTime（毫秒时间戳）。取该账号所有包中「最早的到期时间」。
+    """
     remain = 0.0
     total = 0.0
+    earliest: float | None = None
     for acct in accounts:
         if not isinstance(acct, dict):
             continue
@@ -103,7 +108,26 @@ def _summarize(accounts: list) -> tuple[float, float]:
         else:
             remain += max(cap_remain, 0.0)
             total += cap_size
-    return remain, total
+        # 到期时间：取本包最早到期
+        for key, is_ms in (("CycleEndTime", False), ("ExpiredTime", False), ("DeductionEndTime", True)):
+            raw = acct.get(key)
+            ts = _parse_ts(raw, is_ms)
+            if ts is not None and (earliest is None or ts < earliest):
+                earliest = ts
+    return remain, total, earliest
+
+
+def _parse_ts(raw, is_ms: bool) -> float | None:
+    """解析到期时间：毫秒时间戳直接转秒；'YYYY-MM-DD HH:MM:SS' 字符串转时间戳。失败返回 None。"""
+    if raw is None or raw == "":
+        return None
+    try:
+        if is_ms:
+            return float(raw) / 1000.0
+        dt = datetime.strptime(str(raw).strip(), "%Y-%m-%d %H:%M:%S")
+        return dt.timestamp()
+    except (TypeError, ValueError):
+        return None
 
 
 def _num(v) -> float:
@@ -151,8 +175,8 @@ async def _fetch_new_credits(mgr) -> dict | None:
         return None
     if not accounts:
         return None
-    remain, total = _summarize(accounts)
-    return {"remain": round(remain), "total": round(total)}
+    remain, total, expire_at = _summarize(accounts)
+    return {"remain": round(remain), "total": round(total), "expire_at": expire_at}
 
 
 async def _fetch_old_credits(mgr) -> dict | None:
@@ -173,14 +197,15 @@ async def _fetch_old_credits(mgr) -> dict | None:
     accounts = _extract_accounts(j)
     if not accounts:
         return None
-    remain, total = _summarize(accounts)
-    return {"remain": round(remain), "total": round(total)}
+    remain, total, expire_at = _summarize(accounts)
+    return {"remain": round(remain), "total": round(total), "expire_at": expire_at}
 
 
 async def fetch_credits(mgr) -> dict:
-    """查询账号当前可花费积分余额，返回 {remain, total}。
+    """查询账号当前可花费积分余额，返回 {remain, total, expire_at}。
 
     优先新三接口；新接口不可用时降级旧接口；两者都失败则抛异常。
+    expire_at 为最早到期时间戳（秒），可能为 None。
     """
     res = await _fetch_new_credits(mgr)
     if res is not None:

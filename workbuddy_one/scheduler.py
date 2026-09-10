@@ -99,14 +99,17 @@ class Scheduler:
         for acc in self.pool.accounts:
             try:
                 res = await billing.fetch_credits(acc.mgr)
-                self.pool.set_credits(acc.uid, res["remain"], res["total"])
+                self.pool.set_credits(acc.uid, res["remain"], res["total"], res.get("expire_at"))
                 # 持久化最近额度到 DB，进程重启后可恢复（避免额度盲区）
                 if self.db:
-                    self.db.set_account_state(acc.uid, credits_remaining=res["remain"], credits_total=res["total"])
+                    self.db.set_account_state(acc.uid, credits_remaining=res["remain"],
+                                              credits_total=res["total"],
+                                              credits_expire_at=res.get("expire_at"))
                 # 余额 > 0 的冷却账号自动解冻（参考 Sliverkiss ReenableIfCredits）
                 if res["remain"] > 0:
                     self.pool.clear_cooldown(acc.uid, enabled=True)
-                logger.info("额度 %s: remain=%s total=%s", acc.uid, res["remain"], res["total"])
+                logger.info("额度 %s: remain=%s total=%s expire=%s", acc.uid, res["remain"],
+                            res["total"], res.get("expire_at"))
             except Exception as e:  # noqa: BLE001
                 logger.warning("额度查询失败 %s: %s", acc.uid, e)
 

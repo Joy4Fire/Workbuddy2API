@@ -70,12 +70,53 @@ class TestPool(unittest.TestCase):
             a.credits_remaining = 100
         return AccountPool({a.uid: a for a in accounts})
 
-    def test_round_robin(self):
+    def test_weighted_distribution(self):
         pool = self._pool()
-        picked = [pool.pick().uid for _ in range(3)]
-        # round-robin 覆盖所有账号各一次（起始索引从 1 开始，顺序可能为 b,c,a）
-        self.assertEqual(sorted(picked), ["a", "b", "c"])
+        # 同权重：多次 pick 应覆盖到全部账号（加权随机虽不保证严格轮换，但不该只选一个）
+        picked = [pool.pick().uid for _ in range(30)]
         self.assertEqual(len(set(picked)), 3)
+        # 每个账号占比应落在 (5%, 75%) 区间（同权重下不该有账号被完全饿死或垄断）
+        from collections import Counter
+        cnt = Counter(picked)
+        for uid in ("a", "b", "c"):
+            self.assertTrue(0.05 < cnt[uid] / len(picked) < 0.75, f"{uid} 占比异常: {cnt}")
+
+    def test_expiry_prioritized(self):
+        # 到期紧迫度：快到期账号进入硬性优先池，应显著优先被选
+        from workbuddy_one.pool import AccountPool
+        import time
+        now = time.time()
+        pool = AccountPool({})
+        pool.add_account("far", None)
+        pool.add_account("soon", None)
+        far = next(a for a in pool.accounts if a.uid == "far")
+        soon = next(a for a in pool.accounts if a.uid == "soon")
+        far.credits_remaining = 1000; far.credits_total = 1000; far.credits_expire_at = now + 90 * 86400
+        soon.credits_remaining = 1000; soon.credits_total = 1000; soon.credits_expire_at = now + 1 * 86400
+        # 快到期账号应为硬性优先（阶段1只在快到期池选）
+        from collections import Counter
+        cnt = Counter(pool.pick().uid for _ in range(100))
+        self.assertEqual(cnt.get("soon", 0), 100, f"到期硬性优先未生效: {cnt}")
+        # 权重比：快到期 E=8 vs 长期 E=1（其他因子相同）
+        w_soon = pool._weight(soon, now)
+        w_far = pool._weight(far, now)
+        self.assertAlmostEqual(w_soon / w_far, 8.0, delta=0.01)
+
+    def test_priority_weight(self):
+        from workbuddy_one.pool import AccountPool
+        import time
+        now = time.time()
+        pool = AccountPool({})
+        pool.add_account("low", None)
+        pool.add_account("high", None)
+        low = next(a for a in pool.accounts if a.uid == "low")
+        high = next(a for a in pool.accounts if a.uid == "high")
+        low.credits_remaining = 100; low.credits_total = 100; low.priority = 0
+        high.credits_remaining = 100; high.credits_total = 100; high.priority = 3
+        w_high = pool._weight(high, now)
+        w_low = pool._weight(low, now)
+        # priority=3 → (1+3)=4 倍
+        self.assertAlmostEqual(w_high / w_low, 4.0, delta=0.01)
 
     def test_failure_cooldown(self):
         pool = self._pool()

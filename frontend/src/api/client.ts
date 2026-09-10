@@ -52,6 +52,8 @@ export const api = {
   accounts: () => http.get<unknown, { accounts: AccountInfo[] }>('/admin/accounts'),
   setEnabled: (uid: string, enabled: boolean) =>
     http.post<unknown, { ok: boolean }>(`/admin/accounts/${uid}/${enabled ? 'enable' : 'disable'}`),
+  setPriority: (uid: string, priority: number) =>
+    http.post<unknown, { ok: boolean; priority: number }>(`/admin/accounts/${uid}/priority`, { priority }),
   deleteAccount: (uid: string) => http.delete<unknown, { ok: boolean }>(`/admin/accounts/${uid}`),
   refreshCredits: () => http.post<unknown, { ok: boolean; accounts: AccountInfo[] }>('/admin/credits/refresh'),
   checkin: () => http.post<unknown, CheckinResponse>('/admin/checkin'),

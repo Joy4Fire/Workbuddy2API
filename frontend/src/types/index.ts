@@ -8,6 +8,10 @@ export interface AccountInfo {
   failure_count: number
   credits_remaining: number | null
   credits_total: number | null
+  /** 积分最早到期时间戳（秒），无则 null */
+  credits_expire_at?: number | null
+  /** 选号优先级（越大权重越高，0=默认） */
+  priority?: number
   checkin_today?: boolean
   /** 账号来源：project=项目 auths/（上传/扫码），local=本机 CodeBuddy 目录 */
   source?: 'project' | 'local' | 'unknown'

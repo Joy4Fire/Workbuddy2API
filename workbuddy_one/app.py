@@ -126,8 +126,12 @@ def create_app() -> FastAPI:
     # 从 DB 恢复上次额度的最近值：避免进程重启后额度盲区（冷启动即可按额度排除已耗尽账号）
     for _acc in pool.accounts:
         _row = db.get_account(_acc.uid)
-        if _row and _row.get("credits_remaining") is not None:
-            pool.set_credits(_acc.uid, _row.get("credits_remaining"), _row.get("credits_total"))
+        if _row:
+            if _row.get("credits_remaining") is not None:
+                pool.set_credits(_acc.uid, _row.get("credits_remaining"), _row.get("credits_total"),
+                                 _row.get("credits_expire_at"))
+            if _row.get("priority"):
+                pool.set_priority(_acc.uid, _row.get("priority"))
     models = ModelRegistry(pool)
     benchmarks = AABenchmarks(db=db)
     scheduler = Scheduler(pool, db=db, models=models,
@@ -694,6 +698,17 @@ def create_app() -> FastAPI:
     def admin_disable(uid: str):
         pool.set_enabled(uid, False)
         return {"ok": True}
+
+    @app.post("/admin/accounts/{uid}/priority")
+    def admin_set_priority(uid: str, body: dict):
+        """设置账号选号优先级（0-100，越大权重越高）。"""
+        try:
+            priority = max(0, min(100, int(body.get("priority", 0))))
+        except (TypeError, ValueError):
+            raise HTTPException(status_code=400, detail={"error": {"message": "priority 需为数字"}})
+        pool.set_priority(uid, priority)
+        db.set_account_state(uid, priority=priority)
+        return {"ok": True, "priority": priority}
 
     @app.delete("/admin/accounts/{uid}")
     def admin_delete_account(uid: str):
