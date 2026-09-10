@@ -36,6 +36,32 @@ STATIC_MODELS = [
     "minimax-m3",
 ]
 
+# 权威模态修正表（人工核对各模型真实能力）。
+# WorkBuddy 上游的 supportsImages 标注并不可靠——实测把 deepseek-v4-flash/pro、
+# glm-5.3 等纯文本模型误标为支持图像。这里以真实能力为准强制覆盖上游：
+#   True  = 该模型确实支持图像输入（多模态）
+#   False = 该模型为纯文本（即使上游误标 supportsImages=True 也按文本处理）
+# 依据：官方/主流文档对每个模型输入/输出模态的说明。
+MODALITY_OVERRIDE: dict[str, bool] = {
+    # 文本模型（上游可能误标 supportsImages=True，强制按文本）
+    "hy4-preview": False,
+    "hy3": False,
+    "glm-5.3": False,
+    "glm-5.2": False,
+    "glm-5.1": False,
+    "deepseek-v4-flash": False,
+    "deepseek-v4-pro": False,
+    # 多模态模型（GLM-5 系列 / Kimi / MiniMax 原生多模态）
+    "glm-5.3-flash": True,
+    "glm-5v-turbo": True,
+    "kimi-k3": True,
+    "kimi-k3-1": True,
+    "kimi-k2.7": True,
+    "kimi-k2.6": True,
+    "kimi-k2.5": True,
+    "minimax-m3": True,
+}
+
 
 class ModelRegistry:
     """动态模型目录（线程安全）。"""
@@ -235,11 +261,21 @@ def _extract_reasoning(m: dict) -> dict:
 
 
 def _extract_caps(m: dict) -> dict:
-    """从上游模型对象提取模态/能力/成本等字段（动态获取）。"""
+    """从上游模型对象提取模态/能力/成本等字段（动态获取）。
+
+    模态以权威修正表 MODALITY_OVERRIDE 优先：WorkBuddy 上游的 supportsImages
+    会把纯文本模型（deepseek-v4-*、glm-5.3 等）误标为多模态，这里强制纠正。
+    表内没有的模型才回退到上游 supportsImages 推导。
+    """
+    mid = m.get("id") or ""
     supports_images = bool(m.get("supportsImages", False))
     img_disabled = bool(m.get("disabledMultimodal", False))
-    # 支持图像且未禁用 → 多模态；否则纯文本
-    modality = "multimodal" if (supports_images and not img_disabled) else "text"
+    # 权威修正表优先；无则按上游 supportsImages 推导
+    if mid in MODALITY_OVERRIDE:
+        supports_images = MODALITY_OVERRIDE[mid]
+        modality = "multimodal" if supports_images else "text"
+    else:
+        modality = "multimodal" if (supports_images and not img_disabled) else "text"
 
     credits_raw = m.get("credits")
     credits = None
