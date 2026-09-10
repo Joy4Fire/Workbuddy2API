@@ -156,6 +156,90 @@ class TestDB(unittest.TestCase):
             for f in tmp.glob("test.db*"):
                 f.unlink(missing_ok=True)
 
+    def test_migrate_old_schema(self):
+        """旧 schema 库（缺列/缺 apps 表）打开后应升级到当前版本且保留数据。"""
+        import sqlite3
+        from workbuddy_one.db import Database, SCHEMA_VERSION
+        tmp = Path(__file__).resolve().parent / "_tmp"
+        tmp.mkdir(exist_ok=True)
+        old = str(tmp / "old_schema.db")
+        # 建一个「旧版」库：accounts 无 last_checkin_date、usage_logs 无内容列、无 apps 表
+        c = sqlite3.connect(old)
+        c.executescript("""
+            CREATE TABLE accounts (id INTEGER PRIMARY KEY AUTOINCREMENT, uid TEXT UNIQUE,
+                nickname TEXT, enterprise_id TEXT, domain TEXT, auth_json TEXT,
+                enabled INTEGER DEFAULT 1, credits_remaining REAL, credits_total REAL,
+                created_at REAL, updated_at REAL);
+            CREATE TABLE usage_logs (id INTEGER PRIMARY KEY AUTOINCREMENT, ts REAL,
+                model TEXT, protocol TEXT, account_uid TEXT, input_tokens INTEGER,
+                output_tokens INTEGER, total_tokens INTEGER, latency_ms REAL,
+                status TEXT, error TEXT);
+            CREATE TABLE settings (key TEXT PRIMARY KEY, value TEXT);
+            INSERT INTO accounts (uid, nickname) VALUES ('legacy-uid', '旧账号');
+            INSERT INTO settings (key, value) VALUES ('checkin_hours', '8,20');
+        """)
+        c.commit(); c.close()
+        try:
+            db = Database(old)
+            try:
+                # accounts 列已补齐
+                cols = db._table_columns("accounts")
+                self.assertIn("last_checkin_date", cols)
+                self.assertIn("priority", cols)
+                self.assertIn("credits_expire_at", cols)
+                # usage_logs 内容列已补齐
+                ucols = db._table_columns("usage_logs")
+                for col in ("input_content", "output_content", "reasoning_content", "credits", "app_name"):
+                    self.assertIn(col, ucols)
+                # apps 表已创建 + key_enc
+                self.assertIn("key_enc", db._table_columns("apps"))
+                # 数据保留
+                self.assertIsNotNone(db.get_account("legacy-uid"))
+                self.assertEqual(db.get_settings().get("checkin_hours"), "8,20")
+                # 版本号已写入
+                self.assertEqual(db._user_version(), SCHEMA_VERSION)
+            finally:
+                db._conn.close()
+        finally:
+            for f in tmp.glob("old_schema.db*"):
+                f.unlink(missing_ok=True)
+
+    def test_merge_legacy_data(self):
+        """当前空库 + 发现旧库时，自动合并 accounts/settings/usage_logs 数据。"""
+        import sqlite3
+        from workbuddy_one.db import Database
+        tmp = Path(__file__).resolve().parent / "_tmp"
+        tmp.mkdir(exist_ok=True)
+        legacy = str(tmp / "legacy.db")
+        target = str(tmp / "target.db")
+        # 清理上次运行残留，保证幂等
+        for f in list(tmp.glob("legacy.db*")) + list(tmp.glob("target.db*")):
+            f.unlink(missing_ok=True)
+        # 建旧库并写入数据
+        c = sqlite3.connect(legacy)
+        c.executescript("""
+            CREATE TABLE accounts (uid TEXT UNIQUE, nickname TEXT, auth_json TEXT);
+            CREATE TABLE usage_logs (ts REAL, model TEXT, protocol TEXT, status TEXT);
+            CREATE TABLE settings (key TEXT PRIMARY KEY, value TEXT);
+            INSERT INTO accounts (uid, nickname) VALUES ('leg-1', '旧账号1');
+            INSERT INTO usage_logs (ts, model, protocol, status) VALUES (1000, 'hy3', 'chat', 'ok');
+            INSERT INTO settings (key, value) VALUES ('credit_refresh_min', '15');
+        """)
+        c.commit(); c.close()
+        try:
+            db = Database(target)
+            try:
+                db._merge_legacy_db(legacy)  # 手动触发合并（target 路径下无候选旧库，直接调方法）
+                self.assertIsNotNone(db.get_account("leg-1"))
+                self.assertEqual(db.get_settings().get("credit_refresh_min"), "15")
+                recent = db.usage_recent(10)
+                self.assertTrue(any(r["model"] == "hy3" for r in recent))
+            finally:
+                db._conn.close()
+        finally:
+            for f in list(tmp.glob("legacy.db*")) + list(tmp.glob("target.db*")):
+                f.unlink(missing_ok=True)
+
 
 if __name__ == "__main__":
     unittest.main()

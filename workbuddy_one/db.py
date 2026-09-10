@@ -11,6 +11,10 @@ import threading
 import time
 from pathlib import Path
 
+# 当前数据库 schema 版本（用 SQLite PRAGMA user_version 持久化）。
+# 每次对表结构做不兼容/增量修改时 +1，并在 _migrate 里追加对应迁移步骤。
+SCHEMA_VERSION = 3
+
 
 class Database:
     def __init__(self, path: str):
@@ -22,6 +26,8 @@ class Database:
         self._conn.execute("PRAGMA journal_mode=WAL")
         self._conn.execute("PRAGMA foreign_keys=ON")
         self._init_schema()
+        # 发现并合并旧版数据库（如顶层 workbuddy.db / data-top-level），幂等
+        self._migrate_legacy_dbs()
 
     def _init_schema(self):
         with self._lock:
@@ -84,24 +90,154 @@ class Database:
                 );
                 """
             )
-            # 旧库迁移：为 accounts 补 last_checkin_date 列
-            cols = [r[1] for r in self._conn.execute("PRAGMA table_info(accounts)").fetchall()]
-            if "last_checkin_date" not in cols:
-                self._conn.execute("ALTER TABLE accounts ADD COLUMN last_checkin_date TEXT")
-            # 旧库迁移：为 usage_logs 补请求内容列（输入/输出/COT）
-            ucols = [r[1] for r in self._conn.execute("PRAGMA table_info(usage_logs)").fetchall()]
-            for col in ("input_content", "output_content", "reasoning_content"):
-                if col not in ucols:
-                    self._conn.execute(f"ALTER TABLE usage_logs ADD COLUMN {col} TEXT")
-            if "credits" not in ucols:
-                self._conn.execute("ALTER TABLE usage_logs ADD COLUMN credits REAL")
-            if "app_name" not in ucols:
-                self._conn.execute("ALTER TABLE usage_logs ADD COLUMN app_name TEXT")
-            # 旧库迁移：为 apps 补 key_enc（加密明文 Key）
-            acols = [r[1] for r in self._conn.execute("PRAGMA table_info(apps)").fetchall()]
-            if "key_enc" not in acols:
-                self._conn.execute("ALTER TABLE apps ADD COLUMN key_enc TEXT")
+            # 版本化增量迁移：把旧 schema 库升级到当前版本（幂等，保留数据）
+            self._migrate()
             self._conn.commit()
+
+    # ---------------- schema 版本化迁移 ----------------
+
+    # 当前各表的完整列定义（列名 → DDL 类型）。迁移时兜底补齐缺失列，
+    # 保证无论旧库多老，最终都对齐当前 schema。
+    _FULL_COLUMNS = {
+        "accounts": [
+            ("id", "INTEGER PRIMARY KEY AUTOINCREMENT"), ("uid", "TEXT"),
+            ("nickname", "TEXT"), ("enterprise_id", "TEXT"), ("domain", "TEXT"),
+            ("auth_json", "TEXT"), ("enabled", "INTEGER DEFAULT 1"),
+            ("priority", "INTEGER DEFAULT 0"), ("credits_remaining", "REAL"),
+            ("credits_total", "REAL"), ("credits_expire_at", "TEXT"),
+            ("last_used_at", "REAL"), ("last_checkin_date", "TEXT"),
+            ("failure_count", "INTEGER DEFAULT 0"), ("cooldown_until", "REAL DEFAULT 0"),
+            ("created_at", "REAL"), ("updated_at", "REAL"),
+        ],
+        "usage_logs": [
+            ("id", "INTEGER PRIMARY KEY AUTOINCREMENT"), ("ts", "REAL"),
+            ("model", "TEXT"), ("protocol", "TEXT"), ("account_uid", "TEXT"),
+            ("input_tokens", "INTEGER"), ("output_tokens", "INTEGER"),
+            ("total_tokens", "INTEGER"), ("latency_ms", "REAL"),
+            ("status", "TEXT"), ("error", "TEXT"),
+            ("input_content", "TEXT"), ("output_content", "TEXT"),
+            ("reasoning_content", "TEXT"), ("credits", "REAL"), ("app_name", "TEXT"),
+        ],
+        "apps": [
+            ("id", "INTEGER PRIMARY KEY AUTOINCREMENT"), ("name", "TEXT"),
+            ("key_hash", "TEXT"), ("key_prefix", "TEXT"), ("note", "TEXT"),
+            ("enabled", "INTEGER DEFAULT 1"), ("created_at", "REAL"), ("key_enc", "TEXT"),
+        ],
+    }
+
+    def _table_columns(self, table: str) -> list[str]:
+        """返回表的所有列名（表不存在返回空列表）。"""
+        try:
+            rows = self._conn.execute(f"PRAGMA table_info({table})").fetchall()
+        except sqlite3.Error:
+            return []
+        return [r[1] for r in rows]
+
+    def _add_column(self, table: str, col: str, ddl: str):
+        """列不存在则添加。"""
+        if col not in self._table_columns(table):
+            self._conn.execute(f"ALTER TABLE {table} ADD COLUMN {col} {ddl}")
+
+    def _user_version(self) -> int:
+        try:
+            return self._conn.execute("PRAGMA user_version").fetchone()[0]
+        except (sqlite3.Error, IndexError, TypeError):
+            return 0
+
+    def _migrate(self):
+        """按版本号把数据库升级到 SCHEMA_VERSION，并兜底补齐所有当前列。
+
+        从当前 user_version 逐级执行迁移，每级幂等；最后统一补齐缺失列，
+        确保旧库（即使缺多个列）最终都对齐当前 schema，数据不丢失。
+        """
+        ver = self._user_version()
+        # v0 → v1：基础表（accounts/usage_logs/settings/apps）已由 _init_schema 创建
+        if ver < 1:
+            ver = 1
+        # v1 → v2：accounts 补 last_checkin_date；usage_logs 补内容列/credits/app_name
+        if ver < 2:
+            ver = 2
+        # v2 → v3：apps 补 key_enc（加密明文 Key）
+        if ver < 3:
+            ver = 3
+        # 兜底补齐所有当前列（保证对齐 SCHEMA_VERSION 结构）
+        for table, cols in self._FULL_COLUMNS.items():
+            for col, ddl in cols:
+                # 跳过主键列（id 已由建表创建，重复 ALTER 会失败）
+                if ddl.startswith("INTEGER PRIMARY KEY"):
+                    continue
+                self._add_column(table, col, ddl)
+        # 写入最新版本号
+        self._conn.execute(f"PRAGMA user_version = {int(SCHEMA_VERSION)}")
+
+    # ---------------- 旧库发现与数据合并 ----------------
+
+    def _migrate_legacy_dbs(self):
+        """检测旧版数据库文件并合并数据到当前库（幂等，仅当前库无对应数据时迁移）。
+
+        旧版 workbuddy-one 曾把数据库放在包根目录（workbuddy.db）或 data-top-level/。
+        若当前库是全新空库（无账号/设置），且发现旧库，则把旧库的
+        accounts / usage_logs / settings 数据复制进来，避免用户"数据丢失"。
+        """
+        from .config import PACKAGE_ROOT
+
+        # 当前库已有数据则跳过（避免覆盖）
+        try:
+            has_data = self._conn.execute("SELECT COUNT(*) FROM accounts").fetchone()[0] > 0 or \
+                       bool(self._conn.execute("SELECT 1 FROM settings LIMIT 1").fetchone())
+        except sqlite3.Error:
+            has_data = True
+        if has_data:
+            return
+
+        candidates = [
+            PACKAGE_ROOT / "workbuddy.db",                 # 顶层旧版
+            PACKAGE_ROOT / "data-top-level" / "workbuddy.db",  # 归档旧版
+            self.path.parent.parent / "workbuddy.db",      # 项目根
+        ]
+        for legacy in candidates:
+            if not legacy.is_file():
+                continue
+            try:
+                migrated = self._merge_legacy_db(str(legacy))
+            except sqlite3.Error:
+                continue
+            if migrated:
+                break
+
+    def _merge_legacy_db(self, legacy_path: str):
+        """把旧库的 accounts/settings/usage_logs 合并进当前库。返回是否迁移了数据。"""
+        src = sqlite3.connect(legacy_path)
+        try:
+            src.row_factory = sqlite3.Row
+            # 迁移 settings（非默认键，保留旧配置）
+            for r in src.execute("SELECT key, value FROM settings"):
+                self._conn.execute(
+                    "INSERT OR IGNORE INTO settings (key, value) VALUES (?,?)", (r["key"], r["value"]))
+            # 迁移 accounts（uid 唯一，冲突忽略）
+            acct_cols = self._table_columns("accounts")
+            for r in src.execute("SELECT * FROM accounts"):
+                d = dict(r)
+                keys = [k for k in d if k in acct_cols and d[k] is not None]
+                cols = ", ".join(keys)
+                ph = ", ".join("?" * len(keys))
+                self._conn.execute(
+                    f"INSERT OR IGNORE INTO accounts ({cols}) VALUES ({ph})",
+                    [d[k] for k in keys])
+            # 迁移 usage_logs
+            ug_cols = self._table_columns("usage_logs")
+            for r in src.execute("SELECT * FROM usage_logs"):
+                d = dict(r)
+                keys = [k for k in d if k in ug_cols and d[k] is not None]
+                cols = ", ".join(keys)
+                ph = ", ".join("?" * len(keys))
+                self._conn.execute(
+                    f"INSERT OR IGNORE INTO usage_logs ({cols}) VALUES ({ph})",
+                    [d[k] for k in keys])
+            self._conn.commit()
+            return True
+        finally:
+            src.close()
 
     # ---- accounts ----
     def upsert_account(self, auth: dict, account: dict | None = None):
