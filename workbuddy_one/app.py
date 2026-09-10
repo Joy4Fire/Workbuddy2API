@@ -134,7 +134,7 @@ def create_app() -> FastAPI:
                 pool.set_priority(_acc.uid, _row.get("priority"))
     models = ModelRegistry(pool)
     benchmarks = AABenchmarks(db=db)
-    scheduler = Scheduler(pool, db=db, models=models,
+    scheduler = Scheduler(pool, db=db, models=models, benchmarks=benchmarks,
                           credit_interval_min=config.credit_refresh_min)
 
     def _register_account(path: Path) -> dict:
@@ -904,6 +904,7 @@ def create_app() -> FastAPI:
             "checkin_hours": s.get("checkin_hours", "9,21"),
             "credit_refresh_min": s.get("credit_refresh_min", "30"),
             "model_refresh_hour": s.get("model_refresh_hour", "6"),
+            "aa_refresh_hour": s.get("aa_refresh_hour", "7"),
             "keepalive_hour": s.get("keepalive_hour", "22"),
             "aa_api_key": aa_key,
             # 掩码用于前端展示（不泄露完整 key）
@@ -946,6 +947,8 @@ def create_app() -> FastAPI:
             db.save_settings(credit_refresh_min=str(v))
         if model_refresh_hour is not None:
             db.save_settings(model_refresh_hour=_validate_hour_field(model_refresh_hour, "模型刷新时间"))
+        if "aa_refresh_hour" in body:
+            db.save_settings(aa_refresh_hour=_validate_hour_field(body.get("aa_refresh_hour"), "AA 评测刷新时间"))
         if keepalive_hour is not None:
             db.save_settings(keepalive_hour=_validate_hour_field(keepalive_hour, "token 保活时间"))
         if "aa_api_key" in body:

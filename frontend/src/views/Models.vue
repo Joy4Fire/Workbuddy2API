@@ -1,7 +1,7 @@
 <script setup lang="ts">
 import { ref, computed, onMounted } from 'vue'
 import { message } from 'ant-design-vue'
-import { SearchOutlined, ReloadOutlined, PictureOutlined, FileTextOutlined, ToolOutlined, ThunderboltOutlined, MoneyCollectOutlined } from '@ant-design/icons-vue'
+import { SearchOutlined, ReloadOutlined, PictureOutlined, FileTextOutlined, ToolOutlined, ThunderboltOutlined } from '@ant-design/icons-vue'
 import { api } from '@/api/client'
 import type { ModelInfo } from '@/types'
 
@@ -72,11 +72,6 @@ function fmtName(m: ModelInfo) {
 function fmtNum(v?: number, digits = 1) {
   if (v === undefined || v === null || Number.isNaN(v)) return '-'
   return Number(v).toFixed(digits)
-}
-
-function fmtPct(v?: number) {
-  if (v === undefined || v === null || Number.isNaN(v)) return '-'
-  return `${(Number(v) * 100).toFixed(1)}%`
 }
 
 function reasoningEfforts(m: ModelInfo): string[] {
@@ -198,12 +193,7 @@ onMounted(load)
             <div class="aa-scores">
               <div class="aa-score"><span class="as-v">{{ fmtNum(m.benchmark.intelligence_index) }}</span><span class="as-k">智能</span></div>
               <div class="aa-score"><span class="as-v">{{ fmtNum(m.benchmark.coding_index) }}</span><span class="as-k">编码</span></div>
-              <div class="aa-score"><span class="as-v">{{ fmtNum(m.benchmark.math_index) }}</span><span class="as-k">数学</span></div>
-              <div class="aa-score"><span class="as-v">{{ fmtPct(m.benchmark.mmlu_pro) }}</span><span class="as-k">MMLU</span></div>
-              <div class="aa-score"><span class="as-v">{{ fmtNum(m.benchmark.speed_tps) }}</span><span class="as-k">tok/s</span></div>
-            </div>
-            <div v-if="m.benchmark.price_in !== undefined" class="aa-price">
-              <MoneyCollectOutlined style="margin-right: 4px" /> ${{ fmtNum(m.benchmark.price_in) }}/M in · ${{ fmtNum(m.benchmark.price_out) }}/M out
+              <div class="aa-score"><span class="as-v">{{ fmtNum(m.benchmark.agentic_index) }}</span><span class="as-k">Agentic</span></div>
             </div>
           </div>
         </div>

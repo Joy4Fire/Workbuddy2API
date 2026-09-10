@@ -186,6 +186,7 @@ class Database:
         "checkin_hours": "9,21",       # 每日自动签到小时点（逗号分隔）
         "credit_refresh_min": "30",    # 额度刷新间隔（分钟）
         "model_refresh_hour": "6",     # 每日自动刷新模型目录的小时（0-23）
+        "aa_refresh_hour": "7",        # 每日自动刷新 AA 评测数据的小时（0-23）
         "keepalive_hour": "22",        # 每日 token 保活小时（0-23）
         "aa_api_key": "",              # Artificial Analysis API key（评测数据，空则不启用）
     }

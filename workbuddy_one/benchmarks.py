@@ -165,27 +165,22 @@ class AABenchmarks:
         return None
 
     def map(self, model_id: str) -> dict | None:
-        """返回精简后的评测数据（供前端展示），无则 None。"""
+        """返回精简后的评测数据（供前端展示），无则 None。
+
+        只保留用户选定的三个核心指标（intelligence / coding / agentic），
+        速度、延迟、价格等非指标数据不再返回。
+        """
         r = self.lookup(model_id)
         if not r:
             return None
         ev = r.get("evaluations") or {}
-        pr = r.get("pricing") or {}
         creator = r.get("model_creator") or {}
         return {
             "name": r.get("name"),
             "creator": creator.get("name"),
             "intelligence_index": ev.get("artificial_analysis_intelligence_index"),
             "coding_index": ev.get("artificial_analysis_coding_index"),
-            "math_index": ev.get("artificial_analysis_math_index"),
-            "mmlu_pro": ev.get("mmlu_pro"),
-            "gpqa": ev.get("gpqa"),
-            "livecodebench": ev.get("livecodebench"),
-            "speed_tps": r.get("median_output_tokens_per_second"),
-            "ttft_s": r.get("median_time_to_first_token_seconds"),
-            "price_in": pr.get("price_1m_input_tokens"),
-            "price_out": pr.get("price_1m_output_tokens"),
-            "price_blended": pr.get("price_1m_blended_3_to_1"),
+            "agentic_index": ev.get("artificial_analysis_agentic_index"),
             "source": "aa",
             "aa_url": "https://artificialanalysis.ai/models",
         }

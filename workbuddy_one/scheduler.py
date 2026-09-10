@@ -34,14 +34,16 @@ def _parse_hour(s: str, default: int) -> int:
 
 
 class Scheduler:
-    def __init__(self, pool: AccountPool, *, db=None, models=None, credit_interval_min: int = 30):
+    def __init__(self, pool: AccountPool, *, db=None, models=None, benchmarks=None, credit_interval_min: int = 30):
         self.pool = pool
         self.db = db
         self.models = models
+        self.benchmarks = benchmarks
         self.credit_interval_min = credit_interval_min
         self._last_checkin_date: str | None = None
         self._last_keepalive_date: str | None = None
         self._last_model_refresh_date: str | None = None
+        self._last_aa_refresh_date: str | None = None
         self._task: asyncio.Task | None = None
         self._running = False
 
@@ -80,6 +82,9 @@ class Scheduler:
 
     def _model_refresh_hour(self) -> int:
         return _parse_hour(self._setting("model_refresh_hour", "6"), 6)
+
+    def _aa_refresh_hour(self) -> int:
+        return _parse_hour(self._setting("aa_refresh_hour", "7"), 7)
 
     def _keepalive_hour(self) -> int:
         return _parse_hour(self._setting("keepalive_hour", "22"), 22)
@@ -164,6 +169,18 @@ class Scheduler:
         except Exception as e:  # noqa: BLE001
             logger.warning("模型刷新异常: %s", e)
 
+    async def refresh_benchmarks(self):
+        """每日刷新 AA 评测数据（未配置 key 时静默跳过）。"""
+        if not self.benchmarks:
+            return
+        if not self.benchmarks.configured():
+            logger.info("未配置 AA key，跳过评测刷新")
+            return
+        try:
+            await asyncio.to_thread(self.benchmarks.refresh)
+        except Exception as e:  # noqa: BLE001
+            logger.warning("AA 评测刷新异常: %s", e)
+
     async def _run(self):
         last_credit = 0.0
         while self._running:
@@ -188,6 +205,14 @@ class Scheduler:
                     await self.refresh_models()
                 except Exception as e:  # noqa: BLE001
                     logger.warning("模型刷新任务异常: %s", e)
+                self._last_model_refresh_date = today
+            # 每日 AA 评测刷新
+            if now.hour == self._aa_refresh_hour() and self._last_aa_refresh_date != today:
+                try:
+                    await self.refresh_benchmarks()
+                except Exception as e:  # noqa: BLE001
+                    logger.warning("AA 评测刷新任务异常: %s", e)
+                self._last_aa_refresh_date = today
             # 定期刷新额度
             interval = self._credit_interval()
             if now.timestamp() - last_credit >= interval * 60:

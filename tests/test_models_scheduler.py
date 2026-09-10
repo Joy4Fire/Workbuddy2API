@@ -267,7 +267,12 @@ class TestAABenchmarks(unittest.TestCase):
         rows = [{
             "id": "uuid", "slug": "glm-5.3", "name": "GLM-5.3",
             "model_creator": {"name": "Zhipu"},
-            "evaluations": {"artificial_analysis_intelligence_index": 70.5, "mmlu_pro": 0.8},
+            "evaluations": {
+                "artificial_analysis_intelligence_index": 70.5,
+                "artificial_analysis_coding_index": 66.0,
+                "artificial_analysis_agentic_index": 60.2,
+                "mmlu_pro": 0.8,  # 非选定字段，不应返回
+            },
             "pricing": {"price_1m_input_tokens": 0.5, "price_1m_output_tokens": 1.5},
             "median_output_tokens_per_second": 120.0,
         }]
@@ -278,9 +283,14 @@ class TestAABenchmarks(unittest.TestCase):
         m = bb.map("glm-5.3")
         self.assertIsNotNone(m)
         self.assertEqual(m["intelligence_index"], 70.5)
-        self.assertEqual(m["mmlu_pro"], 0.8)
-        self.assertEqual(m["price_in"], 0.5)
+        self.assertEqual(m["coding_index"], 66.0)
+        self.assertEqual(m["agentic_index"], 60.2)
         self.assertEqual(m["source"], "aa")
+        # 只保留选定的三个指标，不再返回非指标字段
+        self.assertNotIn("mmlu_pro", m)
+        self.assertNotIn("math_index", m)
+        self.assertNotIn("price_in", m)
+        self.assertNotIn("speed_tps", m)
 
 
 class TestUsageContent(unittest.TestCase):

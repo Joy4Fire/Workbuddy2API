@@ -25,9 +25,10 @@ let pollTimer: ReturnType<typeof setInterval> | null = null
 // 自动签到设置
 const settingsOpen = ref(false)
 const settingsSaving = ref(false)
-const settings = ref<Settings>({ checkin_hours: '9,21', credit_refresh_min: '30', model_refresh_hour: '6', keepalive_hour: '22' })
+const settings = ref<Settings>({ checkin_hours: '9,21', credit_refresh_min: '30', model_refresh_hour: '6', aa_refresh_hour: '7', keepalive_hour: '22' })
 const creditMinutes = ref(30)
 const modelRefreshHour = ref(6)
+const aaRefreshHour = ref(7)
 const keepaliveHour = ref(22)
 const aaKey = ref('')
 const aaKeyMasked = ref('')
@@ -166,6 +167,7 @@ async function openSettings() {
     settings.value = res
     creditMinutes.value = parseInt(res.credit_refresh_min, 10) || 30
     modelRefreshHour.value = parseInt(res.model_refresh_hour, 10) || 6
+    aaRefreshHour.value = parseInt(res.aa_refresh_hour, 10) || 7
     keepaliveHour.value = parseInt(res.keepalive_hour, 10) || 22
     aaKeyMasked.value = res.aa_api_key_masked || ''
     aaEnabled.value = !!res.aa_enabled
@@ -185,6 +187,7 @@ async function saveSettings() {
     checkin_hours: settings.value.checkin_hours,
     credit_refresh_min: String(creditMinutes.value),
     model_refresh_hour: String(modelRefreshHour.value),
+    aa_refresh_hour: String(aaRefreshHour.value),
     keepalive_hour: String(keepaliveHour.value),
   }
   if (aaKey.value) {
@@ -413,6 +416,12 @@ onUnmounted(() => {
             每天该小时自动从上游拉取可用模型列表（供 /v1/models 与 WebUI 展示）
           </div>
         </a-form-item>
+        <a-form-item label="每日 AA 评测刷新时间（小时，0-23）">
+          <a-input-number v-model:value="aaRefreshHour" :min="0" :max="23" style="width: 100%" />
+          <div style="color: #999; font-size: 12px; margin-top: 4px">
+            每天该小时自动刷新 Artificial Analysis 评测数据（intelligence / coding / agentic 指数）。需先配置 AA API Key。
+          </div>
+        </a-form-item>
         <a-form-item label="每日 token 保活时间（小时，0-23）">
           <a-input-number v-model:value="keepaliveHour" :min="0" :max="23" style="width: 100%" />
           <div style="color: #999; font-size: 12px; margin-top: 4px">
@@ -428,7 +437,7 @@ onUnmounted(() => {
             @change="aaClear = false"
           />
           <div style="color: #999; font-size: 12px; margin-top: 4px">
-            用于获取各模型的权威评测（智能/编码/数学指数、MMLU-Pro、速度、价格）。在 artificialanalysis.ai 注册生成，免费档 1000 次/天。key 仅存于后端，不暴露给前端。
+            用于获取各模型的权威评测（智能 intelligence / 编码 coding / agentic 指数）。在 artificialanalysis.ai 注册生成，免费档 1000 次/天。key 仅存于后端，不暴露给前端。
           </div>
           <a-checkbox
             v-if="aaEnabled"

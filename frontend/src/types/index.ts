@@ -21,6 +21,7 @@ export interface Settings {
   checkin_hours: string
   credit_refresh_min: string
   model_refresh_hour: string
+  aa_refresh_hour: string
   keepalive_hour: string
   aa_api_key?: string
   aa_api_key_masked?: string
@@ -42,15 +43,7 @@ export interface AABenchmark {
   creator?: string
   intelligence_index?: number
   coding_index?: number
-  math_index?: number
-  mmlu_pro?: number
-  gpqa?: number
-  livecodebench?: number
-  speed_tps?: number
-  ttft_s?: number
-  price_in?: number
-  price_out?: number
-  price_blended?: number
+  agentic_index?: number
   source?: string
   aa_url?: string
 }
