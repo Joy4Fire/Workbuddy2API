@@ -125,7 +125,7 @@ onUnmounted(() => {
 </script>
 
 <template>
-  <div style="padding-bottom: 36px">
+  <div style="padding-bottom: 16px">
     <!-- KPI 概览卡 -->
     <a-row :gutter="[16, 16]" style="margin-bottom: 16px">
       <a-col v-for="k in kpis" :key="k.title" :xs="12" :sm="6">
@@ -153,7 +153,7 @@ onUnmounted(() => {
           <a-radio-button value="tokens">Tokens</a-radio-button>
         </a-radio-group>
       </div>
-      <div ref="chartEl" style="width: 100%; height: 320px"></div>
+      <div ref="chartEl" style="width: 100%; height: 200px"></div>
     </a-card>
 
     <!-- 协议 + 应用 / 模型统计：两列高度均衡（模型多时 Top N + 其他聚合，可展开全部） -->
@@ -213,7 +213,7 @@ onUnmounted(() => {
 /* KPI 卡 */
 .kpi-card {
   display: flex; align-items: center; gap: 12px;
-  border-radius: 14px; padding: 16px;
+  border-radius: 14px; padding: 12px 16px;
   background: linear-gradient(150deg, #1b2038 0%, #232a4a 100%);
   border: 1px solid rgba(99,179,237,0.15);
 }
@@ -228,13 +228,13 @@ onUnmounted(() => {
 /* 进度条（统一色系） */
 .bar-row {
   display: flex; align-items: center; gap: 12px;
-  padding: 8px 0;
+  padding: 5px 0;
 }
 .bar-label { width: 130px; font-size: 13px; color: #cdd6e8; flex-shrink: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .bar-label.mono { font-family: 'Consolas', 'Menlo', monospace; }
-.bar-track { flex: 1; height: 12px; border-radius: 6px; background: rgba(255,255,255,0.06); overflow: hidden; }
+.bar-track { flex: 1; height: 10px; border-radius: 5px; background: rgba(255,255,255,0.06); overflow: hidden; }
 .bar-fill {
-  height: 100%; border-radius: 6px;
+  height: 100%; border-radius: 5px;
   background: linear-gradient(90deg, #6366f1, #8b5cf6);
   transition: width 0.5s ease;
 }
