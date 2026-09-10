@@ -125,6 +125,74 @@ class Database:
         ],
     }
 
+    # ---------------- 版本化迁移框架 ----------------
+    #
+    # 每次对表结构做不兼容/增量修改时：
+    #   1) SCHEMA_VERSION +1
+    #   2) 在 _MIGRATIONS 追加一个 (版本号, 迁移函数)
+    #   3) 迁移函数必须幂等（先查列/表是否存在再动手）
+    # 启动时从 PRAGMA user_version 逐级执行到 SCHEMA_VERSION，
+    # 旧库自动升级、数据保留；新库 user_version=0 也走完整迁移链（幂等无副作用）。
+
+    def _migration_v1(self):
+        """v1：初始结构（accounts/usage_logs/settings/apps 已由 _init_schema 创建）。"""
+        # 基础表由 _init_schema 的 CREATE TABLE IF NOT EXISTS 保证存在，此处无额外动作
+
+    def _migration_v2(self):
+        """v2：accounts 补 last_checkin_date；usage_logs 补内容列 / credits / app_name。"""
+        self._add_column("accounts", "last_checkin_date", "TEXT")
+        for col in ("input_content", "output_content", "reasoning_content"):
+            self._add_column("usage_logs", col, "TEXT")
+        self._add_column("usage_logs", "credits", "REAL")
+        self._add_column("usage_logs", "app_name", "TEXT")
+
+    def _migration_v3(self):
+        """v3：apps 补 key_enc（加密明文 Key，配套应用鉴权改造）。"""
+        self._add_column("apps", "key_enc", "TEXT")
+
+    # 迁移注册表：每个条目 = (目标版本号, 迁移函数)。按版本号升序。
+    # 后续新增结构 → 在此追加新条目，并在 SCHEMA_VERSION 处 +1。
+    _MIGRATIONS = [
+        (1, _migration_v1),
+        (2, _migration_v2),
+        (3, _migration_v3),
+    ]
+
+    # 兜底列定义：对「未知极老库」最后统一补齐当前全部列。
+    # 已按版本迁移的库到这里通常无缺失列（幂等无副作用）。
+    _FULL_COLUMNS = {
+        "accounts": [
+            ("id", "INTEGER PRIMARY KEY AUTOINCREMENT"), ("uid", "TEXT"),
+            ("nickname", "TEXT"), ("enterprise_id", "TEXT"), ("domain", "TEXT"),
+            ("auth_json", "TEXT"), ("enabled", "INTEGER DEFAULT 1"),
+            ("priority", "INTEGER DEFAULT 0"), ("credits_remaining", "REAL"),
+            ("credits_total", "REAL"), ("credits_expire_at", "TEXT"),
+            ("last_used_at", "REAL"), ("last_checkin_date", "TEXT"),
+            ("failure_count", "INTEGER DEFAULT 0"), ("cooldown_until", "REAL DEFAULT 0"),
+            ("created_at", "REAL"), ("updated_at", "REAL"),
+        ],
+        "usage_logs": [
+            ("id", "INTEGER PRIMARY KEY AUTOINCREMENT"), ("ts", "REAL"),
+            ("model", "TEXT"), ("protocol", "TEXT"), ("account_uid", "TEXT"),
+            ("input_tokens", "INTEGER"), ("output_tokens", "INTEGER"),
+            ("total_tokens", "INTEGER"), ("latency_ms", "REAL"),
+            ("status", "TEXT"), ("error", "TEXT"),
+            ("input_content", "TEXT"), ("output_content", "TEXT"),
+            ("reasoning_content", "TEXT"), ("credits", "REAL"), ("app_name", "TEXT"),
+        ],
+        "apps": [
+            ("id", "INTEGER PRIMARY KEY AUTOINCREMENT"), ("name", "TEXT"),
+            ("key_hash", "TEXT"), ("key_prefix", "TEXT"), ("note", "TEXT"),
+            ("enabled", "INTEGER DEFAULT 1"), ("created_at", "REAL"), ("key_enc", "TEXT"),
+        ],
+    }
+
+    def _user_version(self) -> int:
+        try:
+            return self._conn.execute("PRAGMA user_version").fetchone()[0]
+        except (sqlite3.Error, IndexError, TypeError):
+            return 0
+
     def _table_columns(self, table: str) -> list[str]:
         """返回表的所有列名（表不存在返回空列表）。"""
         try:
@@ -138,32 +206,25 @@ class Database:
         if col not in self._table_columns(table):
             self._conn.execute(f"ALTER TABLE {table} ADD COLUMN {col} {ddl}")
 
-    def _user_version(self) -> int:
-        try:
-            return self._conn.execute("PRAGMA user_version").fetchone()[0]
-        except (sqlite3.Error, IndexError, TypeError):
-            return 0
+    def _executescript_migrate(self, script: str):
+        """在迁移中执行多语句 SQL（建表/索引等）。调用方保证幂等。"""
+        self._conn.executescript(script)
 
     def _migrate(self):
-        """按版本号把数据库升级到 SCHEMA_VERSION，并兜底补齐所有当前列。
+        """按版本号把数据库升级到 SCHEMA_VERSION（版本化增量迁移 + 兜底补列）。
 
-        从当前 user_version 逐级执行迁移，每级幂等；最后统一补齐缺失列，
-        确保旧库（即使缺多个列）最终都对齐当前 schema，数据不丢失。
+        从 PRAGMA user_version 逐级执行 _MIGRATIONS 中更高版本的迁移，每步幂等；
+        最后兜底补齐缺失列，确保极老库也对齐当前结构。数据全程保留。
         """
         ver = self._user_version()
-        # v0 → v1：基础表（accounts/usage_logs/settings/apps）已由 _init_schema 创建
-        if ver < 1:
-            ver = 1
-        # v1 → v2：accounts 补 last_checkin_date；usage_logs 补内容列/credits/app_name
-        if ver < 2:
-            ver = 2
-        # v2 → v3：apps 补 key_enc（加密明文 Key）
-        if ver < 3:
-            ver = 3
-        # 兜底补齐所有当前列（保证对齐 SCHEMA_VERSION 结构）
+        # 逐级执行迁移到当前版本
+        for target, fn in self._MIGRATIONS:
+            if ver < target:
+                fn(self)
+                ver = target
+        # 兜底补齐所有当前列（对未知极老库的最终保险）
         for table, cols in self._FULL_COLUMNS.items():
             for col, ddl in cols:
-                # 跳过主键列（id 已由建表创建，重复 ALTER 会失败）
                 if ddl.startswith("INTEGER PRIMARY KEY"):
                     continue
                 self._add_column(table, col, ddl)
