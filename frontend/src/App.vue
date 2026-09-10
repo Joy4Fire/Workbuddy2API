@@ -4,7 +4,7 @@ import { useRoute, useRouter } from 'vue-router'
 import { message } from 'ant-design-vue'
 import {
   DashboardOutlined, TeamOutlined, DatabaseOutlined, BarChartOutlined,
-  FileTextOutlined, KeyOutlined, ThunderboltOutlined, SafetyOutlined, ApiOutlined,
+  FileTextOutlined, KeyOutlined, ThunderboltOutlined, ApiOutlined,
 } from '@ant-design/icons-vue'
 import { setAdminToken } from '@/api/client'
 
@@ -45,7 +45,7 @@ function saveToken() {
     <!-- 侧边栏 -->
     <a-layout-sider theme="dark" width="228" class="app-sider">
       <div class="brand">
-        <div class="brand-logo"><SafetyOutlined /></div>
+        <img class="brand-logo" src="/logo.svg" alt="Workbuddy2API" />
         <div class="brand-text">
           <div class="brand-name">Workbuddy2API</div>
           <div class="brand-sub">本地一体化网关</div>
@@ -156,11 +156,9 @@ body { background: #0d1120; }
   position: relative; z-index: 1;
 }
 .brand-logo {
-  width: 42px; height: 42px; border-radius: 12px;
-  display: flex; align-items: center; justify-content: center;
-  font-size: 22px;
-  background: linear-gradient(135deg, #6366f1, #8b5cf6);
-  box-shadow: 0 4px 14px rgba(99,102,241,0.5);
+  width: 44px; height: 44px; border-radius: 12px;
+  object-fit: cover; display: block;
+  box-shadow: 0 4px 14px rgba(99,102,241,0.45);
 }
 .brand-text { display: flex; flex-direction: column; }
 .brand-name {

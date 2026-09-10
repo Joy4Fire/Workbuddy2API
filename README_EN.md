@@ -228,9 +228,13 @@ This project draws on the following open-source projects (all archived in this r
 
 ## Disclaimer
 
-This project is for learning and research only. Users must comply with WorkBuddy / CodeBuddy terms
-of service and use it at their own risk. The author is not liable for any direct or indirect loss
-arising from the use of this project.
+> **This project is for learning and study purposes ONLY. Do not use it for anything else.**
+
+- This project is **for learning only** — studying programming, API gateway concepts, and protocol adaptation.
+- **Prohibited** to use it for commercial purposes, production environments, bulk calling, reselling as a proxy service, or any action that may violate the WorkBuddy / CodeBuddy terms of service.
+- You must comply with the WorkBuddy / CodeBuddy terms of service and use this project entirely at your own risk.
+- The author is not liable for any direct or indirect loss arising from the use of this project.
+- If your region or platform prohibits such tools, please do not use it.
 
 ## License
 
