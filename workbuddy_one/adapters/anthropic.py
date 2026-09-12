@@ -74,10 +74,14 @@ def anthropic_request_to_chat(body: dict) -> dict:
         elif isinstance(tc, str):
             chat["tool_choice"] = tc if tc in ("none", "auto", "required") else {"type": "function", "function": {"name": tc}}
 
-    # 透传常见参数
-    for key in ("temperature", "top_p", "stop", "top_k"):
+    # 透传常见参数（top_k 不是 OpenAI Chat 参数，之前靠腾讯后端宽容才没报错，不再透传）
+    for key in ("temperature", "top_p", "stop"):
         if key in body:
             chat[key] = body[key]
+
+    # Anthropic 的停止序列字段名是 stop_sequences（OpenAI Chat 叫 stop）
+    if "stop_sequences" in body:
+        chat["stop"] = body["stop_sequences"]
 
     return chat
 
@@ -115,12 +119,23 @@ def _convert_anthropic_message(msg: dict) -> list[dict]:
     if role == "user":
         result: list[dict] = []
         text_parts: list[str] = []
+        image_parts: list[dict] = []
         for block in blocks:
             if not isinstance(block, dict):
                 continue
             bt = block.get("type", "")
             if bt == "text":
                 text_parts.append(block.get("text", ""))
+            elif bt == "image":
+                # Anthropic image 块 → OpenAI image_url（data URI）。保留多模态图片输入。
+                src = block.get("source") or {}
+                mt = src.get("media_type", "image/png") if isinstance(src, dict) else "image/png"
+                data = src.get("data", "") if isinstance(src, dict) else ""
+                if data:
+                    image_parts.append({
+                        "type": "image_url",
+                        "image_url": {"url": f"data:{mt};base64,{data}"},
+                    })
             elif bt == "tool_result":
                 # tool_result → 独立的 tool 消息
                 tc_id = block.get("tool_use_id", "")
@@ -130,8 +145,15 @@ def _convert_anthropic_message(msg: dict) -> list[dict]:
                         b.get("text", "") for b in output if isinstance(b, dict) and b.get("type") == "text"
                     )
                 result.append({"role": "tool", "tool_call_id": tc_id, "content": output})
-        if text_parts:
-            result.insert(0, {"role": "user", "content": "".join(text_parts)})
+        # 文本与图片合并进同一条 user 消息（OpenAI 多模态 content 数组）
+        if text_parts or image_parts:
+            if image_parts:
+                segs: list[dict] = list(image_parts)
+                if text_parts:
+                    segs.insert(0, {"type": "text", "text": "".join(text_parts)})
+                result.insert(0, {"role": "user", "content": segs})
+            else:
+                result.insert(0, {"role": "user", "content": "".join(text_parts)})
         return result
 
     # assistant 角色
@@ -155,10 +177,8 @@ def _convert_anthropic_message(msg: dict) -> list[dict]:
                 }
                 tool_calls.append(tc)
         msg_out: dict[str, Any] = {"role": "assistant"}
-        if text_parts:
-            msg_out["content"] = "".join(text_parts)
-        else:
-            msg_out["content"] = None
+        # OpenAI 要求 assistant.content 为字符串；纯工具调用时为 ""，绝不能是 null
+        msg_out["content"] = "".join(text_parts)
         if tool_calls:
             msg_out["tool_calls"] = tool_calls
         return [msg_out]

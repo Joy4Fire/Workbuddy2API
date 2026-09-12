@@ -43,6 +43,97 @@ class TestReasoning(unittest.TestCase):
         normalize_reasoning_effort(b)
         self.assertEqual(b["reasoning_effort"], "max")
 
+    def test_v41_flash_effort_known(self):
+        # deepseek-v4.1-flash 目录支持 reasoning 至 high（cli2api #146 目录元数据）
+        from workbuddy_one.reasoning import normalize_reasoning_effort
+        b = {"model": "deepseek-v4.1-flash", "reasoning_effort": "max"}
+        normalize_reasoning_effort(b)
+        self.assertEqual(b["reasoning_effort"], "high")
+
+    # --- developer 角色归一（上游 role 白名单，防 11128） ---
+    def test_normalize_roles_developer(self):
+        from workbuddy_one.reasoning import normalize_roles
+        b = {"messages": [
+            {"role": "developer", "content": "sys"},
+            {"role": "user", "content": "hi"},
+            {"role": "assistant", "content": "ok"},
+        ]}
+        normalize_roles(b)
+        self.assertEqual([m["role"] for m in b["messages"]], ["system", "user", "assistant"])
+        # 内容不动
+        self.assertEqual(b["messages"][0]["content"], "sys")
+
+    def test_normalize_roles_no_messages(self):
+        from workbuddy_one.reasoning import normalize_roles
+        b = {"model": "x"}
+        self.assertEqual(normalize_roles(b), b)
+
+    def test_sanitize_body_maps_developer(self):
+        # sanitize_body 全链路：developer 应被归一
+        from workbuddy_one.reasoning import sanitize_body
+        b = {"model": "glm-5.2", "messages": [{"role": "developer", "content": "s"}]}
+        sanitize_body(b)
+        self.assertEqual(b["messages"][0]["role"], "system")
+
+    # --- DeepSeek 思维链开关注入 ---
+    def test_inject_thinking_deepseek_default(self):
+        from workbuddy_one.reasoning import inject_thinking
+        b = {"model": "deepseek-v4-pro", "messages": []}
+        inject_thinking(b)
+        self.assertEqual(b["thinking"], {"type": "enabled"})
+
+    def test_inject_thinking_explicit_untouched(self):
+        from workbuddy_one.reasoning import inject_thinking
+        b = {"model": "deepseek-v4-pro", "thinking": {"type": "enabled"}, "reasoning_effort": "high"}
+        inject_thinking(b)
+        self.assertEqual(b["thinking"], {"type": "enabled"})
+        self.assertEqual(b["reasoning_effort"], "high")  # 明确 enabled 时 effort 保留
+
+    def test_inject_thinking_disabled_removes_effort(self):
+        from workbuddy_one.reasoning import inject_thinking
+        b = {"model": "deepseek-v4-flash", "thinking": {"type": "disabled"}, "reasoning_effort": "high"}
+        inject_thinking(b)
+        self.assertNotIn("reasoning_effort", b)
+
+    def test_inject_thinking_missing_type(self):
+        from workbuddy_one.reasoning import inject_thinking
+        b = {"model": "deepseek-v4-pro", "thinking": {}}
+        inject_thinking(b)
+        self.assertEqual(b["thinking"]["type"], "enabled")
+
+    def test_inject_thinking_non_deepseek_untouched(self):
+        from workbuddy_one.reasoning import inject_thinking
+        b = {"model": "glm-5.3", "messages": [{"role": "user", "content": "hi"}]}
+        inject_thinking(b)
+        self.assertNotIn("thinking", b)
+
+    # --- DeepSeek 多轮 reasoning_content 回填 ---
+    def test_backfill_copies_and_fills(self):
+        from workbuddy_one.reasoning import backfill_reasoning_content
+        b = {"model": "deepseek-v4-pro", "messages": [
+            {"role": "user", "content": "hi"},
+            {"role": "assistant", "content": "a", "reasoning_content": "思考A"},
+            {"role": "assistant", "content": "b", "reasoning": "思考B"},
+            {"role": "assistant", "content": "c"},
+        ]}
+        backfill_reasoning_content(b)
+        msgs = b["messages"]
+        self.assertEqual(msgs[1]["reasoning_content"], "思考A")  # 已有保留
+        self.assertEqual(msgs[2]["reasoning_content"], "思考B")  # reasoning 复制
+        self.assertEqual(msgs[3]["reasoning_content"], "")       # 两者皆无补空串
+
+    def test_backfill_no_trace_untouched(self):
+        from workbuddy_one.reasoning import backfill_reasoning_content
+        b = {"model": "deepseek-v4-pro", "messages": [{"role": "assistant", "content": "a"}]}
+        backfill_reasoning_content(b)
+        self.assertNotIn("reasoning_content", b["messages"][0])
+
+    def test_backfill_non_deepseek_untouched(self):
+        from workbuddy_one.reasoning import backfill_reasoning_content
+        b = {"model": "glm-5.3", "messages": [{"role": "assistant", "content": "a", "reasoning": "x"}]}
+        backfill_reasoning_content(b)
+        self.assertNotIn("reasoning_content", b["messages"][0])
+
 
 class TestDesensitize(unittest.TestCase):
     def test_zero_width_inserted(self):
@@ -156,6 +247,69 @@ class TestDB(unittest.TestCase):
             for f in tmp.glob("test.db*"):
                 f.unlink(missing_ok=True)
 
+    def test_migration_auto_backup(self):
+        """旧版本库升级时自动备份到 <db目录>/backups；升级后再次打开不重复备份。"""
+        import sqlite3
+        from workbuddy_one.db import Database, SCHEMA_VERSION
+        tmp = Path(__file__).resolve().parent / "_tmp"
+        tmp.mkdir(exist_ok=True)
+        old = tmp / "old_backup_test.db"
+        backups_dir = tmp / "backups"
+        for f in list(tmp.glob("old_backup_test.db*")) + list(backups_dir.glob("old_backup_test.pre-migrate-*")):
+            f.unlink(missing_ok=True)
+        # 建一个旧版本库（user_version=1，旧表结构）
+        c = sqlite3.connect(str(old))
+        c.executescript("""
+            CREATE TABLE accounts (uid TEXT UNIQUE, nickname TEXT);
+            CREATE TABLE usage_logs (ts REAL, model TEXT);
+            INSERT INTO accounts (uid, nickname) VALUES ('u-old', '旧账号');
+        """)
+        c.execute("PRAGMA user_version = 1")
+        c.commit()
+        c.close()
+        try:
+            db = Database(str(old))
+            try:
+                # 数据保留 + 版本到位
+                self.assertIsNotNone(db.get_account("u-old"))
+                self.assertEqual(db._user_version(), SCHEMA_VERSION)
+                # 备份文件存在且含旧数据快照
+                baks = list(backups_dir.glob("old_backup_test.pre-migrate-v1-*.bak"))
+                self.assertTrue(baks, "迁移前应生成备份文件")
+                src = sqlite3.connect(str(baks[0]))
+                try:
+                    self.assertEqual(src.execute("SELECT COUNT(*) FROM accounts").fetchone()[0], 1)
+                finally:
+                    src.close()
+                # 已是最新版本的库再次打开：不再产生新备份
+                n_before = len(list(backups_dir.glob("old_backup_test.pre-migrate-*")))
+                db2 = Database(str(old))
+                db2._conn.close()
+                self.assertEqual(n_before, len(list(backups_dir.glob("old_backup_test.pre-migrate-*"))))
+            finally:
+                db._conn.close()
+        finally:
+            for f in list(tmp.glob("old_backup_test.db*")) + list(backups_dir.glob("old_backup_test.pre-migrate-*")):
+                f.unlink(missing_ok=True)
+
+    def test_fresh_db_no_backup(self):
+        """全新空库首次初始化不算"升级"，不产生迁移备份。"""
+        from workbuddy_one.db import Database
+        tmp = Path(__file__).resolve().parent / "_tmp"
+        tmp.mkdir(exist_ok=True)
+        fresh = tmp / "fresh_backup_test.db"
+        backups_dir = tmp / "backups"
+        for f in list(tmp.glob("fresh_backup_test.db*")) + list(backups_dir.glob("fresh_backup_test.pre-migrate-*")):
+            f.unlink(missing_ok=True)
+        try:
+            db = Database(str(fresh))
+            db._conn.close()
+            leftovers = list(backups_dir.glob("fresh_backup_test.pre-migrate-*")) if backups_dir.exists() else []
+            self.assertEqual(leftovers, [])
+        finally:
+            for f in list(tmp.glob("fresh_backup_test.db*")) + list(backups_dir.glob("fresh_backup_test.pre-migrate-*")):
+                f.unlink(missing_ok=True)
+
     def test_migrate_old_schema(self):
         """旧 schema 库（缺列/缺 apps 表）打开后应升级到当前版本且保留数据。"""
         import sqlite3
@@ -201,7 +355,8 @@ class TestDB(unittest.TestCase):
             finally:
                 db._conn.close()
         finally:
-            for f in tmp.glob("old_schema.db*"):
+            # 迁移前自动备份会产生 *.pre-migrate-*.bak，一并清理
+            for f in list(tmp.glob("old_schema.db*")) + list((tmp / "backups").glob("old_schema.db.pre-migrate-*")):
                 f.unlink(missing_ok=True)
 
     def test_merge_legacy_data(self):

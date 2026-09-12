@@ -1,0 +1,16 @@
+# 缩小 docker build 上下文：.venv/node_modules 有几百 MB，data/、auths/ 含
+# 数据库、主密钥 .secret_key 与账号登录凭证——绝不进入构建上下文（哪怕
+# Dockerfile 的 COPY 是选择性的，上下文本身也会整包传给 daemon）。
+.venv/
+.git/
+data/
+auths/
+node_modules/
+frontend/node_modules/
+tests/
+__pycache__/
+**/__pycache__/
+*.db
+*.db-wal
+*.db-shm
+.env

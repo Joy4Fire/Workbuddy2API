@@ -85,7 +85,8 @@ def _summarize(accounts: list) -> tuple[float, float, float | None]:
 
     返回 (remain, total, expire_at)：expire_at 为最早到期时间戳（秒），无则 None。
     到期时间来源：CycleEndTime（"YYYY-MM-DD HH:MM:SS"）、ExpiredTime（同上）、
-    DeductionEndTime（毫秒时间戳）。取该账号所有包中「最早的到期时间」。
+    DeductionEndTime（毫秒时间戳）。取「还有剩余额度的包」中最早的到期时间
+    （已用完的包不计，与官方控制台"最近到期时间"口径一致）。
     """
     remain = 0.0
     total = 0.0
@@ -108,13 +109,72 @@ def _summarize(accounts: list) -> tuple[float, float, float | None]:
         else:
             remain += max(cap_remain, 0.0)
             total += cap_size
-        # 到期时间：取本包最早到期
+        # 到期时间：只统计还有剩余额度的包。已用完的包（Remain=0，Status=3）也带
+        # ExpiredTime（过去的结算时间），混进来会让「积分到期」显示成错误的过去
+        # 时间（显示"已到期"但积分其实还能用）。官方控制台的"最近到期时间"同样
+        # 只算有余额的包。
+        if cycle_remain <= 0 and cap_remain <= 0:
+            continue
         for key, is_ms in (("CycleEndTime", False), ("ExpiredTime", False), ("DeductionEndTime", True)):
             raw = acct.get(key)
             ts = _parse_ts(raw, is_ms)
             if ts is not None and (earliest is None or ts < earliest):
                 earliest = ts
     return remain, total, earliest
+
+
+def _summarize_packages(accounts: list) -> list[dict]:
+    """按 PackageCode 聚合各积分包，给出与官方控制台"积分明细"同口径的构成。
+
+    remain/used/total 统计**全部**包（含已用完的批次，否则总量对不上控制台的
+    "已使用 1,300/2,500"）；expire_at 只统计**还有余额**的包的最早到期时间
+    （已用完批次的到期时间无意义，与 _summarize 的 expire_at 口径一致）。
+
+    返回 [{name, remain, used, total, expire_at}]，按剩余额度降序。
+    """
+    groups: dict[str, dict] = {}
+    for acct in accounts:
+        if not isinstance(acct, dict):
+            continue
+        cycle_used = _num(acct.get("CycleCapacityUsed"))
+        cap_used = _num(acct.get("CapacityUsed"))
+        # 优先取 *Precise 精确值（如 480.9），与官方控制台显示一致；缺失回落整数字段
+        def _p(base: str) -> float:
+            v = acct.get(base + "Precise")
+            if v is None or v == "":
+                return _num(acct.get(base))
+            try:
+                return float(v)
+            except (TypeError, ValueError):
+                return _num(acct.get(base))
+        cycle_remain = _p("CycleCapacityRemain")
+        cycle_size = _p("CycleCapacitySize")
+        cap_remain = _p("CapacityRemain")
+        cap_size = _p("CapacitySize")
+        cycle_used = _p("CycleCapacityUsed")
+        cap_used = _p("CapacityUsed")
+        if cycle_size > 0:
+            remain, used, total = cycle_remain, cycle_used, cycle_size
+        elif cycle_remain > 0 or cycle_used > 0:
+            remain, used, total = cycle_remain, cycle_used, cycle_size
+        else:
+            remain, used, total = cap_remain, cap_used, cap_size
+        key = str(acct.get("PackageCode") or acct.get("SubProductCode") or "other")
+        g = groups.setdefault(key, {
+            "name": str(acct.get("PackageName") or key),
+            "remain": 0.0, "used": 0.0, "total": 0.0, "expire_at": None,
+        })
+        g["remain"] += max(remain, 0.0)
+        g["used"] += max(used, 0.0)
+        g["total"] += max(total, 0.0)
+        if remain > 0:
+            for key2, is_ms in (("CycleEndTime", False), ("ExpiredTime", False), ("DeductionEndTime", True)):
+                ts = _parse_ts(acct.get(key2), is_ms)
+                if ts is not None and (g["expire_at"] is None or ts < g["expire_at"]):
+                    g["expire_at"] = ts
+    out = [g for g in groups.values() if g["total"] > 0]
+    out.sort(key=lambda g: -g["remain"])
+    return out
 
 
 def _parse_ts(raw, is_ms: bool) -> float | None:
@@ -148,35 +208,38 @@ async def _post_json(mgr, url: str, body: dict) -> dict:
 
 
 async def _fetch_new_credits(mgr) -> dict | None:
-    """尝试新计费三接口；任一接口鉴权/权限失败返回 None（走降级）。"""
+    """尝试新计费三接口；全部失败返回 None（走降级）。单个接口失败不影响其余接口。"""
     now = datetime.now()
     day_start = now.strftime("%Y-%m-%d 00:00:00")
     day_end = now.strftime("%Y-%m-%d 23:59:59")
     base = f"{config.backend}/billing/meter"
     accounts: list = []
-    try:
+    endpoints: list[tuple[str, dict]] = [
         # 1) summary（聚合）
-        j = await _post_json(mgr, f"{base}/get-user-resource-summary", {})
-        accounts.extend(_extract_accounts(j))
+        (f"{base}/get-user-resource-summary", {}),
         # 2) paid-packages
-        j = await _post_json(mgr, f"{base}/get-user-resource-paid-packages", {
+        (f"{base}/get-user-resource-paid-packages", {
             "PageNumber": 1, "PageSize": 100, "PackageCodes": PAID_PACKAGE_CODES,
             "Status": [0, 3], "NeedRenewInfo": True, "IsDisplayTotalInfo": True,
-        })
-        accounts.extend(_extract_accounts(j))
+        }),
         # 3) free-packages
-        j = await _post_json(mgr, f"{base}/get-user-resource-free-packages", {
+        (f"{base}/get-user-resource-free-packages", {
             "PageNumber": 1, "PageSize": 100, "PackageCodes": FREE_PACKAGE_CODES,
             "Status": [0, 3], "SlicePeriodStartTime": day_start, "SlicePeriodEndTime": day_end,
             "IsDisplayTotalInfo": True,
-        })
+        }),
+    ]
+    for url, body in endpoints:
+        try:
+            j = await _post_json(mgr, url, body)
+        except httpx.HTTPError:
+            continue  # 单个接口异常不丢弃其它接口结果
         accounts.extend(_extract_accounts(j))
-    except httpx.HTTPError:
-        return None
     if not accounts:
         return None
     remain, total, expire_at = _summarize(accounts)
-    return {"remain": round(remain), "total": round(total), "expire_at": expire_at}
+    return {"remain": round(remain), "total": round(total), "expire_at": expire_at,
+            "packages": _summarize_packages(accounts)}
 
 
 async def _fetch_old_credits(mgr) -> dict | None:
@@ -198,14 +261,16 @@ async def _fetch_old_credits(mgr) -> dict | None:
     if not accounts:
         return None
     remain, total, expire_at = _summarize(accounts)
-    return {"remain": round(remain), "total": round(total), "expire_at": expire_at}
+    return {"remain": round(remain), "total": round(total), "expire_at": expire_at,
+            "packages": _summarize_packages(accounts)}
 
 
 async def fetch_credits(mgr) -> dict:
-    """查询账号当前可花费积分余额，返回 {remain, total, expire_at}。
+    """查询账号当前可花费积分余额，返回 {remain, total, expire_at, packages}。
 
     优先新三接口；新接口不可用时降级旧接口；两者都失败则抛异常。
-    expire_at 为最早到期时间戳（秒），可能为 None。
+    expire_at 为最早到期时间戳（秒，只算有余额的包），可能为 None；
+    packages 为按商品聚合的积分构成（与官方控制台"积分明细"同口径）。
     """
     res = await _fetch_new_credits(mgr)
     if res is not None:

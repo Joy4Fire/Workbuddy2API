@@ -1,0 +1,28 @@
+# WorkBuddy2API 单用户网关 — Docker Compose
+# 个人自用：直接挂载宿主机 data/ 与 auths/ 目录，数据持久化在宿主机，
+# 容器可随时重建而数据不丢失（数据库、附件、密钥、auth 文件都在里面）。
+services:
+  workbuddy2api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: workbuddy2api:latest
+    container_name: workbuddy2api
+    restart: unless-stopped
+    ports:
+      - "8787:8787"
+    environment:
+      # 监听 0.0.0.0，配合端口映射从本机 localhost 访问
+      HOST: 0.0.0.0
+      PORT: "8787"
+      TZ: Asia/Shanghai
+      # 个人自用（仅本机 localhost 访问）：无需设置 ADMIN_TOKEN。
+      # 管理端回环校验已在源码中兼容 Docker 端口映射（Host 为 localhost 即放行）。
+      # 如需从局域网/公网访问，取消下面注释并设置一个随机 token，在 WebUI 右上角
+      # 「Token 管理」里填入即可：
+      # ADMIN_TOKEN: "changeme"
+    volumes:
+      # 持久化宿主机上的运行时数据（数据库/附件/密钥）
+      - ./data:/app/data
+      # 持久化宿主机上的 auth 文件（扫码登录/上传落盘）
+      - ./auths:/app/auths

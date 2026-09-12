@@ -116,7 +116,7 @@ def _convert_input_items(items: list) -> list[dict]:
         if item_type is None and role in ("user", "system", "developer"):
             _flush_assistant()
             mapped_role = "system" if role == "developer" else role
-            content = _extract_content(item.get("content", ""))
+            content = _content_with_images(item.get("content", ""))
             messages.append({"role": mapped_role, "content": content})
             continue
 
@@ -124,7 +124,7 @@ def _convert_input_items(items: list) -> list[dict]:
         if item_type == "message" and role in ("user", "system", "developer"):
             _flush_assistant()
             mapped_role = "system" if role == "developer" else role
-            content = _extract_content(item.get("content", ""))
+            content = _content_with_images(item.get("content", ""))
             messages.append({"role": mapped_role, "content": content})
             continue
 
@@ -193,6 +193,57 @@ def _extract_content(content) -> str:
                 parts.append(p)
         return "".join(parts) or str(content)
     return str(content)
+
+
+def _image_data_url(block: dict) -> str:
+    """从 input_image 块提取 data URL，两种格式都兼容：
+    {"type":"input_image","image_url":"data:image/png;base64,..."}
+    {"type":"input_image","image":{"media_type":...,"data":...}}
+    """
+    url = block.get("image_url")
+    if isinstance(url, str) and url:
+        return url
+    if isinstance(url, dict) and url.get("url"):
+        return str(url["url"])
+    img = block.get("image")
+    if isinstance(img, dict) and img.get("data"):
+        mt = img.get("media_type", "image/png")
+        return f"data:{mt};base64,{img['data']}"
+    return ""
+
+
+def _content_with_images(content):
+    """提取用户消息 content，兼容 input_image 图片块（否则 Codex 发图会被静默丢弃）。
+
+    返回：无图片时为纯文本字符串（减少对上游的格式扰动）；
+    有图片时为 OpenAI 多模态数组 [{"type":"text",...}, {"type":"image_url",...}]。
+    """
+    if isinstance(content, str):
+        return content
+    if not isinstance(content, list):
+        return str(content)
+    texts: list[str] = []
+    images: list[dict] = []
+    for p in content:
+        if isinstance(p, str):
+            texts.append(p)
+            continue
+        if not isinstance(p, dict):
+            continue
+        t = p.get("type")
+        if t in ("input_text", "text", "output_text"):
+            texts.append(p.get("text", ""))
+        elif t == "input_image":
+            url = _image_data_url(p)
+            if url:
+                images.append({"type": "image_url", "image_url": {"url": url}})
+    if not images:
+        return "".join(texts)
+    parts: list[dict] = []
+    if texts:
+        parts.append({"type": "text", "text": "".join(texts)})
+    parts.extend(images)
+    return parts
 
 
 def _extract_output_text(content_parts: list) -> str:

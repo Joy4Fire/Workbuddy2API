@@ -13,7 +13,8 @@ logger = logging.getLogger("workbuddy_one.reasoning")
 # effort 档位从低到高
 _EFFORT_RANK = {"off": 0, "minimal": 1, "low": 2, "medium": 3, "high": 4, "xhigh": 5, "max": 6}
 
-# 已知模型的 reasoning 支持档位（尽力而为；未知模型透传）
+# 已知模型的 reasoning 支持档位（尽力而为；未知模型透传）。
+# 运行时以模型目录的动态表为准，这里只是目录冷启动时的兜底。
 KNOWN_EFFORTS: dict[str, list[str]] = {
     "glm-5.2": ["low", "medium", "high"],
     "glm-5.1": ["low", "medium", "high"],
@@ -23,6 +24,9 @@ KNOWN_EFFORTS: dict[str, list[str]] = {
     "kimi-k2.5": ["low", "medium", "high"],
     "deepseek-v4-pro": ["off", "low", "medium", "high"],
     "deepseek-v4-flash": ["off", "low", "medium", "high"],
+    # deepseek-v4.1-flash：目录标注支持 reasoning（档位至 high，300k/1M 上下文），
+    # 参考 cli2api #146 的目录元数据
+    "deepseek-v4.1-flash": ["low", "medium", "high"],
     "minimax-m3-pay": ["low", "medium", "high"],
     "hy3-preview-agent": ["low", "medium", "high"],
 }
@@ -99,10 +103,98 @@ def normalize_tool_choice(body: dict) -> dict:
 
 
 def sanitize_body(body: dict, efforts: dict[str, list[str]] | None = None) -> dict:
-    """对发送给上游的 body 做统一规整：tool_choice 归一化 + reasoning 降级。
+    """对发送给上游的 body 做统一规整。
+
+    - tool_choice 归一化（对象 → string）
+    - reasoning_effort 按模型档位降级
+    - developer 角色归一为 system（上游 role 白名单校验，防 11128）
+    - DeepSeek 思维链开关注入 + 多轮 reasoning_content 回填
 
     efforts: 可选的动态思考强度表（来自模型目录），优先于内置 KNOWN_EFFORTS。
     """
     body = normalize_tool_choice(body)
     body = normalize_reasoning_effort(body, efforts=efforts)
+    body = normalize_roles(body)
+    body = inject_thinking(body)
+    body = backfill_reasoning_content(body)
+    return body
+
+
+def normalize_roles(body: dict) -> dict:
+    """把 messages 里的 developer 角色归一为 system（协议兼容，非内容脱敏）。
+
+    腾讯上游对 role 做白名单校验，developer 不在其中，命中即 HTTP 400
+    code=11128（Sliverkiss 与 codebuddy2api 两个独立实现均踩过此坑）。
+    developer 是 OpenAI 新规范里 system 的别名（Codex/Cursor 等客户端用它承载
+    system 级指令），改写为 system 不丢语义。只认 developer 这一个值：
+    其余 role 一律原样保留，不合并、不重排、不删除任何消息。
+    """
+    msgs = body.get("messages")
+    if not isinstance(msgs, list):
+        return body
+    for m in msgs:
+        if isinstance(m, dict) and m.get("role") == "developer":
+            m["role"] = "system"
+    return body
+
+
+def _is_deepseek(model) -> bool:
+    return str(model or "").strip().lower().startswith("deepseek")
+
+
+def inject_thinking(body: dict) -> dict:
+    """DeepSeek 思维链开关：无显式 thinking 时注入 {type: enabled}（非 deepseek 零改动）。
+
+    deepseek 模型不带 thinking 字段时上游不返回思维链（Sliverkiss #43）：
+    - 客户端显式给了 thinking.type（enabled/disabled）→ 视为明确意图不改写；
+      disabled 时同步删掉 reasoning_effort（与官方 disabled 语义一致）
+    - thinking 对象存在但 type 缺失 → 补 enabled
+    - 无 thinking（或非法值）→ 注入 enabled；有 reasoning_effort 也照常注入
+      （effort 交给既有降级逻辑，开关照开）
+    """
+    if not _is_deepseek(body.get("model")):
+        return body
+    th = body.get("thinking")
+    if isinstance(th, dict):
+        typ = str(th.get("type") or "").strip()
+        if typ:
+            if typ.lower() == "disabled":
+                body.pop("reasoning_effort", None)
+                body.pop("reasoningEffort", None)
+            return body
+        th["type"] = "enabled"
+        return body
+    body["thinking"] = {"type": "enabled"}
+    return body
+
+
+def backfill_reasoning_content(body: dict) -> dict:
+    """DeepSeek 多轮一致性：回填 assistant 消息的 reasoning_content（非 deepseek 零改动）。
+
+    DeepSeek 对多轮会话有约束——历史 assistant 消息带思考痕迹时，后续请求的
+    所有 assistant 消息必须带 reasoning_content 字段（字符串，可为空串），
+    否则上游按缺字段校验/语义异常处理。规则（参考 Sliverkiss）：
+    - 任一 assistant 消息带非空 reasoning/reasoning_content → 所有 assistant
+      消息确保有 reasoning_content：有 reasoning 无 reasoning_content 的复制之，
+      已有字符串的保留（不覆盖，空串视为客户端明确意图），两者皆无的补空串
+    - 无任何思考痕迹 → 零改动（不白白加字段）
+    """
+    if not _is_deepseek(body.get("model")):
+        return body
+    msgs = body.get("messages")
+    if not isinstance(msgs, list):
+        return body
+    assistants = [m for m in msgs if isinstance(m, dict) and m.get("role") == "assistant"]
+
+    def _has_trace(m: dict) -> bool:
+        rc, r = m.get("reasoning_content"), m.get("reasoning")
+        return (isinstance(rc, str) and bool(rc)) or (isinstance(r, str) and bool(r))
+
+    if not any(_has_trace(m) for m in assistants):
+        return body
+    for m in assistants:
+        if isinstance(m.get("reasoning_content"), str):
+            continue
+        reason = m.get("reasoning")
+        m["reasoning_content"] = reason if isinstance(reason, str) else ""
     return body

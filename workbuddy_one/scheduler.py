@@ -7,12 +7,37 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import time
 from datetime import datetime
+from pathlib import Path
 
 from . import billing
 from .pool import AccountPool
 
 logger = logging.getLogger("workbuddy_one.scheduler")
+
+# 附件归档目录（与 app.py 的 ATTACH_DIR 同一位置）：归档只增不减，由每日清理任务
+# 按使用记录保留期一并清理。此处独立定义路径，避免 scheduler→app 循环导入。
+_ATTACH_DIR = Path(__file__).resolve().parent.parent / "data" / "attachments"
+
+
+def cleanup_attachments(retention_days: int) -> int:
+    """删除 mtime 早于保留期的归档附件，返回删除数量。
+
+    归档附件的生命周期与使用记录一致：记录删了，附件留着也无人引用。
+    """
+    if not _ATTACH_DIR.is_dir():
+        return 0
+    cutoff = time.time() - retention_days * 86400
+    removed = 0
+    for f in _ATTACH_DIR.iterdir():
+        try:
+            if f.is_file() and f.stat().st_mtime < cutoff:
+                f.unlink()
+                removed += 1
+        except OSError:
+            continue
+    return removed
 
 
 def _parse_hours(s: str) -> tuple[int, ...]:
@@ -34,27 +59,45 @@ def _parse_hour(s: str, default: int) -> int:
 
 
 class Scheduler:
-    def __init__(self, pool: AccountPool, *, db=None, models=None, benchmarks=None, credit_interval_min: int = 30):
+    def __init__(self, pool: AccountPool, *, db=None, models=None, benchmarks=None, credit_interval_min: int = 30,
+                 usage_retention_days: int = 90):
         self.pool = pool
         self.db = db
         self.models = models
         self.benchmarks = benchmarks
         self.credit_interval_min = credit_interval_min
+        self.usage_retention_days = max(1, int(usage_retention_days))
         self._last_checkin_date: str | None = None
         self._last_keepalive_date: str | None = None
         self._last_model_refresh_date: str | None = None
         self._last_aa_refresh_date: str | None = None
+        self._last_cleanup_date: str | None = None
         self._task: asyncio.Task | None = None
         self._running = False
+        # 连续保活失败计数（uid → 次数）：避免偶发网络抖动一次就永久禁用账号
+        self._keepalive_fails: dict[str, int] = {}
+        # 保活连续失败阈值：达到才视为 session 失效并禁用账号
+        self._keepalive_fail_threshold = 3
 
     async def start(self):
         self._running = True
         self._task = asyncio.create_task(self._run())
-        # 启动时：刷新额度 + 模型目录
+        # 启动时：刷新额度 + 模型目录 + AA 评测（全部预热，页面首开即有数据）
         await self.refresh_credits()
         if self.models:
             try:
                 await asyncio.to_thread(self.models.refresh)
+            except Exception:  # noqa: BLE001
+                pass
+        if self.benchmarks and self.benchmarks.configured() and not self.benchmarks.has_cache():
+            try:
+                await asyncio.to_thread(self.benchmarks.refresh)
+            except Exception:  # noqa: BLE001
+                pass
+        # 启动时做一次存量瘦身：早期版本曾全量重复入库，可能残留超大 content（单条 30 万+ 字符）
+        if self.db:
+            try:
+                await asyncio.to_thread(self.db.trim_usage_content)
             except Exception:  # noqa: BLE001
                 pass
 
@@ -89,6 +132,9 @@ class Scheduler:
     def _keepalive_hour(self) -> int:
         return _parse_hour(self._setting("keepalive_hour", "22"), 22)
 
+    def _keepalive_enabled(self) -> bool:
+        return self._setting("keepalive_enabled", "1") == "1"
+
     def checked_in_today(self) -> set[str]:
         """返回今日已签到的账号 uid 集合（本地记录判定）。"""
         today = datetime.now().strftime("%Y-%m-%d")
@@ -101,10 +147,11 @@ class Scheduler:
         return {uid for uid, d in dates.items() if d == today}
 
     async def refresh_credits(self):
-        for acc in self.pool.accounts:
+        for acc in list(self.pool.accounts):  # 快照遍历：管理端点可能并发增删账号
             try:
                 res = await billing.fetch_credits(acc.mgr)
-                self.pool.set_credits(acc.uid, res["remain"], res["total"], res.get("expire_at"))
+                self.pool.set_credits(acc.uid, res["remain"], res["total"], res.get("expire_at"),
+                                      packages=res.get("packages"))
                 # 持久化最近额度到 DB，进程重启后可恢复（避免额度盲区）
                 if self.db:
                     self.db.set_account_state(acc.uid, credits_remaining=res["remain"],
@@ -112,7 +159,7 @@ class Scheduler:
                                               credits_expire_at=res.get("expire_at"))
                 # 余额 > 0 的冷却账号自动解冻（参考 Sliverkiss ReenableIfCredits）
                 if res["remain"] > 0:
-                    self.pool.clear_cooldown(acc.uid, enabled=True)
+                    self.pool.clear_cooldown(acc.uid)
                 logger.info("额度 %s: remain=%s total=%s expire=%s", acc.uid, res["remain"],
                             res["total"], res.get("expire_at"))
             except Exception as e:  # noqa: BLE001
@@ -127,7 +174,7 @@ class Scheduler:
         if skip is None:
             skip = self.checked_in_today()
         results = []
-        for acc in self.pool.accounts:
+        for acc in list(self.pool.accounts):  # 快照遍历：管理端点可能并发增删账号
             if acc.uid in skip:
                 logger.info("签到跳过 %s（今日已签到）", acc.uid)
                 results.append((acc.uid, {"ok": False, "message": "今日已签到", "already": True}))
@@ -148,17 +195,35 @@ class Scheduler:
         return results
 
     async def do_keepalive(self):
-        """强制刷新所有账号 token；session 失效的账号自动禁用。"""
+        """强制刷新所有账号 token；连续多次失败（session 可能失效）才自动禁用。
+
+        偶发单次失败仅计数，不立即禁用，避免网络抖动导致账号"莫名被禁用"；
+        成功一次即重置计数，并在账号是被保活禁用的情况下自动恢复启用。
+        """
+        if not self._keepalive_enabled():
+            logger.info("保活已由用户关闭（keepalive_enabled=0），跳过")
+            return
         today = datetime.now().strftime("%Y-%m-%d")
-        for acc in self.pool.accounts:
+        for acc in list(self.pool.accounts):  # 快照遍历：管理端点可能并发增删账号
             if not acc.enabled:
                 continue
             ok = await asyncio.to_thread(acc.mgr.keepalive)
             if ok:
+                self._keepalive_fails.pop(acc.uid, None)  # 重置失败计数
                 logger.info("token 保活 %s: ok", acc.uid)
             else:
-                logger.warning("token 保活 %s: 失败（session 可能失效），自动禁用", acc.uid)
-                self.pool.set_enabled(acc.uid, False)
+                fails = self._keepalive_fails.get(acc.uid, 0) + 1
+                self._keepalive_fails[acc.uid] = fails
+                if fails >= self._keepalive_fail_threshold:
+                    logger.error("token 保活 %s: 连续 %d 次失败（session 可能失效），自动禁用", acc.uid, fails)
+                    self.pool.set_enabled(acc.uid, False)
+                    # 同步落库：否则重启后账号"复活"，坏 session 继续打上游
+                    if self.db:
+                        self.db.set_account_state(acc.uid, enabled=0)
+                    self._keepalive_fails[acc.uid] = 0  # 禁用后重置，等待用户重新登录
+                else:
+                    logger.warning("token 保活 %s: 失败 %d/%d 次（暂不禁用）", acc.uid, fails,
+                                   self._keepalive_fail_threshold)
         self._last_keepalive_date = today
 
     async def refresh_models(self):
@@ -181,14 +246,41 @@ class Scheduler:
         except Exception as e:  # noqa: BLE001
             logger.warning("AA 评测刷新异常: %s", e)
 
+    async def cleanup_usage(self):
+        """每日清理过期使用记录，防止 DB 无限膨胀。
+
+        历史 content（含 base64 图片等大文本）体积增长很快，超期删除能控制单库体积；
+        顺带 VACUUM 回收删除/增删产生的空闲页，把文件体积压回真实数据量。
+        同时清理 data/attachments 附件归档（只增不减，与使用记录同一保留期）。
+        """
+        if not self.db:
+            return
+        try:
+            changed = await asyncio.to_thread(
+                self.db.cleanup_usage, self.usage_retention_days, True)
+            logger.info("使用记录清理完成（保留 %d 天，含 VACUUM）", self.usage_retention_days)
+        except Exception as e:  # noqa: BLE001
+            logger.warning("使用记录清理异常: %s", e)
+            return None
+        try:
+            removed = await asyncio.to_thread(cleanup_attachments, self.usage_retention_days)
+            if removed:
+                logger.info("附件清理完成：删除 %d 个超期归档附件", removed)
+        except Exception as e:  # noqa: BLE001
+            logger.warning("附件清理异常: %s", e)
+        return changed
+
     async def _run(self):
         last_credit = 0.0
         while self._running:
             now = datetime.now()
             today = now.strftime("%Y-%m-%d")
             hours = self._checkin_hours()
-            # 每日签到：到点且今天未签
-            if now.hour in hours and self._last_checkin_date != today:
+            # 每日签到：追赶语义——只要已过当天最早的签到点且今天未签就执行，
+            # 服务在签到窗口之后才启动（本机开发常态）也能补上当天签到；
+            # do_checkin 内部按 DB 记录跳过已签账号，且 _last_checkin_date 无条件置位，
+            # 不会每分钟重复请求上游
+            if now.hour >= min(hours) and self._last_checkin_date != today:
                 try:
                     await self.do_checkin()
                 except Exception as e:  # noqa: BLE001
@@ -199,6 +291,13 @@ class Scheduler:
                     await self.do_keepalive()
                 except Exception as e:  # noqa: BLE001
                     logger.warning("保活任务异常: %s", e)
+            # 每日使用记录清理（每天凌晨 4 点执行一次）
+            if now.hour == 4 and self._last_cleanup_date != today:
+                try:
+                    await self.cleanup_usage()
+                except Exception as e:  # noqa: BLE001
+                    logger.warning("使用记录清理异常: %s", e)
+                self._last_cleanup_date = today
             # 每日模型刷新
             if now.hour == self._model_refresh_hour() and self._last_model_refresh_date != today:
                 try:

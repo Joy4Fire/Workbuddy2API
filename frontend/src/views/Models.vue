@@ -153,8 +153,11 @@ onMounted(load)
     </div>
 
     <a-spin :spinning="loading || aaLoading">
-      <div v-if="!models.length" class="empty">暂无模型</div>
-      <div class="card-grid">
+      <div v-if="!models.length" class="empty-state">
+        <p class="empty-title">暂无模型数据</p>
+        <p class="empty-desc">需要先在「账号」页配置账号（扫码登录或上传 auth 文件），配置后点上方「刷新模型」从上游拉取真实模型目录。</p>
+      </div>
+      <div v-else class="card-grid">
         <div v-for="m in filtered" :key="m.id" class="model-card" :class="m.modality">
           <div class="card-head">
             <div class="card-title-row">
@@ -193,13 +196,12 @@ onMounted(load)
             <div class="aa-scores">
               <div class="aa-score"><span class="as-v">{{ fmtNum(m.benchmark.intelligence_index) }}</span><span class="as-k">智能</span></div>
               <div class="aa-score"><span class="as-v">{{ fmtNum(m.benchmark.coding_index) }}</span><span class="as-k">编码</span></div>
-              <div class="aa-score"><span class="as-v">{{ fmtNum(m.benchmark.agentic_index) }}</span><span class="as-k">Agentic</span></div>
+              <div class="aa-score"><span class="as-v">{{ fmtNum(m.benchmark.math_index) }}</span><span class="as-k">数学</span></div>
             </div>
           </div>
         </div>
       </div>
     </a-spin>
-
     <!-- 未配置 AA key 提示 -->
     <a-alert
       v-if="!aaConfigured"
@@ -207,7 +209,7 @@ onMounted(load)
       show-icon
       style="margin-top: 16px"
       message="未配置 Artificial Analysis 评测"
-      description="在「账号 → 自动签到设置」中填入 AA API Key 后，将在此展示各模型的权威评测数据（智能/编码/数学指数、MMLU-Pro、速度、价格）。"
+      description="在「账号 → 自动签到设置」中填入 AA API Key 后，将在此展示各模型的权威评测数据（智能/编码/数学指数）。"
     />
   </div>
 </template>
@@ -236,6 +238,13 @@ onMounted(load)
 .m-label { font-size: 12px; color: #8a94a6; }
 
 .empty { padding: 40px; text-align: center; color: #8a94a6; }
+.empty-state {
+  padding: 48px 24px; text-align: center; color: #8a94a6;
+  background: linear-gradient(150deg, #1b2038 0%, #232a4a 100%);
+  border: 1px dashed rgba(99, 179, 237, 0.3); border-radius: 14px;
+}
+.empty-title { font-size: 15px; font-weight: 700; color: #cdd6e8; margin-bottom: 8px; }
+.empty-desc { font-size: 13px; max-width: 480px; margin: 0 auto; line-height: 1.6; }
 
 .card-grid {
   display: grid; grid-template-columns: repeat(auto-fill, minmax(320px, 1fr));
@@ -291,7 +300,7 @@ onMounted(load)
 .aa-head { display: flex; justify-content: space-between; align-items: center; margin-bottom: 8px; }
 .aa-title { font-size: 12px; font-weight: 700; color: #c4b5fd; }
 .aa-link { font-size: 12px; color: #63b3ed; }
-.aa-scores { display: grid; grid-template-columns: repeat(5, 1fr); gap: 4px; text-align: center; }
+.aa-scores { display: grid; grid-template-columns: repeat(3, 1fr); gap: 4px; text-align: center; }
 .aa-score { display: flex; flex-direction: column; align-items: center; }
 .as-v { font-size: 15px; font-weight: 700; color: #a5f3fc; }
 .as-k { font-size: 10px; color: #8a94a6; margin-top: 2px; }

@@ -24,17 +24,8 @@ DEFAULT_TTL = 3600
 # 失败负缓存时长（秒）
 FAIL_COOLDOWN = 300
 
-# 兜底静态模型（上游拉取失败时使用）。
-# 只保留实测可用模型：上游 cli 白名单内模型 + 实测可用的白名单外模型（hunyuan-2.0-thinking / kimi-k2.5）。
-# 已剔除实测 400 失效的 ID：kimi-k2-thinking、minimax-m2.5。
-STATIC_MODELS = [
-    "auto",
-    "hy3", "hunyuan-2.0-thinking", "hunyuan-chat",
-    "glm-5.2", "glm-5.1", "glm-5v-turbo",
-    "kimi-k3-1", "kimi-k2.7", "kimi-k2.6", "kimi-k2.5",
-    "deepseek-v4-pro", "deepseek-v4-flash",
-    "minimax-m3",
-]
+# 说明：已移除静态兜底模型列表——宁可显示空列表并引导配置账号，
+# 也不展示带不出元数据（成本/上下文全是 "-"）的过时模型清单误导使用。
 
 # 权威模态修正表（人工核对各模型真实能力）。
 # WorkBuddy 上游的 supportsImages 标注并不可靠——实测把 deepseek-v4-flash/pro、
@@ -60,15 +51,18 @@ MODALITY_OVERRIDE: dict[str, bool] = {
     "kimi-k2.6": True,
     "kimi-k2.5": True,
     "minimax-m3": True,
+    # DeepSeek V4.1：上游描述明确"原生多模态"
+    "deepseek-v4.1-flash": True,
 }
 
 
 class ModelRegistry:
     """动态模型目录（线程安全）。"""
 
-    def __init__(self, pool, *, ttl: int = DEFAULT_TTL, fail_cooldown: int = FAIL_COOLDOWN):
+    def __init__(self, pool, *, db=None, ttl: int = DEFAULT_TTL, fail_cooldown: int = FAIL_COOLDOWN):
         self.pool = pool
-        self.ttl = ttl
+        self.db = db
+        self._default_ttl = ttl
         self.fail_cooldown = fail_cooldown
         self._lock = threading.Lock()
         self._models: list[dict] | None = None   # [{id,name,context_length,max_output_tokens,reasoning}]
@@ -77,21 +71,48 @@ class ModelRegistry:
         self._last_fail: float = 0.0
         self._source: str = "static"   # 当前模型来源：dynamic=上游拉取, static=静态兜底
 
+    def _ttl(self) -> int:
+        """当前 TTL（秒）：优先读数据库设置 model_ttl_min（分钟），否则用默认值。
+
+        这样用户可在 WebUI「自动签到设置」里动态调整模型缓存刷新间隔，无需改代码。
+        """
+        if self.db:
+            try:
+                minutes = int(self.db.get_settings().get("model_ttl_min", "") or self._default_ttl // 60)
+                if 1 <= minutes <= 1440:
+                    return minutes * 60
+            except (TypeError, ValueError):
+                pass
+        return self._default_ttl
+
     # ---- 对外 ----
 
     def list(self) -> list[dict]:
         """返回当前可用模型（OpenAI /v1/models 格式条目）。缓存过期时尝试刷新。"""
         now = time.time()
+        ttl = self._ttl()
         with self._lock:
-            if self._models and (now - self._fetched_at) < self.ttl:
+            if self._models and (now - self._fetched_at) < ttl:
                 return [self._with_standard_fields(dict(m)) for m in self._models]
             in_fail_cooldown = (self._last_fail != 0.0) and (now - self._last_fail) < self.fail_cooldown
         if in_fail_cooldown:
             return [self._with_standard_fields(dict(m)) for m in self._fallback()]
         return self.refresh()
 
+    def list_cached(self) -> list[dict]:
+        """只读缓存快照（绝不触发网络刷新），供概览等高频端点使用。
+
+        缓存为空/过期时返回最后一份成功数据（可能为空列表），
+        由后台调度器负责定期刷新，避免请求路径被上游网络往返拖慢。
+        """
+        with self._lock:
+            return [self._with_standard_fields(dict(m)) for m in (self._models or [])]
+
     def ids(self) -> list[str]:
         return [m["id"] for m in self.list()]
+
+    def ids_cached(self) -> list[str]:
+        return [m["id"] for m in self.list_cached()]
 
     def source(self) -> str:
         """当前模型来源：dynamic=上游拉取, static=静态兜底。"""
@@ -99,13 +120,13 @@ class ModelRegistry:
             return self._source
 
     def refresh(self) -> list[dict]:
-        """强制刷新模型缓存（拉取上游）。失败则回退静态列表并记负缓存。"""
+        """强制刷新模型缓存（拉取上游）。失败则保留旧缓存并记负缓存。"""
         fetched = self._fetch_from_upstream()
         if fetched is None:
             with self._lock:
                 self._last_fail = time.time()
-                self._source = "static"
-            logger.warning("模型拉取失败，回退静态列表")
+                self._source = "dynamic" if self._models else "empty"
+            logger.warning("模型拉取失败，%s", "保留上次缓存" if self._models else "无缓存可用")
             return self._fallback()
         with self._lock:
             self._models = [m[0] for m in fetched]
@@ -117,12 +138,12 @@ class ModelRegistry:
         return [self._with_standard_fields(dict(m)) for m in self._models]
 
     def set_static(self) -> list[dict]:
-        """仅用静态列表（如无账号时）。"""
+        """兼容保留：仅返回当前缓存（不再构造静态列表）。"""
         with self._lock:
-            self._models = self._static_entries()
-            self._reasoning = {}
+            self._models = self._models or []
+            self._reasoning = self._reasoning or {}
             self._fetched_at = time.time()
-            self._source = "static"
+            self._source = "dynamic" if self._models else "empty"
         return [dict(m) for m in self._models]
 
     # ---- 对外 ----
@@ -150,10 +171,9 @@ class ModelRegistry:
         return efforts or None
 
     def _fallback(self) -> list[dict]:
+        """无动态数据时的回退：保留最后一份成功缓存（可能为空）。"""
         with self._lock:
-            if self._models:
-                return [dict(m) for m in self._models]
-        return self._static_entries()
+            return [dict(m) for m in (self._models or [])]
 
     def _fetch_from_upstream(self) -> list[dict] | None:
         """从池中任一健康账号拉取模型列表。"""
@@ -240,7 +260,8 @@ class ModelRegistry:
         }
 
     def _static_entries(self) -> list[dict]:
-        return [self._entry(m, m, 0, 0) for m in STATIC_MODELS]
+        """兼容保留（测试引用）：返回当前缓存，不再构造静态模型表。"""
+        return self._fallback()
 
 
 def _extract_reasoning(m: dict) -> dict:

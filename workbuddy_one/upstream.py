@@ -20,7 +20,20 @@ PASSTHROUGH_BODY_KEYS = {
     "stream_options", "stop", "presence_penalty", "frequency_penalty",
     "n", "response_format", "seed", "user", "reasoning_effort",
     "verbosity", "reasoning_summary",
+    "thinking",  # DeepSeek 思维链开关（reasoning.inject_thinking 注入/客户端显式传入）
 }
+
+# 模块级共享客户端：复用 TCP/TLS 连接，避免每次请求都重建连接造成握手开销。
+# trust_env=False: 避免读取 HTTP_PROXY 等环境变量导致 httpx 解析出无效代理。
+# 每个 stream/请求各自独立使用，互不阻塞；单进程内并发安全。
+_client: httpx.AsyncClient | None = None
+
+
+def _get_client() -> httpx.AsyncClient:
+    global _client
+    if _client is None or _client.is_closed:
+        _client = httpx.AsyncClient(timeout=300, trust_env=False, limits=httpx.Limits(max_connections=50, max_keepalive_connections=20))
+    return _client
 
 
 def build_upstream_body(payload: dict) -> dict:
@@ -36,16 +49,15 @@ def build_upstream_body(payload: dict) -> dict:
 async def stream_upstream(headers: dict, body: dict) -> AsyncIterator[str]:
     """透传上游 SSE 流，逐行 yield 原始 data 行（含 [DONE]）。"""
     url = f"{config.backend}/v2/chat/completions"
-    # trust_env=False: 避免读取 HTTP_PROXY 等环境变量导致 httpx 解析出无效代理
-    async with httpx.AsyncClient(timeout=300, trust_env=False) as client:
-        async with client.stream("POST", url, headers=headers, json=body) as resp:
-            if resp.status_code != 200:
-                raw = await resp.aread()
-                raise UpstreamError(resp.status_code, raw)
-            async for line in resp.aiter_lines():
-                line = line.strip()
-                if line.startswith("data:"):
-                    yield line
+    client = _get_client()
+    async with client.stream("POST", url, headers=headers, json=body) as resp:
+        if resp.status_code != 200:
+            raw = await resp.aread()
+            raise UpstreamError(resp.status_code, raw)
+        async for line in resp.aiter_lines():
+            line = line.strip()
+            if line.startswith("data:"):
+                yield line
 
 
 async def collect_upstream(headers: dict, body: dict) -> dict:

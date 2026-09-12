@@ -44,32 +44,56 @@ class TestModelRegistry(unittest.TestCase):
         from workbuddy_one.models import ModelRegistry
         return ModelRegistry(pool=None)
 
-    def test_static_entries_include_auto_and_rich_shape(self):
+    def test_no_static_fallback_empty_without_cache(self):
+        # 静态兜底已移除：无缓存时 fallback/entries 应为空列表（而非过时静态清单）
         r = self._registry()
-        entries = r._static_entries()
-        ids = {e["id"] for e in entries}
-        self.assertIn("auto", ids)
-        self.assertIn("glm-5.2", ids)
-        for e in entries:
-            self.assertIn("id", e)
-            self.assertIn("name", e)
-            self.assertIn("context_length", e)
-            self.assertIn("max_output_tokens", e)
-            self.assertIn("object", e)
+        self.assertEqual(r._fallback(), [])
+        self.assertEqual(r._static_entries(), [])
+        self.assertEqual(r.list_cached(), [])
 
-    def test_set_static_returns_usable_list(self):
+    def test_fallback_keeps_last_cache(self):
+        # 有缓存时 refresh 失败应保留最后一份成功数据
         r = self._registry()
-        out = r.set_static()
-        self.assertGreaterEqual(len(out), 1)
-        self.assertIn("auto", r.ids())
-        self.assertEqual(out[0]["object"], "model")
+        cached = [{"id": "glm-5.3", "object": "model", "created": 1, "owned_by": "x",
+                   "name": "GLM-5.3", "context_length": 1000, "max_output_tokens": 100}]
+        r._models = cached
+        self.assertEqual(len(r._fallback()), 1)
+        self.assertEqual(r._fallback()[0]["id"], "glm-5.3")
 
-    def test_fallback_when_no_pool(self):
-        # pool=None 时 pick 不可用，list() 应安全回退静态
+    def test_list_cached_never_fetches(self):
+        # list_cached 只读快照：pool=None（无法拉取）时也不抛错，返回缓存
         r = self._registry()
-        r._models = None
-        lst = r._fallback()
-        self.assertGreaterEqual(len(lst), 1)
+        r._models = [{"id": "a", "object": "model", "created": 1, "owned_by": "x",
+                      "name": "a", "context_length": 0, "max_output_tokens": 0}]
+        out = r.list_cached()
+        self.assertEqual(len(out), 1)
+        self.assertIn("vision", out[0])  # 标准字段已注入
+
+    def test_ttl_reads_from_db_setting(self):
+        # TTL 可从 DB settings（model_ttl_min）动态读取
+        from workbuddy_one.models import ModelRegistry, DEFAULT_TTL
+        from workbuddy_one.db import Database
+        tmp = Path(__file__).resolve().parent / "_tmp"
+        tmp.mkdir(exist_ok=True)
+        db = Database(str(tmp / "ttl.db"))
+        try:
+            r = ModelRegistry(pool=None, db=db)
+            # 默认：未设置时用 DEFAULT_TTL
+            self.assertEqual(r._ttl(), DEFAULT_TTL)
+            # 设置 120 分钟 → TTL = 7200 秒
+            db.save_settings(model_ttl_min="120")
+            self.assertEqual(r._ttl(), 7200)
+            # 非法值（0/超界/非数字）→ 回退默认
+            db.save_settings(model_ttl_min="0")
+            self.assertEqual(r._ttl(), DEFAULT_TTL)
+            db.save_settings(model_ttl_min="9999")
+            self.assertEqual(r._ttl(), DEFAULT_TTL)
+            db.save_settings(model_ttl_min="abc")
+            self.assertEqual(r._ttl(), DEFAULT_TTL)
+        finally:
+            db._conn.close()
+            for f in tmp.glob("ttl.db*"):
+                f.unlink(missing_ok=True)
 
 
 class TestReasoningConfig(unittest.TestCase):
@@ -270,7 +294,7 @@ class TestAABenchmarks(unittest.TestCase):
             "evaluations": {
                 "artificial_analysis_intelligence_index": 70.5,
                 "artificial_analysis_coding_index": 66.0,
-                "artificial_analysis_agentic_index": 60.2,
+                "artificial_analysis_math_index": 61.2,
                 "mmlu_pro": 0.8,  # 非选定字段，不应返回
             },
             "pricing": {"price_1m_input_tokens": 0.5, "price_1m_output_tokens": 1.5},
@@ -284,13 +308,21 @@ class TestAABenchmarks(unittest.TestCase):
         self.assertIsNotNone(m)
         self.assertEqual(m["intelligence_index"], 70.5)
         self.assertEqual(m["coding_index"], 66.0)
-        self.assertEqual(m["agentic_index"], 60.2)
+        self.assertEqual(m["math_index"], 61.2)
         self.assertEqual(m["source"], "aa")
         # 只保留选定的三个指标，不再返回非指标字段
         self.assertNotIn("mmlu_pro", m)
-        self.assertNotIn("math_index", m)
+        self.assertNotIn("agentic_index", m)
         self.assertNotIn("price_in", m)
         self.assertNotIn("speed_tps", m)
+
+    def test_has_cache(self):
+        from workbuddy_one.benchmarks import AABenchmarks
+        bb = AABenchmarks(db=None)
+        self.assertFalse(bb.has_cache())
+        with bb._lock:
+            bb._rows = [{"id": "x"}]
+        self.assertTrue(bb.has_cache())
 
 
 class TestUsageContent(unittest.TestCase):

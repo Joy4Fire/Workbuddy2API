@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { ref, h, computed } from 'vue'
+import { ref, h, computed, onMounted, onUnmounted } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import { message } from 'ant-design-vue'
 import {
@@ -30,14 +30,46 @@ function onMenuClick({ key }: { key: string }) {
 const tokenInput = ref('')
 const tokenVisible = ref(false)
 
+// Token 格式校验：字母数字、下划线、连字符，至少 8 位
+function validateToken(t: string): boolean {
+  return /^[a-zA-Z0-9_-]{8,}$/.test(t)
+}
+
 function saveToken() {
   const t = tokenInput.value.trim()
+  if (t && !validateToken(t)) {
+    message.error('Token 格式不正确（至少 8 位字母/数字/_-）')
+    return
+  }
   setAdminToken(t)
   tokenInput.value = ''
   tokenVisible.value = false
   message.success(t ? '已保存管理 Token' : '已清除管理 Token')
   router.go(0) // 重新加载，让后续请求带上 Token
 }
+
+// 侧边栏健康账号数指示（每 30s 刷新）
+const healthyCount = ref<number | null>(null)
+let healthTimer: ReturnType<typeof setInterval> | null = null
+async function refreshHealth() {
+  try {
+    const res = await fetch('/admin/accounts', {
+      headers: { 'X-Admin-Token': localStorage.getItem('workbuddy_admin_token') || '' },
+    })
+    if (!res.ok) { healthyCount.value = null; return }
+    const data = await res.json()
+    healthyCount.value = (data.accounts || []).filter((a: { healthy?: boolean }) => a.healthy).length
+  } catch {
+    healthyCount.value = null
+  }
+}
+onMounted(() => {
+  refreshHealth()
+  healthTimer = setInterval(refreshHealth, 30000)
+})
+onUnmounted(() => {
+  if (healthTimer) clearInterval(healthTimer)
+})
 </script>
 
 <template>
@@ -72,7 +104,11 @@ function saveToken() {
       </a-menu>
 
       <div class="sider-footer">
-        <span>v0.4</span>
+        <span v-if="healthyCount !== null" class="health-badge" :class="healthyCount > 0 ? 'ok' : 'bad'">
+          <i class="health-dot"></i>{{ healthyCount }} 健康
+        </span>
+        <span v-else class="health-badge loading"><i class="health-dot"></i>…</span>
+        <span class="version-tag">v0.4.1</span>
       </div>
     </a-layout-sider>
 
@@ -117,6 +153,20 @@ function saveToken() {
 html, body { margin: 0; }
 body { background: #0d1120; }
 #app { min-height: 100vh; }
+
+/* ---------- 全局暗色滚动条 ----------
+   原生白色滚动条在深色主题里非常刺眼（内容区/表格/弹窗/下拉全受影响），
+   这里统一覆盖为半透明品牌色细条。 */
+::-webkit-scrollbar { width: 10px; height: 10px; }
+::-webkit-scrollbar-thumb {
+  background: rgba(99, 179, 237, 0.22);
+  border-radius: 6px;
+  border: 2px solid transparent;
+  background-clip: padding-box;
+}
+::-webkit-scrollbar-thumb:hover { background-color: rgba(99, 179, 237, 0.4); }
+::-webkit-scrollbar-track, ::-webkit-scrollbar-corner { background: transparent; }
+html { scrollbar-color: rgba(99, 179, 237, 0.3) transparent; scrollbar-width: thin; }
 .app-shell {
   height: 100vh;
   overflow: hidden;
@@ -178,10 +228,22 @@ body { background: #0d1120; }
   background: transparent !important;
   border-right: none !important;
   position: relative; z-index: 1;
+  /* 矮窗口下菜单可纵向滚动（底部留出 sider-footer 的高度，避免最后一项被压住）。
+     必须显式 overflow-x: hidden：antd inline 菜单的固有宽度比容器宽 ~12px，
+     overflow-y: auto 会连带把 overflow-x 也变成 auto，侧边栏底部会冒出横向滚动条 */
+  flex: 1;
+  overflow-y: auto;
+  overflow-x: hidden;
+  padding-bottom: 64px;
 }
+.app-sider .ant-layout-sider-children { display: flex; flex-direction: column; height: 100%; }
 .app-menu .ant-menu-item {
   height: 52px; line-height: 1.2;
+  /* antd 默认 item 宽度按 4px 边距计算（calc(100% - 8px)）；这里自定义 10px 边距，
+     宽度必须同步改为 calc(100% - 20px)，否则每项右溢 12px：
+     选中高亮会顶到侧边栏边缘、菜单底部还会冒出横向滚动条 */
   margin: 4px 10px; border-radius: 10px;
+  width: calc(100% - 20px);
   color: #9aa5bd;
   transition: all 0.2s ease;
   position: relative;
@@ -223,6 +285,15 @@ body { background: #0d1120; }
   border-top: 1px solid rgba(255,255,255,0.06);
   font-size: 12px; color: #7d8aa5;
 }
+.health-badge {
+  display: inline-flex; align-items: center; gap: 6px;
+  padding: 3px 10px; border-radius: 20px; font-size: 12px; font-weight: 600;
+}
+.health-badge.ok { color: #4ade80; background: rgba(34,197,94,0.14); border: 1px solid rgba(34,197,94,0.35); }
+.health-badge.bad { color: #fb7185; background: rgba(244,63,94,0.14); border: 1px solid rgba(244,63,94,0.35); }
+.health-badge.loading { color: #8a94a6; background: rgba(148,163,184,0.12); border: 1px solid rgba(148,163,184,0.3); }
+.health-dot { width: 7px; height: 7px; border-radius: 50%; background: currentColor; display: inline-block; }
+.version-tag { margin-left: auto; color: #5c6a8a; }
 .status-dot {
   width: 8px; height: 8px; border-radius: 50%;
   background: #22c55e;
@@ -309,23 +380,33 @@ body .ant-popover-title {
   color: #cdd6e8;
 }
 .page-content .ant-table-thead > tr > th {
-  background: rgba(99,179,237,0.10) !important;
+  /* 必须不透明：横向滚动时表头固定列不能透出底下经过的列（rgba 半透明会露馅） */
+  background: #213051 !important;
   color: #a5b8d8 !important;
   border-bottom: 1px solid rgba(255,255,255,0.08) !important;
 }
 .page-content .ant-table-tbody > tr > td {
   border-bottom: 1px solid rgba(255,255,255,0.06) !important;
   color: #cdd6e8 !important;
+}
+/* 普通单元格透明；固定列必须保持不透明——否则横向滚动时，
+   经过固定列下方的其它列内容会透出来（曾致操作列旁浮现优先级输入框残影） */
+.page-content .ant-table-tbody > tr > td:not(.ant-table-cell-fix-left):not(.ant-table-cell-fix-right) {
   background: transparent !important;
 }
-.page-content .ant-table-tbody > tr:hover > td {
+.page-content .ant-table-tbody > tr:hover > td:not(.ant-table-cell-fix-left):not(.ant-table-cell-fix-right) {
   background: rgba(99,179,237,0.08) !important;
+}
+.page-content .ant-table-tbody > tr:hover > td.ant-table-cell-fix-left,
+.page-content .ant-table-tbody > tr:hover > td.ant-table-cell-fix-right {
+  background: #213051 !important;
 }
 .page-content .ant-table-placeholder,
 .page-content .ant-table-expanded-row-fixed {
   background: transparent !important;
 }
 .page-content .ant-table-cell { color: #cdd6e8 !important; }
+/* 固定列（sticky）底色：与卡片背景一致的不透明色 */
 .page-content .ant-table-cell-fix-left,
 .page-content .ant-table-cell-fix-right {
   background: #1a2140 !important;
@@ -344,6 +425,10 @@ body .ant-popover-title {
 .page-content .ant-input::placeholder { color: #6b7794; }
 .page-content .ant-input-number-input { color: #e6edf7 !important; }
 .page-content .ant-select-selection-item { color: #e6edf7 !important; }
+/* antd v5 默认 placeholder 是深灰（浅色主题值），深色底上几乎看不见——必须显式覆盖 */
+.page-content .ant-select-selection-placeholder,
+.ant-modal .ant-select-selection-placeholder,
+body .ant-select-dropdown .ant-select-selection-placeholder { color: #8a94a6 !important; }
 .page-content .ant-select-arrow { color: #8a94a6; }
 
 /* 按钮 */
@@ -379,6 +464,8 @@ body .ant-popover-title {
 .page-content .ant-tag { color: #cdd6e8 !important; border-radius: 6px; }
 
 /* 分页 */
+/* 总数文字（"共 N 条"）antd 默认深灰，深色底上看不清 */
+.page-content .ant-pagination-total-text { color: #cdd6e8 !important; }
 .page-content .ant-pagination-item,
 .page-content .ant-pagination-prev .ant-pagination-item-link,
 .page-content .ant-pagination-next .ant-pagination-item-link {
@@ -459,9 +546,21 @@ body .ant-popover-title {
 body .ant-select-dropdown {
   background: #1a2140; border: 1px solid rgba(99,179,237,0.15);
 }
-body .ant-select-item-option { color: #cdd6e8; }
-body .ant-select-item-option-active { background: rgba(99,179,237,0.12); }
-body .ant-select-item-option-selected { background: rgba(99,102,241,0.25); color: #fff; }
+/* antd v5 用 CSS-in-JS 给选项设了 rgba(0,0,0,0.88) 黑字，深色底上看不清；
+   需用 !important 强制覆盖到浅色。 */
+body .ant-select-item-option,
+body .ant-select-item-option-content,
+body .ant-select-item-empty {
+  color: #e6edf7 !important;
+}
+body .ant-select-item-option-active { background: rgba(99,179,237,0.12) !important; }
+body .ant-select-item-option-selected {
+  background: rgba(99,102,241,0.25) !important;
+  color: #fff !important;
+}
+body .ant-select-item-option-selected .ant-select-item-option-content { color: #fff !important; }
+/* 下拉里的分组标题（opt-group label）默认是深灰，深色底上看不清 */
+body .ant-select-item-group { color: #7d8aa5 !important; }
 
 /* 复选 / 单选框 */
 .page-content .ant-checkbox-wrapper { color: #cdd6e8; }

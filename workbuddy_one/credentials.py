@@ -107,7 +107,12 @@ class CredentialManager:
         url = f"{config.backend}/v2/plugin/auth/token/refresh"
         with httpx.Client(timeout=15, trust_env=False) as c:
             r = c.post(url, headers=headers, json={})
-            data = r.json()
+            try:
+                data = r.json()
+            except ValueError:
+                raise RuntimeError(f"刷新 token 失败（HTTP {r.status_code}，非 JSON 响应）：{r.text[:200]}")
+        if r.status_code >= 400:
+            raise RuntimeError(f"刷新 token 失败（HTTP {r.status_code}）：{r.text[:200]}")
         if data.get("code") != 0 or not data.get("data"):
             raise RuntimeError(f"刷新 token 失败：{data.get('msg', data)}")
         new_auth = data["data"]

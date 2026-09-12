@@ -43,6 +43,7 @@ class Account:
         self.credits_remaining: int | None = None
         self.credits_total: int | None = None
         self.credits_expire_at: float | None = None   # 积分最早到期时间戳（秒），无则 None
+        self.credit_packages: list[dict] = []         # 积分构成明细（按商品聚合，运行时数据不落库）
         self.priority: int = 0             # 用户指定优先级（越大权重越高）
         self.last_used = 0.0
 
@@ -91,6 +92,7 @@ class AccountPool:
             "credits_remaining": a.credits_remaining,
             "credits_total": a.credits_total,
             "credits_expire_at": a.credits_expire_at,
+            "credit_packages": a.credit_packages,
             "priority": a.priority,
             "weight": round(self._weight(a, now), 3),
             "source": _account_source(a),
@@ -103,13 +105,15 @@ class AccountPool:
                     a.enabled = enabled
                     return
 
-    def set_credits(self, uid: str, remain, total, expire_at=None):
+    def set_credits(self, uid: str, remain, total, expire_at=None, packages: list[dict] | None = None):
         with self._lock:
             for a in self.accounts:
                 if a.uid == uid:
                     a.credits_remaining = remain
                     a.credits_total = total
                     a.credits_expire_at = expire_at
+                    if packages is not None:
+                        a.credit_packages = packages
                     return
 
     def set_priority(self, uid: str, priority: int):
@@ -119,15 +123,18 @@ class AccountPool:
                     a.priority = int(priority or 0)
                     return
 
-    def clear_cooldown(self, uid: str, enabled: bool = True):
-        """清除冷却（可选同时启用）。用于签到/余额恢复后自动解冻。"""
+    def clear_cooldown(self, uid: str):
+        """清除冷却与失败计数。用于签到/余额恢复后自动解冻冷却中的账号。
+
+        注意：不复活被显式停用（enabled=False）的账号——手动停用/保活自动禁用
+        的账号只能由用户在 WebUI 重新启用；否则每轮额度刷新都会把停用账号
+        重新打开，停用状态形同虚设。
+        """
         with self._lock:
             for a in self.accounts:
                 if a.uid == uid:
                     a.cooldown_until = 0.0
                     a.failure_count = 0
-                    if enabled:
-                        a.enabled = True
                     return
 
     def add_account(self, uid: str, mgr: CredentialManager) -> bool:

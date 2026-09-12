@@ -5,18 +5,36 @@ Phase 1 先建 accounts（认证账号）与 usage_logs（使用记录）两张�
 """
 from __future__ import annotations
 
+import datetime as _dt
 import json
+import logging
 import sqlite3
 import threading
 import time
 from pathlib import Path
+
+logger = logging.getLogger("workbuddy_one.db")
 
 # 当前数据库 schema 版本（用 SQLite PRAGMA user_version 持久化）。
 # 每次对表结构做不兼容/增量修改时 +1，并在 _migrate 里追加对应迁移步骤。
 SCHEMA_VERSION = 3
 
 
+def _local_midnight_ts() -> int:
+    """本地时区「今日 0 点」的时间戳（秒）。
+
+    统计口径必须与签到等本地日期逻辑一致（都用 datetime.now() 的本地日期）；
+    不能用 `now % 86400`——那对齐的是 UTC 午夜（= 北京时间早上 8 点），
+    会把凌晨 0:00-8:00 的请求算进「昨天」。
+    """
+    n = _dt.datetime.now()
+    return int(n.replace(hour=0, minute=0, second=0, microsecond=0).timestamp())
+
+
 class Database:
+    # 迁移前自动备份的保留份数（data/backups/ 下最多留这么多份）
+    BACKUP_KEEP = 5
+
     def __init__(self, path: str):
         self.path = Path(path)
         self.path.parent.mkdir(parents=True, exist_ok=True)
@@ -25,12 +43,55 @@ class Database:
         self._conn.row_factory = sqlite3.Row
         self._conn.execute("PRAGMA journal_mode=WAL")
         self._conn.execute("PRAGMA foreign_keys=ON")
+        # 升级有风险：即将执行 schema 迁移（旧版本库 → 当前版本）前先自动备份，
+        # 迁移若有 bug 用户可拿备份回滚，而不是丢掉全部历史数据
+        self._backup_before_migration()
         self._init_schema()
         # 发现并合并旧版数据库（如顶层 workbuddy.db / data-top-level），幂等
         self._migrate_legacy_dbs()
 
+    def _backup_before_migration(self):
+        """schema 版本低于当前版本且已有数据表时，迁移前备份整个库。
+
+        用 sqlite backup API（而非文件拷贝）：连同 WAL 里未 checkpoint 的事务
+        一起快照，避免拷出不一致的文件。全新空库（无任何表）不备份。
+        备份放 data/backups/，按版本号与时间命名，最多保留 BACKUP_KEEP 份。
+        """
+        try:
+            ver = self._conn.execute("PRAGMA user_version").fetchone()[0]
+            if ver >= SCHEMA_VERSION:
+                return
+            has_tables = self._conn.execute(
+                "SELECT 1 FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%' LIMIT 1"
+            ).fetchone()
+            if not has_tables:
+                return  # 全新空库，首次建表不算"升级"
+            backup_dir = self.path.parent / "backups"
+            backup_dir.mkdir(parents=True, exist_ok=True)
+            name = f"{self.path.stem}.pre-migrate-v{ver}-to-v{SCHEMA_VERSION}.{int(time.time())}.bak"
+            dst_path = backup_dir / name
+            dst = sqlite3.connect(str(dst_path))
+            try:
+                self._conn.backup(dst)
+            finally:
+                dst.close()
+            # 只保留最近 BACKUP_KEEP 份，清理更旧的
+            backups = sorted(backup_dir.glob(f"{self.path.stem}.pre-migrate-*.bak"))
+            for old in backups[: -self.BACKUP_KEEP]:
+                try:
+                    old.unlink()
+                except OSError:
+                    pass
+            logger.info("schema 迁移 v%d → v%d：已自动备份到 %s", ver, SCHEMA_VERSION, dst_path)
+        except Exception:  # noqa: BLE001
+            # 备份失败不阻塞启动（迁移照常进行），但不能吞掉迁移本身的问题
+            logger.warning("迁移前备份失败（忽略）", exc_info=True)
+
     def _init_schema(self):
         with self._lock:
+            # 只建表不建索引：索引引用的列（如 account_uid）可能在更老的库里
+            # 缺失、要靠下面的 _MIGRATIONS 补列之后才存在——索引统一由
+            # _ensure_indexes 在迁移完成后按需创建，否则极旧库会直接打不开
             self._conn.executescript(
                 """
                 CREATE TABLE IF NOT EXISTS accounts (
@@ -70,9 +131,6 @@ class Database:
                     reasoning_content TEXT,    -- 思考链 / COT 内容
                     credits REAL               -- 本次请求消耗的积分
                 );
-                CREATE INDEX IF NOT EXISTS idx_usage_ts ON usage_logs(ts);
-                CREATE INDEX IF NOT EXISTS idx_usage_model ON usage_logs(model);
-                CREATE INDEX IF NOT EXISTS idx_usage_account ON usage_logs(account_uid);
 
                 CREATE TABLE IF NOT EXISTS settings (
                     key TEXT PRIMARY KEY,
@@ -158,35 +216,6 @@ class Database:
         (3, _migration_v3),
     ]
 
-    # 兜底列定义：对「未知极老库」最后统一补齐当前全部列。
-    # 已按版本迁移的库到这里通常无缺失列（幂等无副作用）。
-    _FULL_COLUMNS = {
-        "accounts": [
-            ("id", "INTEGER PRIMARY KEY AUTOINCREMENT"), ("uid", "TEXT"),
-            ("nickname", "TEXT"), ("enterprise_id", "TEXT"), ("domain", "TEXT"),
-            ("auth_json", "TEXT"), ("enabled", "INTEGER DEFAULT 1"),
-            ("priority", "INTEGER DEFAULT 0"), ("credits_remaining", "REAL"),
-            ("credits_total", "REAL"), ("credits_expire_at", "TEXT"),
-            ("last_used_at", "REAL"), ("last_checkin_date", "TEXT"),
-            ("failure_count", "INTEGER DEFAULT 0"), ("cooldown_until", "REAL DEFAULT 0"),
-            ("created_at", "REAL"), ("updated_at", "REAL"),
-        ],
-        "usage_logs": [
-            ("id", "INTEGER PRIMARY KEY AUTOINCREMENT"), ("ts", "REAL"),
-            ("model", "TEXT"), ("protocol", "TEXT"), ("account_uid", "TEXT"),
-            ("input_tokens", "INTEGER"), ("output_tokens", "INTEGER"),
-            ("total_tokens", "INTEGER"), ("latency_ms", "REAL"),
-            ("status", "TEXT"), ("error", "TEXT"),
-            ("input_content", "TEXT"), ("output_content", "TEXT"),
-            ("reasoning_content", "TEXT"), ("credits", "REAL"), ("app_name", "TEXT"),
-        ],
-        "apps": [
-            ("id", "INTEGER PRIMARY KEY AUTOINCREMENT"), ("name", "TEXT"),
-            ("key_hash", "TEXT"), ("key_prefix", "TEXT"), ("note", "TEXT"),
-            ("enabled", "INTEGER DEFAULT 1"), ("created_at", "REAL"), ("key_enc", "TEXT"),
-        ],
-    }
-
     def _user_version(self) -> int:
         try:
             return self._conn.execute("PRAGMA user_version").fetchone()[0]
@@ -210,6 +239,20 @@ class Database:
         """在迁移中执行多语句 SQL（建表/索引等）。调用方保证幂等。"""
         self._conn.executescript(script)
 
+    # 索引清单：(索引名, 表, 列)。索引引用的列可能在极老库里缺失（靠迁移补列），
+    # 因此统一在 _migrate 末尾按需创建，而不是建表脚本里硬编码。
+    _INDEXES = [
+        ("idx_usage_ts", "usage_logs", "ts"),
+        ("idx_usage_model", "usage_logs", "model"),
+        ("idx_usage_account", "usage_logs", "account_uid"),
+    ]
+
+    def _ensure_indexes(self):
+        """补建查询索引（列存在才建，幂等）。"""
+        for name, table, col in self._INDEXES:
+            if col in self._table_columns(table):
+                self._conn.execute(f"CREATE INDEX IF NOT EXISTS {name} ON {table}({col})")
+
     def _migrate(self):
         """按版本号把数据库升级到 SCHEMA_VERSION（版本化增量迁移 + 兜底补列）。
 
@@ -228,6 +271,8 @@ class Database:
                 if ddl.startswith("INTEGER PRIMARY KEY"):
                     continue
                 self._add_column(table, col, ddl)
+        # 列齐了再补索引（依赖 account_uid 等迁移补出的列）
+        self._ensure_indexes()
         # 写入最新版本号
         self._conn.execute(f"PRAGMA user_version = {int(SCHEMA_VERSION)}")
 
@@ -383,6 +428,7 @@ class Database:
         "checkin_hours": "9,21",       # 每日自动签到小时点（逗号分隔）
         "credit_refresh_min": "30",    # 额度刷新间隔（分钟）
         "model_refresh_hour": "6",     # 每日自动刷新模型目录的小时（0-23）
+        "model_ttl_min": "60",         # 模型缓存 TTL（分钟，推理端点惰性刷新间隔）
         "aa_refresh_hour": "7",        # 每日自动刷新 AA 评测数据的小时（0-23）
         "keepalive_hour": "22",        # 每日 token 保活小时（0-23）
         "aa_api_key": "",              # Artificial Analysis API key（评测数据，空则不启用）
@@ -429,11 +475,18 @@ class Database:
             )
             self._conn.commit()
 
-    def cleanup_usage(self, retention_days: int):
-        """删除超过保留期的使用记录。"""
+    def cleanup_usage(self, retention_days: int, vacuum: bool = False):
+        """删除超过保留期的使用记录。
+
+        vacuum=True 时额外执行 VACUUM 回收 SQLite 空闲页（删除+长期增删产生的碎片页
+        不会被自动回收，会导致文件虚胖；VACUUM 可把体积压回真实数据量）。
+        应在低峰期调用（如每日定时清理时），会短暂阻塞其它写操作。
+        """
         cutoff = time.time() - retention_days * 86400
         with self._lock:
             self._conn.execute("DELETE FROM usage_logs WHERE ts < ?", (cutoff,))
+            if vacuum:
+                self._conn.execute("VACUUM")
             self._conn.commit()
 
     def trim_usage_content(self, input_limit: int = 4000, output_limit: int = 8000,
@@ -450,8 +503,14 @@ class Database:
             return v[:limit] + f"\n…（已截断，原文 {len(v)} 字符）"
 
         with self._lock:
+            # 只取超限行：无 WHERE 的全表拉取在库涨大后（10 万行 × 20KB）每次启动
+            # 都要把全部 content 读进内存比对，启动拖几十秒
             rows = self._conn.execute(
-                "SELECT id, input_content, output_content, reasoning_content FROM usage_logs"
+                """SELECT id, input_content, output_content, reasoning_content FROM usage_logs
+                   WHERE LENGTH(input_content) > ?
+                      OR LENGTH(output_content) > ?
+                      OR LENGTH(reasoning_content) > ?""",
+                (input_limit, output_limit, reason_limit),
             ).fetchall()
             changed = 0
             for r in rows:
@@ -486,7 +545,7 @@ class Database:
         """聚合统计：总数、按协议、按模型、按日、今日 token。"""
         with self._lock:
             total = self._conn.execute("SELECT COUNT(*) c, COALESCE(SUM(total_tokens),0) t FROM usage_logs").fetchone()
-            today_start = int(time.time()) - int(time.time()) % 86400
+            today_start = _local_midnight_ts()
             today = self._conn.execute(
                 "SELECT COUNT(*) c, COALESCE(SUM(total_tokens),0) t FROM usage_logs WHERE ts >= ?", (today_start,)
             ).fetchone()
@@ -509,10 +568,14 @@ class Database:
             "by_app": [{"app": r["app"], "count": r["c"], "tokens": r["t"]} for r in by_app],
         }
 
-    def usage_recent(self, limit: int = 50, protocol: str | None = None,
-                     model: str | None = None, app_name: str | None = None,
-                     status: str | None = None) -> list[dict]:
-        """最近使用记录，支持按协议/模型/应用/状态筛选（空值表示该维度不筛选）。"""
+    _USAGE_COLS = (
+        "id, ts, model, protocol, account_uid, input_tokens, output_tokens, total_tokens, "
+        "latency_ms, status, error, credits, app_name"
+    )
+
+    def _usage_where(self, protocol: str | None, model: str | None,
+                     app_name: str | None, status: str | None) -> tuple[str, list]:
+        """usage_logs 查询的公共 WHERE 子句（usage_recent / usage_count 共用）。"""
         clauses: list[str] = []
         params: list = []
         if protocol:
@@ -521,23 +584,60 @@ class Database:
         if model:
             clauses.append("model = ?")
             params.append(model)
-        if app_name:
-            # 空字符串表示"无应用名"（未命名/旧记录）
+        if app_name is not None:
+            # 空字符串表示"无应用名"（未命名/旧记录），需要与不筛选（None）区分开
             clauses.append("COALESCE(app_name, '') = ?")
             params.append(app_name)
         if status:
             clauses.append("status = ?")
             params.append(status)
         where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
-        params.append(limit)
+        return where, params
+
+    def usage_recent(self, limit: int = 50, protocol: str | None = None,
+                     model: str | None = None, app_name: str | None = None,
+                     status: str | None = None, light: bool = False,
+                     offset: int = 0) -> list[dict]:
+        """最近使用记录，支持按协议/模型/应用/状态筛选（空值表示该维度不筛选）。
+
+        light=True 时只返回元数据列（不含 input/output/reasoning 大文本），
+        用于概览页等高频轮询场景，避免每次把 base64 图片等超大 content 全部拉出来。
+        offset 用于服务端分页（配合 usage_count 的总数）。
+        """
+        where, params = self._usage_where(protocol, model, app_name, status)
+        params.extend([limit, offset])
+        cols = self._USAGE_COLS if light else "*"
         with self._lock:
             rows = self._conn.execute(
-                f"SELECT * FROM usage_logs {where} ORDER BY id DESC LIMIT ?", params
+                f"SELECT {cols} FROM usage_logs {where} ORDER BY id DESC LIMIT ? OFFSET ?", params
             ).fetchall()
         return [dict(r) for r in rows]
 
+    def usage_count(self, protocol: str | None = None, model: str | None = None,
+                    app_name: str | None = None, status: str | None = None) -> int:
+        """符合筛选条件的使用记录总数（服务端分页用，返回总页数依据）。"""
+        where, params = self._usage_where(protocol, model, app_name, status)
+        with self._lock:
+            row = self._conn.execute(f"SELECT COUNT(*) c FROM usage_logs {where}", params).fetchone()
+        return row["c"]
+
+    def get_usage(self, record_id: int) -> dict | None:
+        """单条使用记录（含完整 input/output/reasoning 大文本）。
+
+        记录页列表走 light 投影，点开详情时才按需取这一条的完整 content。
+        """
+        with self._lock:
+            row = self._conn.execute("SELECT * FROM usage_logs WHERE id = ?", (record_id,)).fetchone()
+        return dict(row) if row else None
+
     def usage_filters(self) -> dict:
-        """使用记录筛选项的可选值（协议/模型/应用/状态去重列表）。"""
+        """使用记录筛选项的可选值（协议/模型/应用/状态去重列表）。
+
+        apps 只列 apps 表**现存**应用（与应用页对应）；usage_logs 里 app_name 是
+        请求当时的快照，应用删除后历史记录仍保留旧名——这些名字放进 apps_history，
+        前端分组展示，避免"筛选里冒出应用页不存在的名字"的困惑。
+        has_unnamed 标记是否存在无应用归属的旧记录（供"（未记录应用）"筛选项）。
+        """
         with self._lock:
             def col(field: str) -> list[str]:
                 rows = self._conn.execute(
@@ -548,10 +648,18 @@ class Database:
             st = self._conn.execute(
                 "SELECT DISTINCT status FROM usage_logs WHERE status IS NOT NULL AND status != ''"
             ).fetchall()
+            current_apps = [r["name"] for r in self._conn.execute("SELECT name FROM apps ORDER BY id")]
+            used_apps = col("app_name")
+            has_unnamed = self._conn.execute(
+                "SELECT 1 FROM usage_logs WHERE app_name IS NULL OR app_name = '' LIMIT 1"
+            ).fetchone() is not None
+        current_set = set(current_apps)
         return {
             "protocols": col("protocol"),
             "models": col("model"),
-            "apps": col("app_name"),
+            "apps": current_apps,
+            "apps_history": [a for a in used_apps if a not in current_set],
+            "has_unnamed": has_unnamed,
             "statuses": [r[0] for r in st],
         }
 
@@ -581,16 +689,23 @@ class Database:
         model:       可选，仅统计某模型
         返回: [{bucket_ts, bucket, count, tokens}]，bucket 为易读标签。
         """
-        bucket_sec = 3600 if granularity == "day" else 3600
-        if granularity == "day":
-            bucket_sec = 86400
+        bucket_sec = 86400 if granularity == "day" else 3600
         now = int(time.time())
-        end = now - (now % bucket_sec)          # 对齐到桶边界
+        if granularity == "day":
+            # day 桶按「本地 0 点」对齐，与「今日」统计/签到同口径（标签写的是日期，
+            # 桶边界却按 UTC 午夜切的话会差 8 小时）。SQLite 里先把 ts 平移到本地日界
+            # 再按 86400 取整，最后平移回来。
+            end = _local_midnight_ts()
+            shift = end - (now - now % 86400)
+            bucket_ts_sql = f"((CAST(ts AS INTEGER) - {int(shift)}) / {bucket_sec}) * {bucket_sec} + {int(shift)}"
+        else:
+            end = now - (now % bucket_sec)          # 对齐到桶边界（整点，中国时区整小时偏移无影响）
+            bucket_ts_sql = f"(CAST(ts AS INTEGER) / {bucket_sec}) * {bucket_sec}"
         start = end - (points - 1) * bucket_sec
 
-        sql = ("SELECT (CAST(ts AS INTEGER) / ?) * ? AS bucket_ts, COUNT(*) c, COALESCE(SUM(total_tokens),0) t "
+        sql = (f"SELECT {bucket_ts_sql} AS bucket_ts, COUNT(*) c, COALESCE(SUM(total_tokens),0) t "
                "FROM usage_logs WHERE ts >= ? AND ts < ?")
-        args: list = [bucket_sec, bucket_sec, start, end + bucket_sec]
+        args: list = [start, end + bucket_sec]
         if model:
             sql += " AND model = ?"
             args.append(model)
@@ -600,7 +715,6 @@ class Database:
         by_bucket = {r["bucket_ts"]: (r["c"], r["t"]) for r in rows}
 
         # 补齐空桶
-        import datetime as _dt
         out = []
         for i in range(points):
             bt = start + i * bucket_sec

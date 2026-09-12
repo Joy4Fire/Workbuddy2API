@@ -124,7 +124,15 @@ onMounted(load)
     </div>
 
     <a-card title="应用列表">
-      <a-table :data-source="apps" :loading="loading" row-key="id" :pagination="false" table-layout="fixed">
+      <!-- 列宽合计 ~1160px，窄窗口下开横向滚动并固定操作列，避免按钮被卡片右缘裁掉 -->
+      <a-table
+        :data-source="apps"
+        :loading="loading"
+        row-key="id"
+        :pagination="false"
+        :scroll="{ x: 1160 }"
+        table-layout="fixed"
+      >
         <a-table-column title="应用名称" data-index="name" key="name" :width="140">
           <template #default="{ record }">
             <span style="font-weight: 600; color: #e6edf7">{{ record.name }}</span>
@@ -160,7 +168,7 @@ onMounted(load)
         <a-table-column title="创建时间" key="created_at" :width="140">
           <template #default="{ record }">{{ fmtTime(record.created_at) }}</template>
         </a-table-column>
-        <a-table-column title="操作" key="action" :width="220">
+        <a-table-column title="操作" key="action" :width="220" fixed="right">
           <template #default="{ record }">
             <a-space>
               <a-button size="small" @click="onViewKey(record)"><template #icon><KeyOutlined /></template>查看 Key</a-button>

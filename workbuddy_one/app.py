@@ -103,9 +103,26 @@ COOLDOWN_SOFT = 60.0       # 通用失败
 COOLDOWN_HARD = 1800.0     # 认证/限流（401/403/429）
 
 
+def _cooldown_for(status_code: int) -> float:
+    """按上游 HTTP 状态码选择冷却时长。
+
+    429 限流若只用 60s 软冷却，账号会反复被限流、UI 在健康/不可用间抖动，
+    故限流给 5 分钟；认证类错误（401/403）用 30 分钟；上游服务错误 2 分钟；
+    其余走 60s 软冷却。
+    """
+    if status_code == 429:
+        return 300.0
+    if status_code in (401, 403):
+        return COOLDOWN_HARD
+    if status_code >= 500:
+        return 120.0
+    return COOLDOWN_SOFT
+
+
+
 def create_app() -> FastAPI:
     # 关闭自动生成的 /docs、/redoc、/openapi.json：本地网关无需暴露 API 文档（减少攻击面）
-    app = FastAPI(title="Workbuddy2API", version="0.4.0",
+    app = FastAPI(title="Workbuddy2API", version="0.4.1",
                   docs_url=None, redoc_url=None, openapi_url=None)
     db = Database(config.db_path)
 
@@ -132,10 +149,14 @@ def create_app() -> FastAPI:
                                  _row.get("credits_expire_at"))
             if _row.get("priority"):
                 pool.set_priority(_acc.uid, _row.get("priority"))
-    models = ModelRegistry(pool)
+            # 恢复停用状态：手动停用/保活自动禁用的账号不能因重启"复活"
+            if _row.get("enabled") == 0:
+                pool.set_enabled(_acc.uid, False)
+    models = ModelRegistry(pool, db=db)
     benchmarks = AABenchmarks(db=db)
     scheduler = Scheduler(pool, db=db, models=models, benchmarks=benchmarks,
-                          credit_interval_min=config.credit_refresh_min)
+                          credit_interval_min=config.credit_refresh_min,
+                          usage_retention_days=config.usage_retention_days)
 
     def _register_account(path: Path) -> dict:
         """把一份 auth 文件注册进账号池（含 DB 落账）。返回账号摘要。"""
@@ -154,11 +175,22 @@ def create_app() -> FastAPI:
         d.mkdir(parents=True, exist_ok=True)
         return d
 
+    def _safe_uid(uid: str) -> str:
+        """把任意 uid 规整为安全的文件名片段，防止路径穿越/非法字符。
+
+        uid 来自用户上传的 JSON 或扫码结果，属不可信输入；只保留字母数字、连字符、下划线。
+        非法则退化为 'unknown'，保证落盘路径始终限定在 auths/ 目录内。
+        """
+        import re as _re
+        safe = _re.sub(r"[^A-Za-z0-9_\-]", "", str(uid or "")).strip("-")
+        return safe or "unknown"
+
     def _remove_account(uid: str) -> dict:
         """从账号池、DB 移除账号；若其 auth 文件在项目 auths/ 下则一并删除。"""
         removed = pool.remove_account(uid)
         managers.pop(uid, None)
         db.delete_account(uid)
+        _limiters.pop(uid, None)  # 释放账号级限速器，避免字典无限增长
         # 删除项目内 auths/ 下的对应文件（本机 CodeBuddy 目录的保留，不删）
         d = _auths_dir()
         for f in d.glob(f"*{uid}*.info"):
@@ -205,6 +237,11 @@ def create_app() -> FastAPI:
         acc = pool.pick()
         if acc is None:
             raise HTTPException(status_code=503, detail={"error": {"message": "无可用账号（全部冷却或额度耗尽），请检查账号状态", "type": "auth_error"}})
+        # fallback 顶班账号（无健康账号时选出的最早冷却到期者）若还要冷却 30 秒以上，
+        # 不硬打——把请求送上去只会再吃一个 429，形成 429 风暴；直接明确拒绝
+        if acc.cooldown_until - time.time() > 30:
+            raise HTTPException(status_code=503, detail={
+                "error": {"message": "上游限流中，所有账号均在冷却，请稍后重试", "type": "rate_limit_error"}})
         return acc
 
     # 账号级限速器
@@ -215,18 +252,55 @@ def create_app() -> FastAPI:
             _limiters[uid] = AsyncAccountRateLimiter(min_interval=config.ratelimit_interval)
         return _limiters[uid]
 
+    def _get_headers(account):
+        """取账号请求头（token 过期时自动刷新）；刷新失败转 503 并冷却该账号。
+
+        RuntimeError 直接漏到 FastAPI 会变成裸 500，客户端无从得知该做什么。
+        """
+        try:
+            return account.mgr.get_headers()
+        except RuntimeError as e:
+            pool.on_failure(account.uid, COOLDOWN_HARD)
+            raise HTTPException(status_code=503, detail={
+                "error": {"message": f"账号 token 刷新失败，请到 WebUI 重新扫码登录（{e}）",
+                          "type": "auth_error"}})
+
+    async def _open_upstream_once(account, body: dict):
+        """对单个账号建立上游连接并预取首个 SSE 行，成功返回 (iterator, 首行)。"""
+        if config.ratelimit:
+            await _limiter(account.uid).wait_if_needed()
+        headers = _get_headers(account)
+        it = stream_upstream(headers, body).__aiter__()
+        first = await it.__anext__()   # 首次 anext 会真正发起上游请求；失败抛 UpstreamError
+        return it, first
+
     async def _open_upstream(account, body: dict):
         """在返回 StreamingResponse 前，先建立上游连接并预取首个 SSE 行。
 
         这样上游在流真正开始前失败时，能返回正确的 HTTP 状态码（而非 200+SSE 错误），
-        客户端可以正确识别错误而不是卡住等待。成功返回 (iterator, 首行)。
+        客户端可以正确识别错误而不是卡住等待。
+        返回 (iterator, 首行, 实际使用的账号)——429/502/503 时会自动换健康账号重试一次
+        （仅一次，不递归），换号后调用方必须用返回的账号记账，而不是最初的账号。
         """
-        if config.ratelimit:
-            await _limiter(account.uid).wait_if_needed()
-        headers = account.mgr.get_headers()
-        it = stream_upstream(headers, body).__aiter__()
-        first = await it.__anext__()   # 首次 anext 会真正发起上游请求；失败抛 UpstreamError
-        return it, first
+        try:
+            it, first = await _open_upstream_once(account, body)
+            return it, first, account
+        except UpstreamError as e:
+            if e.status_code not in (429, 502, 503):
+                raise
+            # 该账号已确认打不通：先上冷却，避免下面 pick() 又选中它原地重试
+            pool.on_failure(account.uid, _cooldown_for(e.status_code))
+            if pool.healthy_count() < 1:
+                # 没有其它健康账号：放弃重试，按原错误交给调用方记录/返回
+                #（后续请求会被 _pick_account 的冷却兜底挡下并得到 503）
+                raise
+            alt = _pick_account()
+            try:
+                it, first = await _open_upstream_once(alt, body)
+            except (UpstreamError, httpx.HTTPError):
+                pool.on_failure(alt.uid, COOLDOWN_SOFT)
+                raise
+            return it, first, alt
 
     def _enhance_body(body: dict) -> dict:
         """统一规整 + 可选脱敏，构造最终上游请求体。"""
@@ -243,12 +317,16 @@ def create_app() -> FastAPI:
         return body
 
     def _log_usage(protocol, model_name, account, t0, status, err="", usage=None, cooldown=COOLDOWN_NONE,
-                   input_content="", output_content="", reasoning_content="", app_name=""):
+                   input_content="", output_content="", reasoning_content="", app_name="", update_pool=True):
         usage = usage or {}
-        if status == "ok":
-            pool.on_success(account.uid)
-        else:
-            pool.on_failure(account.uid, cooldown or COOLDOWN_SOFT)
+        # update_pool=False 用于"客户端断开补记"等非账号过错的场景：
+        # 断开不是账号的失败，不应计入失败数/冷却（否则 Claude Code 常见的主动中断
+        # 会把健康账号打成"冷却中"）
+        if update_pool:
+            if status == "ok":
+                pool.on_success(account.uid)
+            else:
+                pool.on_failure(account.uid, cooldown or COOLDOWN_SOFT)
         # 超长文本裁剪：思考链/输出也可能很长（实测 COT 单条 4 万+ 字符）
         db.log_usage(model=model_name, protocol=protocol, account_uid=account.uid,
                      input_tokens=usage.get("prompt_tokens") or usage.get("input_tokens") or 0,
@@ -259,7 +337,7 @@ def create_app() -> FastAPI:
                      credits=usage.get("credit") or 0,
                      app_name=app_name)
 
-    def _extract_input_text(body: dict) -> str:
+    async def _extract_input_text(body: dict) -> str:
         """从上游请求体提取输入消息（角色: 内容，逐条）。
 
         保留策略：**完整无损入库**——用于后续训练自有模型，因此不截断消息条数、
@@ -305,7 +383,9 @@ def create_app() -> FastAPI:
         result = "\n".join(parts)
         # DSH 附件归档：若文本里引用了 ~/.dsh/attachments 下的对象（非 data-url 场景），
         # 复制进项目本地留存（按 sha256 去重）。完整保留文本，不做替换。
-        _archive_attachments(result)
+        # 归档内部有最大 20MB 的同步文件读 + sha256，放线程池避免阻塞事件循环
+        if ".dsh" in result.lower() and "attachments" in result.lower():
+            result = await asyncio.to_thread(_archive_attachments, result)
         return result
 
     def _delta_parts(line: str) -> tuple[str, str]:
@@ -458,20 +538,23 @@ def create_app() -> FastAPI:
 
         client_wants_stream = bool(payload.get("stream"))
         body = _enhance_body(build_upstream_body(payload))
-        headers = account.mgr.get_headers()
+        headers = _get_headers(account)
         model_name = payload.get("model", "auto")
-        input_text = _extract_input_text(body)
+        input_text = await _extract_input_text(body)
         t0 = time.time()
 
         if client_wants_stream:
             # 预取上游首个事件：失败则直接返回正确 HTTP 状态码
+            # （换号重试后 account 会被重新绑定，gen() 里记账用的就是实际服务的账号）
             try:
-                it, first = await _open_upstream(account, body)
+                it, first, account = await _open_upstream(account, body)
             except UpstreamError as e:
-                log_usage("chat", model_name, account, t0, "error", f"HTTP {e.status_code}", input_content=input_text)
+                log_usage("chat", model_name, account, t0, "error", f"HTTP {e.status_code}", input_content=input_text,
+                          cooldown=_cooldown_for(e.status_code))
                 raise HTTPException(status_code=e.status_code, detail=_safe_err(e.raw, e.status_code))
             except httpx.HTTPError as e:
-                log_usage("chat", model_name, account, t0, "error", str(e), input_content=input_text)
+                log_usage("chat", model_name, account, t0, "error", str(e), input_content=input_text,
+                          cooldown=COOLDOWN_SOFT)
                 raise HTTPException(status_code=502, detail={"error": {"message": f"upstream error: {e}", "type": "upstream_error"}})
 
             async def gen():
@@ -505,14 +588,25 @@ def create_app() -> FastAPI:
                                input_content=input_text,
                                output_content="".join(_out_parts),
                                reasoning_content="".join(_reason_parts))
+                except (asyncio.CancelledError, GeneratorExit):
+                    # 客户端中途断开：上游已消耗的积分要补记一条，否则使用记录缺失、
+                    # 积分预测失真。CancelledError 继承自 BaseException，不会被下面的
+                    # except Exception 捕获。断开非账号过错，不计入失败/冷却。
+                    log_usage("chat", model_name, account, t0, "aborted", "client disconnected",
+                              usage=_usage, input_content=input_text,
+                              output_content="".join(_out_parts),
+                              reasoning_content="".join(_reason_parts), update_pool=False)
+                    raise
                 except UpstreamError as e:
-                    log_usage("chat", model_name, account, t0, "error", f"HTTP {e.status_code}", input_content=input_text)
-                    yield f'data: {_json_error(e.status_code, str(e.raw.decode("utf-8", "replace")))}'.encode()
-                    yield b"\n\n"
+                    log_usage("chat", model_name, account, t0, "error", f"HTTP {e.status_code}", input_content=input_text,
+                              cooldown=_cooldown_for(e.status_code))
+                    yield f'data: {_json_error(e.status_code, str(e.raw.decode("utf-8", "replace")))}\n\n'.encode()
+                    yield b"data: [DONE]\n\n"
                 except Exception as e:  # noqa: BLE001
-                    log_usage("chat", model_name, account, t0, "error", str(e), input_content=input_text)
-                    yield f'data: {_json_error(502, str(e))}'.encode()
-                    yield b"\n\n"
+                    log_usage("chat", model_name, account, t0, "error", str(e), input_content=input_text,
+                              cooldown=COOLDOWN_SOFT)
+                    yield f'data: {_json_error(502, str(e))}\n\n'.encode()
+                    yield b"data: [DONE]\n\n"
             return StreamingResponse(gen(), media_type="text/event-stream",
                                      headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
 
@@ -531,10 +625,12 @@ def create_app() -> FastAPI:
                        reasoning_content=_msg.get("reasoning_content") or "")
             return JSONResponse(content=collected)
         except UpstreamError as e:
-            log_usage("chat", model_name, account, t0, "error", f"HTTP {e.status_code}", input_content=input_text)
+            log_usage("chat", model_name, account, t0, "error", f"HTTP {e.status_code}", input_content=input_text,
+                      cooldown=_cooldown_for(e.status_code))
             raise HTTPException(status_code=e.status_code, detail=_safe_err(e.raw, e.status_code))
         except httpx.HTTPError as e:
-            log_usage("chat", model_name, account, t0, "error", str(e), input_content=input_text)
+            log_usage("chat", model_name, account, t0, "error", str(e), input_content=input_text,
+                      cooldown=COOLDOWN_SOFT)
             raise HTTPException(status_code=502, detail={"error": {"message": f"upstream error: {e}", "type": "upstream_error"}})
 
     @app.post("/v1/messages")
@@ -552,7 +648,7 @@ def create_app() -> FastAPI:
 
         chat_body = _enhance_body(anthropic_request_to_chat(payload))
         model_name = chat_body.get("model", "auto")
-        input_text = _extract_input_text(chat_body)
+        input_text = await _extract_input_text(chat_body)
         t0 = time.time()
 
         # Anthropic 默认流式；客户端可用 stream=false 请求非流式
@@ -560,14 +656,21 @@ def create_app() -> FastAPI:
         client_wants_stream = payload.get("stream", True)
 
         # 预取上游首个事件：失败则直接返回正确 HTTP 状态码（流式与非流式一致）
+        # （换号重试后 account 会被重新绑定，gen() 里记账用的就是实际服务的账号）
         try:
-            it, first = await _open_upstream(account, chat_body)
+            it, first, account = await _open_upstream(account, chat_body)
         except UpstreamError as e:
-            log_usage("anthropic", model_name, account, t0, "error", f"HTTP {e.status_code}", input_content=input_text)
+            log_usage("anthropic", model_name, account, t0, "error", f"HTTP {e.status_code}", input_content=input_text,
+                      cooldown=_cooldown_for(e.status_code))
             raise HTTPException(status_code=e.status_code, detail=_safe_err(e.raw, e.status_code))
         except httpx.HTTPError as e:
-            log_usage("anthropic", model_name, account, t0, "error", str(e), input_content=input_text)
+            log_usage("anthropic", model_name, account, t0, "error", str(e), input_content=input_text,
+                      cooldown=COOLDOWN_SOFT)
             raise HTTPException(status_code=502, detail={"error": {"message": f"upstream error: {e}", "type": "upstream_error"}})
+
+        # 闭包错误标志：gen 捕获 UpstreamError 后只 yield 错误事件不抛出（流式路径需要），
+        # 非流式路径靠它区分"正常结束"与"中途出错"，避免把半截内容当 200 成功返回
+        errored = {"flag": False, "status": 0, "msg": ""}
 
         async def gen():
             _reason_parts: list[str] = []
@@ -588,23 +691,41 @@ def create_app() -> FastAPI:
                            input_content=input_text,
                            output_content=(getattr(converter, "_text_content", "") or "") + converter.tools_summary(),
                            reasoning_content="".join(_reason_parts))
+            except (asyncio.CancelledError, GeneratorExit):
+                # 客户端中途断开：补记已产生的输出（CancelledError 不走 except Exception）；
+                # 断开非账号过错，不计入失败/冷却
+                log_usage("anthropic", model_name, account, t0, "aborted", "client disconnected",
+                          usage=_conv_usage(converter._usage),
+                          input_content=input_text,
+                          output_content=(getattr(converter, "_text_content", "") or "") + converter.tools_summary(),
+                          reasoning_content="".join(_reason_parts), update_pool=False)
+                raise
             except UpstreamError as e:
-                log_usage("anthropic", model_name, account, t0, "error", f"HTTP {e.status_code}", input_content=input_text)
-                yield _err_anthropic(e.status_code, str(e.raw.decode("utf-8", "replace"))).encode()
+                errored["flag"] = True
+                errored["status"] = e.status_code
+                errored["msg"] = str(e.raw.decode("utf-8", "replace"))
+                log_usage("anthropic", model_name, account, t0, "error", f"HTTP {e.status_code}", input_content=input_text,
+                          cooldown=_cooldown_for(e.status_code))
+                yield _err_anthropic(e.status_code, errored["msg"]).encode()
             except Exception as e:  # noqa: BLE001
-                log_usage("anthropic", model_name, account, t0, "error", str(e), input_content=input_text)
+                errored["flag"] = True
+                errored["status"] = 502
+                errored["msg"] = str(e)
+                log_usage("anthropic", model_name, account, t0, "error", str(e), input_content=input_text,
+                          cooldown=COOLDOWN_SOFT)
                 yield _err_anthropic(502, str(e)).encode()
 
         if client_wants_stream:
             return StreamingResponse(gen(), media_type="text/event-stream",
                                      headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
-        # 非流式：消费流并聚合（此时 gen 内的 _log_usage 会记录，这里不再重复）
-        try:
-            async for _ in gen():
-                pass
-            return JSONResponse(content=converter.get_nonstream_response())
-        except Exception as e:  # noqa: BLE001
-            raise HTTPException(status_code=502, detail={"error": {"message": str(e), "type": "upstream_error"}})
+        # 非流式：消费流并聚合（gen 内的 _log_usage 会记录，这里不再重复）；
+        # 中途出错时返回上游真实状态码而非 200+半截内容
+        async for _ in gen():
+            pass
+        if errored["flag"]:
+            raise HTTPException(status_code=errored["status"] or 502,
+                                detail={"error": {"message": errored["msg"], "type": "upstream_error"}})
+        return JSONResponse(content=converter.get_nonstream_response())
 
     @app.post("/v1/responses")
     async def responses(request: Request,
@@ -620,21 +741,27 @@ def create_app() -> FastAPI:
 
         chat_body = _enhance_body(responses_request_to_chat(payload))
         model_name = chat_body.get("model", "auto")
-        input_text = _extract_input_text(chat_body)
+        input_text = await _extract_input_text(chat_body)
         t0 = time.time()
 
         converter = ResponsesStreamConverter(model=model_name)
         client_wants_stream = payload.get("stream", True)
 
         # 预取上游首个事件：失败则直接返回正确 HTTP 状态码
+        # （换号重试后 account 会被重新绑定，gen() 里记账用的就是实际服务的账号）
         try:
-            it, first = await _open_upstream(account, chat_body)
+            it, first, account = await _open_upstream(account, chat_body)
         except UpstreamError as e:
-            log_usage("responses", model_name, account, t0, "error", f"HTTP {e.status_code}", input_content=input_text)
+            log_usage("responses", model_name, account, t0, "error", f"HTTP {e.status_code}", input_content=input_text,
+                      cooldown=_cooldown_for(e.status_code))
             raise HTTPException(status_code=e.status_code, detail=_safe_err(e.raw, e.status_code))
         except httpx.HTTPError as e:
-            log_usage("responses", model_name, account, t0, "error", str(e), input_content=input_text)
+            log_usage("responses", model_name, account, t0, "error", str(e), input_content=input_text,
+                      cooldown=COOLDOWN_SOFT)
             raise HTTPException(status_code=502, detail={"error": {"message": f"upstream error: {e}", "type": "upstream_error"}})
+
+        # 闭包错误标志：用途同 /v1/messages——非流式路径区分正常结束与中途出错
+        errored = {"flag": False, "status": 0, "msg": ""}
 
         async def gen():
             _reason_parts: list[str] = []
@@ -655,24 +782,42 @@ def create_app() -> FastAPI:
                            input_content=input_text,
                            output_content=(getattr(converter, "_content", "") or "") + converter.tools_summary(),
                            reasoning_content="".join(_reason_parts))
+            except (asyncio.CancelledError, GeneratorExit):
+                # 客户端中途断开：补记已产生的输出（CancelledError 不走 except Exception）；
+                # 断开非账号过错，不计入失败/冷却
+                log_usage("responses", model_name, account, t0, "aborted", "client disconnected",
+                          usage=_conv_usage(converter._usage),
+                          input_content=input_text,
+                          output_content=(getattr(converter, "_content", "") or "") + converter.tools_summary(),
+                          reasoning_content="".join(_reason_parts), update_pool=False)
+                raise
             except UpstreamError as e:
-                log_usage("responses", model_name, account, t0, "error", f"HTTP {e.status_code}", input_content=input_text)
-                yield _json_error(e.status_code, str(e.raw.decode("utf-8", "replace"))).encode()
-                yield b"\n\n"
+                errored["flag"] = True
+                errored["status"] = e.status_code
+                errored["msg"] = str(e.raw.decode("utf-8", "replace"))
+                log_usage("responses", model_name, account, t0, "error", f"HTTP {e.status_code}", input_content=input_text,
+                          cooldown=_cooldown_for(e.status_code))
+                yield f'data: {_json_error(e.status_code, errored["msg"])}\n\n'.encode()
+                yield b"data: [DONE]\n\n"
             except Exception as e:  # noqa: BLE001
-                log_usage("responses", model_name, account, t0, "error", str(e), input_content=input_text)
-                yield _json_error(502, str(e)).encode()
-                yield b"\n\n"
+                errored["flag"] = True
+                errored["status"] = 502
+                errored["msg"] = str(e)
+                log_usage("responses", model_name, account, t0, "error", str(e), input_content=input_text,
+                          cooldown=COOLDOWN_SOFT)
+                yield f'data: {_json_error(502, str(e))}\n\n'.encode()
+                yield b"data: [DONE]\n\n"
 
         if client_wants_stream:
             return StreamingResponse(gen(), media_type="text/event-stream",
                                      headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
-        try:
-            async for _ in gen():
-                pass
-            return JSONResponse(content=converter.get_nonstream_response())
-        except Exception as e:  # noqa: BLE001
-            raise HTTPException(status_code=502, detail={"error": {"message": str(e), "type": "upstream_error"}})
+        # 非流式：中途出错时返回上游真实状态码而非 200+半截内容
+        async for _ in gen():
+            pass
+        if errored["flag"]:
+            raise HTTPException(status_code=errored["status"] or 502,
+                                detail={"error": {"message": errored["msg"], "type": "upstream_error"}})
+        return JSONResponse(content=converter.get_nonstream_response())
 
     # ---------------- 管理 API（Phase 3/4） ----------------
     # 单用户一体化的本地管理接口：前后端直接绑定，WebUI 无需 Admin Token 认证即可访问
@@ -692,11 +837,14 @@ def create_app() -> FastAPI:
     @app.post("/admin/accounts/{uid}/enable")
     def admin_enable(uid: str):
         pool.set_enabled(uid, True)
+        # 同步落库：否则重启/重建容器后停用状态丢失，账号"复活"
+        db.set_account_state(uid, enabled=1)
         return {"ok": True}
 
     @app.post("/admin/accounts/{uid}/disable")
     def admin_disable(uid: str):
         pool.set_enabled(uid, False)
+        db.set_account_state(uid, enabled=0)
         return {"ok": True}
 
     @app.post("/admin/accounts/{uid}/priority")
@@ -781,12 +929,40 @@ def create_app() -> FastAPI:
         return {"granularity": granularity, "points": points, "data": db.usage_timeseries(granularity, points, model)}
 
     @app.get("/admin/usage/recent")
-    def admin_usage_recent(limit: int = 50, protocol: str | None = None,
+    def admin_usage_recent(page: int = 1, page_size: int = 20, protocol: str | None = None,
                            model: str | None = None, app_name: str | None = None,
                            status: str | None = None):
-        """最近使用记录，支持按 protocol/model/app_name/status 筛选。"""
-        return {"records": db.usage_recent(min(limit, 500), protocol=protocol,
-                                           model=model, app_name=app_name, status=status)}
+        """最近使用记录（服务端分页），支持按 protocol/model/app_name/status 筛选。
+
+        返回 {records, total, page, page_size}：records 是 light 投影（不含大文本），
+        total 是符合筛选条件的总数——分页必须由后端完成，前端本地分页只能翻到
+        一次性拉回来的那批记录（老版本"到第 5 页就没了"的根因）；
+        完整内容由 /admin/usage/{record_id:int} 详情端点按需获取。
+        """
+        page = max(1, page)
+        page_size = max(1, min(page_size, 200))
+        return {
+            "records": db.usage_recent(page_size, offset=(page - 1) * page_size,
+                                       protocol=protocol, model=model,
+                                       app_name=app_name, status=status, light=True),
+            "total": db.usage_count(protocol=protocol, model=model,
+                                    app_name=app_name, status=status),
+            "page": page,
+            "page_size": page_size,
+        }
+
+    @app.get("/admin/usage/{record_id:int}")
+    def admin_usage_detail(record_id: int):
+        """单条使用记录详情（含完整输入/输出/思考链 content），供记录页详情弹窗。
+
+        路径参数必须用 `:int` 转换器：FastAPI 的 `{record_id}` 会匹配任意单段路径
+        （int 校验在路由匹配之后才做），注册顺序又在 filters/storage 等字面路由之前，
+        会把 GET /admin/usage/filters 吞掉变成 422。
+        """
+        r = db.get_usage(record_id)
+        if not r:
+            raise HTTPException(status_code=404, detail={"error": {"message": "记录不存在"}})
+        return {"record": r}
 
     @app.get("/admin/usage/filters")
     def admin_usage_filters():
@@ -807,8 +983,17 @@ def create_app() -> FastAPI:
     @app.get("/admin/models")
     def admin_models():
         # 返回完整模型元数据（含 context_length / max_output_tokens / name / reasoning / 模态 / 能力），供 WebUI 模型页展示
-        entries = models.list()
-        # 合并 AA 评测数据（若有 key 且有匹配）
+        # 注：请求路径只读当前缓存（后台调度器每 30 分钟自动刷新），
+        # 缓存为空时现场拉取一次（首次访问或刚清空场景），之后仍走缓存。
+        entries = models.list_cached()
+        source = models.source()
+        if not entries:
+            try:
+                entries = models.refresh()
+                source = models.source()
+            except Exception as e:  # noqa: BLE001
+                logger.warning("模型现场刷新失败: %s", e)
+        # 合并 AA 评测数据（若有 key 且有匹配；只读缓存，绝不阻塞在网络请求上）
         for e in entries:
             if benchmarks.configured():
                 try:
@@ -817,19 +1002,32 @@ def create_app() -> FastAPI:
                         e["benchmark"] = bb
                 except Exception:  # noqa: BLE001
                     pass
-        return {"models": entries, "source": models.source()}
+        return {"models": entries, "source": source,
+                "aa_configured": benchmarks.configured()}
 
     @app.get("/admin/models/benchmarks")
     def admin_benchmarks():
-        """返回各模型的 AA 评测数据（供 WebUI 评测卡片展示）。"""
+        """返回各模型的 AA 评测数据（供 WebUI 评测卡片展示）。
+
+        只读缓存：首次调用若缓存为空才现场拉取一次，之后由调度器每日刷新。
+        （sync 路由运行在线程池，可直接调用阻塞的 refresh()）
+        """
         if not benchmarks.configured():
             return {"configured": False, "models": {}}
-        out = {}
-        for e in models.list():
+        if not benchmarks.has_cache():
             try:
-                bb = benchmarks.map(e["id"])
+                benchmarks.refresh()
+            except Exception as e:  # noqa: BLE001
+                logger.warning("AA 评测现场刷新失败: %s", e)
+        out = {}
+        # 只读缓存快照：`or models.ids()` 兜底会在缓存为空时把同步上游调用带回请求路径
+        # （最长 20s 超时），正是概览页曾经专门规避的问题。缓存为空就返回空数据，
+        # 由调度器启动/每日任务预热。
+        for e in models.ids_cached():
+            try:
+                bb = benchmarks.map(e)
                 if bb:
-                    out[e["id"]] = bb
+                    out[e] = bb
             except Exception:  # noqa: BLE001
                 pass
         return {"configured": True, "models": out}
@@ -881,9 +1079,12 @@ def create_app() -> FastAPI:
 
         return {
             "accounts": accounts,
-            "models": models.ids(),
+            # 概览是高频轮询端点：模型只读缓存快照，绝不触发上游网络请求
+            #（缓存由调度器定期刷新，为空时显示 0，由模型页引导刷新）
+            "models": models.ids_cached(),
             "usage": db.usage_summary(),
-            "recent": db.usage_recent(10),
+            # 概览高频轮询：只取元数据，不携带大体积 content，避免 payload 膨胀
+            "recent": db.usage_recent(10, light=True),
             "prediction": {
                 "remaining_credits": round(remaining, 2),
                 "tokens_per_credit": round(blended, 1) if blended is not None else None,
@@ -904,10 +1105,11 @@ def create_app() -> FastAPI:
             "checkin_hours": s.get("checkin_hours", "9,21"),
             "credit_refresh_min": s.get("credit_refresh_min", "30"),
             "model_refresh_hour": s.get("model_refresh_hour", "6"),
+            "model_ttl_min": s.get("model_ttl_min", "60"),
             "aa_refresh_hour": s.get("aa_refresh_hour", "7"),
             "keepalive_hour": s.get("keepalive_hour", "22"),
-            "aa_api_key": aa_key,
-            # 掩码用于前端展示（不泄露完整 key）
+            "keepalive_enabled": s.get("keepalive_enabled", "1"),
+            # 不回明文 key（掩码用于前端展示），完整 key 只在保存时传入、存 DB 即可
             "aa_api_key_masked": _mask_secret(aa_key),
             "aa_enabled": bool(aa_key),
         }
@@ -947,10 +1149,21 @@ def create_app() -> FastAPI:
             db.save_settings(credit_refresh_min=str(v))
         if model_refresh_hour is not None:
             db.save_settings(model_refresh_hour=_validate_hour_field(model_refresh_hour, "模型刷新时间"))
+        if "model_ttl_min" in body:
+            try:
+                ttl = int(body.get("model_ttl_min"))
+                if ttl < 1 or ttl > 1440:
+                    raise ValueError
+            except Exception:  # noqa: BLE001
+                raise HTTPException(status_code=400, detail={"error": {"message": "模型缓存 TTL 需为 1-1440 分钟"}})
+            db.save_settings(model_ttl_min=str(ttl))
         if "aa_refresh_hour" in body:
             db.save_settings(aa_refresh_hour=_validate_hour_field(body.get("aa_refresh_hour"), "AA 评测刷新时间"))
         if keepalive_hour is not None:
             db.save_settings(keepalive_hour=_validate_hour_field(keepalive_hour, "token 保活时间"))
+        if "keepalive_enabled" in body:
+            val = str(body.get("keepalive_enabled") or "").strip()
+            db.save_settings(keepalive_enabled="1" if val in ("1", "true", "on") else "0")
         if "aa_api_key" in body:
             aa_key = str(body.get("aa_api_key") or "").strip()
             # 留空且已有配置 → 视为不修改（避免误清空）；显式清除用特殊标记
@@ -961,15 +1174,20 @@ def create_app() -> FastAPI:
                 # 否则忽略（不覆盖）
             else:
                 db.save_settings(aa_api_key=aa_key)
-        # 设置已存入 DB，调度器下个周期自动生效
-        return {"ok": True, **db.get_settings()}
+        # 设置已存入 DB，调度器下个周期自动生效；响应结构与 GET 一致（不回明文 key）
+        resp = dict(admin_get_settings())
+        resp["ok"] = True
+        return resp
 
     # ---------------- 账号管理：上传 auth 文件 / 扫码登录 ----------------
 
     @app.post("/admin/accounts/upload")
     async def admin_upload_auth(file: UploadFile = File(...)):
         """上传一份 CodeBuddy 原始 .info auth 文件并注册进账号池。"""
-        raw = await file.read()
+        MAX_AUTH_SIZE = 10 * 1024 * 1024  # 10MB 上限，防止内存耗尽攻击
+        raw = await file.read(MAX_AUTH_SIZE + 1)
+        if len(raw) > MAX_AUTH_SIZE:
+            raise HTTPException(status_code=413, detail={"error": {"message": "auth 文件过大（>10MB）"}})
         if not raw:
             raise HTTPException(status_code=400, detail={"error": {"message": "空文件"}})
         try:
@@ -983,9 +1201,9 @@ def create_app() -> FastAPI:
         uid = account.get("uid") or ""
         if not uid:
             raise HTTPException(status_code=400, detail={"error": {"message": "account 中缺少 uid"}})
-        # 落盘到 auths/ 目录（校验并格式化）
+        # 落盘到 auths/ 目录（校验并格式化）；uid 属不可信输入，先做安全规整
         d = _auths_dir()
-        path = d / f"workbuddy-{uid}.info"
+        path = d / f"workbuddy-{_safe_uid(uid)}.info"
         with open(path, "w", encoding="utf-8") as f:
             json.dump(data, f, ensure_ascii=False, indent=2)
         info = _register_account(path)
@@ -1004,14 +1222,15 @@ def create_app() -> FastAPI:
     @app.get("/admin/oauth/status")
     async def admin_oauth_status(state: str):
         """轮询扫码登录状态；ready 时自动落盘并注册账号。"""
-        result = oauth_poll(state)
+        # oauth_poll 内含同步网络请求，放线程池避免阻塞事件循环
+        result = await asyncio.to_thread(oauth_poll, state)
         if result.get("status") != "ready":
             return {"status": "pending"}
         auth = result["auth"]
         account = result["account"]
         uid = account.get("uid") or "unknown"
         d = _auths_dir()
-        path = d / f"workbuddy-{uid}.info"
+        path = d / f"workbuddy-{_safe_uid(uid)}.info"
         session = {"auth": auth, "account": account}
         with open(path, "w", encoding="utf-8") as f:
             json.dump(session, f, ensure_ascii=False, indent=2)
@@ -1059,9 +1278,13 @@ def create_app() -> FastAPI:
                 if token != config.admin_token and request.headers.get("X-Admin-Token") != config.admin_token:
                     return JSONResponse(status_code=403, content={"error": {"message": "需要有效的 Admin Token"}})
             else:
-                # 未设置 ADMIN_TOKEN：仅允许本机回环访问管理接口
+                # 未设置 ADMIN_TOKEN：仅允许本机回环访问管理接口。
+                # 兼容 Docker 端口映射：容器化后客户端 IP 是 Docker 网桥网关（如 172.x.x.1），
+                # 不再等于 127.0.0.1。此时改以“Host 头为回环”为准（上方已校验 Host 只允许
+                # localhost/127.0.0.1/::1，DNS rebinding 防护仍在）；真正的 LAN 直连 Host 会被
+                # 上方拦截，需设 ADMIN_TOKEN 才能从局域网访问。
                 client_host = (request.client.host if request.client else "") or ""
-                if not _is_loopback(client_host):
+                if not (_is_loopback(client_host) or _is_loopback(host_name)):
                     return JSONResponse(status_code=403, content={
                         "error": {"message": "管理接口仅允许本机访问；局域网访问请设置 ADMIN_TOKEN"}})
 
@@ -1112,7 +1335,8 @@ def create_app() -> FastAPI:
         if asset_path in ("docs", "redoc", "openapi.json"):
             raise HTTPException(status_code=404)
         f = (_DIST_DIR / asset_path).resolve()
-        if f.is_file() and str(f).startswith(str(_DIST_DIR)):
+        # 严格判定位于 dist 目录内（is_relative_to 避免 "dist-evil" 之类的兄弟目录前缀绕过）
+        if f.is_file() and f.is_relative_to(_DIST_DIR):
             return FileResponse(f)
         # SPA fallback：非 API 的未知路径返回 index.html
         if (_DIST_DIR / "index.html").exists():
@@ -1142,7 +1366,10 @@ def _conv_usage(usage: dict | None) -> dict:
 
 
 def _err_anthropic(status: int, message: str) -> str:
-    return json.dumps({"type": "error", "error": {"type": "api_error", "message": message}})
+    # Anthropic SSE 规范要求错误事件带 `event: error` 头，只发裸 data 行时
+    # Claude Code 等客户端可能不识别而一直挂起等待
+    return ("event: error\ndata: " +
+            json.dumps({"type": "error", "error": {"type": "api_error", "message": message}}) + "\n\n")
 
 
 def _json_error(status: int, message: str) -> str:

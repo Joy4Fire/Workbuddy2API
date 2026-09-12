@@ -46,8 +46,9 @@ MODEL_MAP: dict[str, list[str]] = {
     "kimi-k2.6": ["kimi k2.6"],
     "kimi-k2.5": ["kimi k2.5"],
     "minimax-m3": ["minimax m3"],
-    "deepseek-v4-pro": ["deepseek v4"],
-    "deepseek-v4-flash": ["deepseek v4"],
+    "deepseek-v4-pro": ["deepseek v4 pro", "deepseek v4"],
+    "deepseek-v4.1-flash": ["deepseek v4.1 flash", "deepseek v4"],
+    "deepseek-v4-flash": ["deepseek v4 flash", "deepseek v4"],
     "deepseek-v3-2-volc": ["deepseek v3.2"],
     "hunyuan-2.0-thinking": ["hunyuan"],
     "hunyuan-chat": ["hunyuan turbo"],
@@ -82,6 +83,11 @@ class AABenchmarks:
 
     def configured(self) -> bool:
         return bool(self.key())
+
+    def has_cache(self) -> bool:
+        """是否已有评测缓存（无论是否过期）。供请求路径判断是否需要现场拉取。"""
+        with self._lock:
+            return bool(self._rows)
 
     # ---- 拉取 ----
 
@@ -167,7 +173,9 @@ class AABenchmarks:
     def map(self, model_id: str) -> dict | None:
         """返回精简后的评测数据（供前端展示），无则 None。
 
-        只保留用户选定的三个核心指标（intelligence / coding / agentic），
+        只保留用户选定的三个核心指标（intelligence / coding / math）。
+        注：AA API 已不再返回 agentic_index（2026-09 实测 evaluations 仅含
+        intelligence/coding/math 等），故第三指标展示为「数学」。
         速度、延迟、价格等非指标数据不再返回。
         """
         r = self.lookup(model_id)
@@ -180,7 +188,7 @@ class AABenchmarks:
             "creator": creator.get("name"),
             "intelligence_index": ev.get("artificial_analysis_intelligence_index"),
             "coding_index": ev.get("artificial_analysis_coding_index"),
-            "agentic_index": ev.get("artificial_analysis_agentic_index"),
+            "math_index": ev.get("artificial_analysis_math_index"),
             "source": "aa",
             "aa_url": "https://artificialanalysis.ai/models",
         }

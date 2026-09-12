@@ -19,6 +19,7 @@ from pathlib import Path
 import httpx
 
 from .config import config
+from .credentials import PROJECT_AUTHS_DIR
 
 # 无鉴权标记头（模拟官方插件）
 _NO_AUTH = {
@@ -36,6 +37,8 @@ class OAuthError(Exception):
 def _request(client: httpx.Client, method: str, path: str, *, headers=None, body=None) -> dict:
     url = f"{config.backend}{path}"
     resp = client.request(method, url, headers=headers, json=body if body is not None else {})
+    if resp.status_code >= 400:
+        raise OAuthError(f"HTTP {resp.status_code}: {resp.text[:200]}")
     try:
         data = resp.json()
     except Exception:  # noqa: BLE001
@@ -85,8 +88,11 @@ def oauth_login(*, open_browser: bool = True, timeout: int = 300,
                     f"/v2/plugin/auth/token?state={urllib.parse.quote(str(state))}",
                     headers=_NO_AUTH,
                 ))
-            except OAuthError:
-                continue
+            except OAuthError as e:
+                if "HTTP 4" in str(e) or "后端错误 4" in str(e) or "后端错误 401" in str(e) or "后端错误 403" in str(e):
+                    # state 失效/未授权等不可恢复错误：立即中止，避免无意义重试到超时
+                    raise OAuthError(f"登录失败（不可恢复错误）：{e}")
+                continue  # 其它错误（pending 等）可重试
             if isinstance(t, dict) and t.get("accessToken"):
                 token = t
                 break
@@ -111,8 +117,10 @@ def oauth_login(*, open_browser: bool = True, timeout: int = 300,
                         "X-No-Department-Info": "true",
                     },
                 ))
-            except OAuthError:
-                continue
+            except OAuthError as e:
+                if "HTTP 4" in str(e) or "后端错误 4" in str(e) or "后端错误 401" in str(e) or "后端错误 403" in str(e):
+                    raise OAuthError(f"登录失败（不可恢复错误）：{e}")
+                continue  # 其它错误（账户信息尚在准备）可重试
             if isinstance(acc, dict) and acc.get("uid"):
                 account = acc
                 break
@@ -120,8 +128,8 @@ def oauth_login(*, open_browser: bool = True, timeout: int = 300,
             raise OAuthError("账户信息获取超时")
 
         session = {"auth": token, "account": account}
-        # 4. 落盘为 auth 文件
-        out = output_dir or Path("auths")
+        # 4. 落盘为 auth 文件（锚定包根 auths/，随 CWD 漂移会导致登录后扫描不到账号）
+        out = output_dir or PROJECT_AUTHS_DIR
         out.mkdir(parents=True, exist_ok=True)
         uid = account.get("uid", "unknown")
         path = out / f"workbuddy-{uid}.info"

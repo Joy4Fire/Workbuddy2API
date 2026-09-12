@@ -16,10 +16,13 @@ auths/
 # 环境配置
 .env
 
-# 前端构建
+# 前端构建（node_modules/缓存忽略；dist 是构建产物但必须跟踪——
+# Dockerfile COPY frontend/dist/，提交它才能保证克隆后 docker build 直接可用）
 frontend/node_modules/
-frontend/dist/
 frontend/.pnpm-store/
+
+# 测试临时目录
+tests/_tmp/
 
 # 系统
 .DS_Store

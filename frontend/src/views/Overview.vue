@@ -4,7 +4,7 @@ import { useRouter } from 'vue-router'
 import { api } from '@/api/client'
 import type { Overview, UsagePoint } from '@/types'
 import dayjs from 'dayjs'
-import { TeamOutlined, ThunderboltOutlined, CalendarOutlined, DollarOutlined, DatabaseOutlined, ArrowRightOutlined } from '@ant-design/icons-vue'
+import { TeamOutlined, ThunderboltOutlined, CalendarOutlined, DollarOutlined, DatabaseOutlined, ArrowRightOutlined, RiseOutlined } from '@ant-design/icons-vue'
 import * as echarts from 'echarts/core'
 import { LineChart } from 'echarts/charts'
 import { GridComponent, TooltipComponent, LegendComponent } from 'echarts/components'
@@ -42,6 +42,7 @@ const statCards = computed(() => [
   },
   { title: '总请求', icon: ThunderboltOutlined, accent: '#0ea5e9', value: fmt(data.value.usage.total_requests) },
   { title: '今日请求', icon: CalendarOutlined, accent: '#f59e0b', value: fmt(data.value.usage.today_requests) },
+  { title: '今日 Tokens', icon: RiseOutlined, accent: '#ec4899', value: fmtK(data.value.usage.today_tokens) },
   { title: '总 Tokens', icon: DollarOutlined, accent: '#8b5cf6', value: fmtK(data.value.usage.total_tokens) },
   { title: '模型数', icon: DatabaseOutlined, accent: '#14b8a6', value: fmt(data.value.models.length) },
 ])
@@ -127,9 +128,11 @@ function renderChart() {
 function onResize() { chart?.resize() }
 
 onMounted(async () => {
-  await load()
-  await loadTs()
-  timer = setInterval(load, REFRESH_MS)
+  // 概览数据与趋势图并行加载（串行会叠加两个接口的耗时）
+  await Promise.allSettled([load(), loadTs()])
+  // 趋势图也要随轮询刷新：只刷 load() 会让折线图永远停在打开时刻，
+  // 用户误以为"没有请求"；Promise.allSettled 保证一个失败不影响另一个
+  timer = setInterval(() => { Promise.allSettled([load(), loadTs()]) }, REFRESH_MS)
   window.addEventListener('resize', onResize)
 })
 
@@ -185,19 +188,17 @@ onUnmounted(() => {
         </div>
       </div>
 
-      <a-row :gutter="[16, 16]" style="margin-top: 16px">
-        <a-col v-for="card in statCards" :key="card.title" :xs="12" :sm="8" :lg="4">
-          <div class="stat-card">
-            <div class="stat-icon" :style="{ background: accentColor(card.accent) }">
-              <component :is="card.icon" />
-            </div>
-            <div class="stat-info">
-              <div class="stat-title">{{ card.title }}</div>
-              <div class="stat-value">{{ card.value }}</div>
-            </div>
+      <div class="stat-grid">
+        <div v-for="card in statCards" :key="card.title" class="stat-card">
+          <div class="stat-icon" :style="{ background: accentColor(card.accent) }">
+            <component :is="card.icon" />
           </div>
-        </a-col>
-      </a-row>
+          <div class="stat-info">
+            <div class="stat-title">{{ card.title }}</div>
+            <div class="stat-value">{{ card.value }}</div>
+          </div>
+        </div>
+      </div>
 
       <!-- 趋势折线图（k3 建议概览页补趋势） -->
       <div class="panel" style="margin-top: 16px">
@@ -246,6 +247,16 @@ onUnmounted(() => {
 </template>
 
 <style scoped>
+/* 统计卡：6 等分网格单行铺满（3×2 断点降级），右侧不留空 */
+.stat-grid {
+  display: grid;
+  grid-template-columns: repeat(6, 1fr);
+  gap: 16px;
+  margin-top: 16px;
+}
+@media (max-width: 1400px) { .stat-grid { grid-template-columns: repeat(3, 1fr); } }
+@media (max-width: 720px)  { .stat-grid { grid-template-columns: repeat(2, 1fr); } }
+
 .stat-card {
   position: relative;
   display: flex; align-items: center; gap: 12px;

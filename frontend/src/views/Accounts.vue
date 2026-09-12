@@ -4,12 +4,31 @@ import { message } from 'ant-design-vue'
 import { CheckCircleOutlined } from '@ant-design/icons-vue'
 import { api, qrUrl } from '@/api/client'
 import type { AccountInfo, Settings } from '@/types'
+import dayjs from 'dayjs'
 
 const REFRESH_MS = 20000 // 每 20s 自动刷新
 let timer: ReturnType<typeof setInterval> | null = null
+let nowTimer: ReturnType<typeof setInterval> | null = null
 
 const accounts = ref<AccountInfo[]>([])
 const loading = ref(false)
+
+// 当前时间（秒，每秒刷新），用于冷却倒计时与状态实时判定
+const now = ref(Date.now() / 1000)
+
+// 账号状态细分：已禁用 / 冷却中 / 余额不足 / 健康
+function statusOf(record: AccountInfo): { label: string; color: string; countdown?: string } {
+  if (!record.enabled) return { label: '已禁用', color: 'default' }
+  if (record.cooldown_until && record.cooldown_until > now.value) {
+    const sec = Math.ceil(record.cooldown_until - now.value)
+    const countdown = sec < 60 ? `${sec} 秒` : `${Math.ceil(sec / 60)} 分钟`
+    return { label: '冷却中', color: 'orange', countdown }
+  }
+  if (record.credits_remaining !== null && record.credits_remaining !== undefined && record.credits_remaining <= 0) {
+    return { label: '余额不足', color: 'red' }
+  }
+  return { label: '健康', color: 'green' }
+}
 
 // 上传 auth 文件
 const fileInput = ref<HTMLInputElement | null>(null)
@@ -25,15 +44,17 @@ let pollTimer: ReturnType<typeof setInterval> | null = null
 // 自动签到设置
 const settingsOpen = ref(false)
 const settingsSaving = ref(false)
-const settings = ref<Settings>({ checkin_hours: '9,21', credit_refresh_min: '30', model_refresh_hour: '6', aa_refresh_hour: '7', keepalive_hour: '22' })
+const settings = ref<Settings>({ checkin_hours: '9,21', credit_refresh_min: '30', model_refresh_hour: '6', model_ttl_min: '60', aa_refresh_hour: '7', keepalive_hour: '22' })
 const creditMinutes = ref(30)
 const modelRefreshHour = ref(6)
+const modelTtlMin = ref(60)
 const aaRefreshHour = ref(7)
 const keepaliveHour = ref(22)
 const aaKey = ref('')
 const aaKeyMasked = ref('')
 const aaEnabled = ref(false)
 const aaClear = ref(false)
+const keepaliveEnabled = ref(true)
 
 const anyUnchecked = computed(() => accounts.value.some((a) => !a.checkin_today))
 
@@ -167,11 +188,13 @@ async function openSettings() {
     settings.value = res
     creditMinutes.value = parseInt(res.credit_refresh_min, 10) || 30
     modelRefreshHour.value = parseInt(res.model_refresh_hour, 10) || 6
+    modelTtlMin.value = parseInt(res.model_ttl_min as any, 10) || 60
     aaRefreshHour.value = parseInt(res.aa_refresh_hour, 10) || 7
     keepaliveHour.value = parseInt(res.keepalive_hour, 10) || 22
     aaKeyMasked.value = res.aa_api_key_masked || ''
     aaEnabled.value = !!res.aa_enabled
     aaKey.value = ''
+    keepaliveEnabled.value = res.keepalive_enabled !== '0'
   } catch { /* 拦截器已提示 */ }
 }
 
@@ -187,8 +210,10 @@ async function saveSettings() {
     checkin_hours: settings.value.checkin_hours,
     credit_refresh_min: String(creditMinutes.value),
     model_refresh_hour: String(modelRefreshHour.value),
+    model_ttl_min: String(modelTtlMin.value),
     aa_refresh_hour: String(aaRefreshHour.value),
     keepalive_hour: String(keepaliveHour.value),
+    keepalive_enabled: keepaliveEnabled.value ? '1' : '0',
   }
   if (aaKey.value) {
     payload.aa_api_key = aaKey.value.trim()
@@ -223,11 +248,11 @@ function short(s: string | null | undefined, n = 8) {
   return str.length > n ? str.slice(0, n) + '…' : (str || '-')
 }
 
-// 积分到期倒计时（秒时间戳 → "x 天后 / 今天到期 / 已到期 / -"）
+// 积分到期倒计时（秒时间戳 → "x 天后 / 今天到期 / 已于 MM-DD 到期 / -"）
 function expiryText(ts: number | null | undefined): string {
   if (!ts) return '-'
   const diffDays = (ts - Date.now() / 1000) / 86400
-  if (diffDays <= 0) return '已到期'
+  if (diffDays <= 0) return `已于 ${dayjs(ts * 1000).format('MM-DD')} 到期`
   if (diffDays < 1) return '今天到期'
   if (diffDays < 30) return `${Math.ceil(diffDays)} 天后`
   return `${Math.round(diffDays / 30)} 个月后`
@@ -238,6 +263,19 @@ function expiryColor(ts: number | null | undefined): string {
   if (diffDays <= 3) return '#ef4444'
   if (diffDays <= 7) return '#f59e0b'
   return '#4ade80'
+}
+
+// 积分构成明细（悬浮弹层用）：与官方控制台"积分明细"同口径
+function fmtNum(n: number | null | undefined): string {
+  return Number(n ?? 0).toLocaleString('zh-CN', { maximumFractionDigits: 1 })
+}
+function remainPct(remain: number, total: number): number {
+  if (!total) return 0
+  return Math.max(0, Math.min(100, Math.round((remain / total) * 100)))
+}
+function fmtDateTime(ts: number | null | undefined): string {
+  if (!ts) return '-'
+  return dayjs(ts * 1000).format('YYYY/MM/DD HH:mm:ss')
 }
 
 // 优先级编辑
@@ -255,10 +293,15 @@ async function savePriority(acc: AccountInfo) {
 onMounted(() => {
   load()
   timer = setInterval(load, REFRESH_MS)
+  // 每秒刷新 now，驱动冷却倒计时与状态实时变化
+  nowTimer = setInterval(() => { now.value = Date.now() / 1000 }, 1000)
 })
 
 onUnmounted(() => {
   if (timer) clearInterval(timer)
+  if (nowTimer) clearInterval(nowTimer)
+  // 扫码轮询也要停：否则弹窗开着切页后每 2s 继续打后端（后端还会打腾讯上游）
+  stopPolling()
 })
 </script>
 
@@ -294,7 +337,16 @@ onUnmounted(() => {
     />
 
     <a-card title="账号列表">
-      <a-table :data-source="accounts" :loading="loading" row-key="uid" :pagination="false" table-layout="fixed">
+      <!-- 列宽合计 ~1210px，窄窗口下容器放不下：开横向滚动并固定操作列，
+           否则操作按钮会被卡片右缘裁掉（无滚动条可拉） -->
+      <a-table
+        :data-source="accounts"
+        :loading="loading"
+        row-key="uid"
+        :pagination="false"
+        :scroll="{ x: 1210 }"
+        table-layout="fixed"
+      >
         <a-table-column title="UID" key="uid" :width="200">
           <template #default="{ record }"><a-tooltip :title="record.uid"><code>{{ short(record.uid, 24) }}</code></a-tooltip></template>
         </a-table-column>
@@ -305,9 +357,15 @@ onUnmounted(() => {
             <a-tag v-else color="default">未知</a-tag>
           </template>
         </a-table-column>
-        <a-table-column title="状态" key="healthy" :width="80">
+        <a-table-column title="状态" key="healthy" :width="130">
           <template #default="{ record }">
-            <a-tag :color="record.healthy ? 'green' : 'red'">{{ record.healthy ? '健康' : '不可用' }}</a-tag>
+            <template v-if="statusOf(record).label === '冷却中'">
+              <a-tooltip :title="`${statusOf(record).countdown}后恢复`">
+                <a-tag color="orange">{{ statusOf(record).label }}</a-tag>
+              </a-tooltip>
+              <span style="font-size: 12px; color: #d97706">{{ statusOf(record).countdown }}后恢复</span>
+            </template>
+            <a-tag v-else :color="statusOf(record).color">{{ statusOf(record).label }}</a-tag>
           </template>
         </a-table-column>
         <a-table-column title="今日签到" key="checkin" :width="90">
@@ -325,7 +383,45 @@ onUnmounted(() => {
         </a-table-column>
         <a-table-column title="积分到期" key="expiry" :width="110">
           <template #default="{ record }">
-            <a-tooltip v-if="record.credits_expire_at" :title="new Date(record.credits_expire_at * 1000).toLocaleString()">
+            <!-- 有积分构成明细时悬浮展示（与官方控制台"积分明细"同口径） -->
+            <a-popover
+              v-if="record.credit_packages && record.credit_packages.length"
+              trigger="hover"
+              placement="left"
+            >
+              <template #content>
+                <div style="min-width: 300px">
+                  <div style="font-weight: 700; color: #e6edf7; margin-bottom: 10px">积分构成</div>
+                  <div v-for="p in record.credit_packages" :key="p.name" style="margin-bottom: 12px">
+                    <div style="display: flex; justify-content: space-between; gap: 12px; font-size: 12px; color: #cdd6e8">
+                      <span>{{ p.name }}</span>
+                      <span style="color: #8a94a6; white-space: nowrap">剩余 {{ remainPct(p.remain, p.total) }}%</span>
+                    </div>
+                    <a-progress
+                      :percent="remainPct(p.remain, p.total)"
+                      :show-info="false"
+                      size="small"
+                      stroke-color="#63b3ed"
+                      trail-color="rgba(255,255,255,0.08)"
+                      style="margin: 2px 0 4px"
+                    />
+                    <div style="font-size: 12px; color: #8a94a6">
+                      已使用 {{ fmtNum(p.used) }} / {{ fmtNum(p.total) }}
+                      <template v-if="p.expire_at"> · 最早到期 {{ fmtDateTime(p.expire_at) }}</template>
+                    </div>
+                  </div>
+                  <div style="font-size: 11px; color: #5c6a8a">已用完的批次不计入最早到期时间</div>
+                </div>
+              </template>
+              <span
+                v-if="record.credits_expire_at"
+                :style="{ color: expiryColor(record.credits_expire_at), fontWeight: 600, cursor: 'help', borderBottom: '1px dashed rgba(255,255,255,0.25)' }"
+              >{{ expiryText(record.credits_expire_at) }}</span>
+              <span v-else style="cursor: help; border-bottom: 1px dashed rgba(255,255,255,0.25)">
+                {{ fmtNum(record.credits_remaining ?? 0) }} 积分
+              </span>
+            </a-popover>
+            <a-tooltip v-else-if="record.credits_expire_at" :title="fmtDateTime(record.credits_expire_at)">
               <span :style="{ color: expiryColor(record.credits_expire_at), fontWeight: 600 }">{{ expiryText(record.credits_expire_at) }}</span>
             </a-tooltip>
             <span v-else>-</span>
@@ -346,7 +442,7 @@ onUnmounted(() => {
           </template>
         </a-table-column>
         <a-table-column title="失败数" data-index="failure_count" key="failure_count" :width="70" />
-        <a-table-column title="操作" key="action" :width="150">
+        <a-table-column title="操作" key="action" :width="150" fixed="right">
           <template #default="{ record }">
             <a-space>
               <a-button size="small" @click="toggle(record)">
@@ -416,16 +512,30 @@ onUnmounted(() => {
             每天该小时自动从上游拉取可用模型列表（供 /v1/models 与 WebUI 展示）
           </div>
         </a-form-item>
+        <a-form-item label="模型缓存 TTL（分钟，1-1440）">
+          <a-input-number v-model:value="modelTtlMin" :min="1" :max="1440" style="width: 100%" />
+          <div style="color: #999; font-size: 12px; margin-top: 4px">
+            推理端点 /v1/models 在缓存超过该时长后才会惰性刷新（默认 60 分钟）。值越大上游调用越少、但模型列表越旧；WebUI 展示不受此影响（由上方定时刷新控制）。
+          </div>
+        </a-form-item>
         <a-form-item label="每日 AA 评测刷新时间（小时，0-23）">
           <a-input-number v-model:value="aaRefreshHour" :min="0" :max="23" style="width: 100%" />
           <div style="color: #999; font-size: 12px; margin-top: 4px">
             每天该小时自动刷新 Artificial Analysis 评测数据（intelligence / coding / agentic 指数）。需先配置 AA API Key。
           </div>
         </a-form-item>
+        <a-form-item label="每日 token 保活">
+          <a-space direction="vertical" style="width: 100%">
+            <a-switch v-model:checked="keepaliveEnabled" checked-children="开启" un-checked-children="关闭" />
+            <div style="color: #999; font-size: 12px">
+              开启后每天定时自动刷新账号 token（防止长期不用过期）。关闭则完全不保活。
+            </div>
+          </a-space>
+        </a-form-item>
         <a-form-item label="每日 token 保活时间（小时，0-23）">
-          <a-input-number v-model:value="keepaliveHour" :min="0" :max="23" style="width: 100%" />
+          <a-input-number v-model:value="keepaliveHour" :min="0" :max="23" style="width: 100%" :disabled="!keepaliveEnabled" />
           <div style="color: #999; font-size: 12px; margin-top: 4px">
-            每天该小时自动刷新账号 token；session 失效的账号会被自动停用
+            每天该小时自动刷新账号 token；连续多次失败（session 失效）的账号才会被自动停用
           </div>
         </a-form-item>
         <a-form-item label="Artificial Analysis API Key（可选）">

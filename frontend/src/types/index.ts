@@ -21,8 +21,12 @@ export interface Settings {
   checkin_hours: string
   credit_refresh_min: string
   model_refresh_hour: string
+  /** 模型缓存 TTL（分钟）：推理端点 /v1/models 惰性刷新的缓存新鲜度上限 */
+  model_ttl_min?: string
   aa_refresh_hour: string
   keepalive_hour: string
+  /** token 保活开关：'1' 开启（默认），'0' 关闭 */
+  keepalive_enabled?: string
   aa_api_key?: string
   aa_api_key_masked?: string
   aa_enabled?: boolean
@@ -43,7 +47,8 @@ export interface AABenchmark {
   creator?: string
   intelligence_index?: number
   coding_index?: number
-  agentic_index?: number
+  /** AA 已不再提供 agentic 指标，第三指标为数学 */
+  math_index?: number
   source?: string
   aa_url?: string
 }
@@ -153,6 +158,10 @@ export interface CheckinResponse {
 
 export interface RecordsResponse {
   records: UsageRecord[]
+  /** 符合筛选条件的总数（服务端分页） */
+  total: number
+  page?: number
+  page_size?: number
 }
 
 /** 应用（API Key）信息 */

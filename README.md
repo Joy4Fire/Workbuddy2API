@@ -12,13 +12,15 @@
 
 - 🔌 **三协议** — OpenAI Chat（`/v1/chat/completions`）、OpenAI Responses（`/v1/responses`）、Anthropic Messages（`/v1/messages`），统一转换后发往腾讯 `/v2/chat/completions`
 - 🔐 **双认证** — 读本地 auth 文件（桌面 CodeBuddy 目录 + 项目 `auths/`）+ 浏览器扫码/OAuth 登录，多账号管理
-- 🔄 **多账号轮换** — 轮换、额度感知、冷却、故障切换，防热点防封号
-- ⏰ **自动签到** — 每日定时签到领积分（登录即自动签到一次，当日不重复）
-- 🗂 **动态模型目录** — 每日从上游拉取可用模型（可配置刷新时间），失败回退静态表；`/v1/models` 输出 OpenAI 标准字段（`vision`/`modalities` 等）
-- 📊 **使用记录** — 每次请求详情（含输入/输出/思考链/多模态 base64）+ 聚合统计（SQLite），可训练自有模型
+- 🔄 **多账号轮换** — 加权轮换（额度/到期/成功率/闲置多因子）、冷却、429/5xx 自动换号重试，防热点防封号
+- ⏰ **自动签到** — 每日定时签到领积分（错过时点自动补签；登录即自动签到一次，当日不重复）
+- 🧠 **思维链适配** — DeepSeek 自动注入 `thinking` 开关、多轮 `reasoning_content` 回填；`developer` 角色自动归一为 `system`（防上游 11128）
+- 🗂 **动态模型目录** — 每日从上游拉取可用模型（可配置刷新时间），拉取失败保留上次缓存；`/v1/models` 输出 OpenAI 标准字段（`vision`/`modalities` 等）
+- 📊 **使用记录** — 每次请求详情（含输入/输出/思考链/多模态 base64）+ 聚合统计（SQLite），服务端分页；客户端中断自动补记 `aborted` 记录
 - 🔑 **应用 Key 管理** — 创建/启停/删除 API Key，加密存储（HMAC-SHA256 计数器密钥流）
 - 🛡 **安全加固** — Host 头校验（防 DNS rebinding）、关闭自动文档、管理写操作审计日志、反审核脱敏、账号级限速
-- 🖥 **WebUI** — 概览 / 账号 / 模型 / 用量 / 使用记录 / 应用 Key 管理（Vite + Vue3 + TS + Ant Design Vue）
+- 🖥 **WebUI** — 概览 / 账号 / 模型 / 用量 / 使用记录 / 应用 Key 管理（Vite + Vue3 + TS + Ant Design Vue），账号页可悬浮查看积分构成明细
+- ⬆️ **升级自动迁移** — 数据库 schema 版本化迁移 + 迁移前自动备份（`data/backups/`），旧版升级无需重新配置
 
 ## 技术栈
 
@@ -140,6 +142,16 @@ clone 后按以下步骤开始使用：
 | `GET /admin/overview` | 概览聚合数据 |
 | `GET/POST /admin/settings` | 读取 / 更新设置 |
 | `POST /admin/oauth/start`、`GET /admin/oauth/status`、`GET /admin/oauth/qr` | 扫码/OAuth 登录 |
+
+## 升级与数据迁移
+
+**从任意旧版本升级到新版本，不需要重新配置**——数据迁移是全自动的：
+
+- **原地升级（最常见）**：直接 `git pull` 后重启，或 `docker compose up -d --build --force-recreate` 重建镜像。数据库文件 `data/workbuddy.db` 与 `auths/` 凭证目录都不会被触碰（Docker 部署时它们挂载在宿主机），旧库的表结构会在启动时按版本号（`PRAGMA user_version`）自动逐级升级，账号、应用 Key、设置、使用记录全部保留。
+- **极旧目录布局**：如果你的旧版把数据库放在包根（`workbuddy.db`）或 `data-top-level/` 下，新版首次启动会自动发现并把这些库的账号/设置/使用记录合并进 `data/workbuddy.db`。
+- **迁移前自动备份**：每次执行 schema 升级前，程序会把旧库完整备份到 `data/backups/workbuddy.db.pre-migrate-v旧-v新.时间戳.bak`（用 SQLite backup API 快照，含未落盘事务），最多保留 5 份。万一升级后有问题，关掉服务后把它改名回 `workbuddy.db` 即可回滚。
+- **换机器 / 换目录部署**：把整个 `data/` 目录（注意保留其中的 `.secret_key` 主密钥，丢了应用 Key 将无法在 WebUI 查看）和 `auths/` 目录拷贝到新位置即可，首次启动自动完成迁移。
+- **应用 Key 兼容性**：早期版本创建的应用没有加密存储（无法在 WebUI「查看 Key」），但 Key 的 sha256 校验值仍在——客户端继续用原来的 Key 即可，鉴权不受影响。
 
 ## 单元测试
 
