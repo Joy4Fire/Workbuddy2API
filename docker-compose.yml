@@ -9,6 +9,13 @@ services:
     image: workbuddy2api:latest
     container_name: workbuddy2api
     restart: unless-stopped
+    healthcheck:
+      # 容器内自检 /health：半死状态让 docker 自动标记 unhealthy（配合 restart 策略）
+      test: ["CMD", "python", "-c", "import urllib.request;urllib.request.urlopen('http://127.0.0.1:8787/health')"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 15s
     ports:
       - "8787:8787"
     environment:

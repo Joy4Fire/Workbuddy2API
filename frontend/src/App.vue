@@ -542,6 +542,21 @@ body .ant-select-dropdown .ant-select-selection-placeholder { color: #8a94a6 !im
 }
 .ant-modal .ant-alert { background: rgba(99, 179, 237, 0.08); border-color: rgba(99, 179, 237, 0.2); }
 
+/* 概览积分预警横幅深色化（warning=橙 / info=蓝，文字提亮保证可读） */
+.page-content .ant-alert-warning {
+  background: rgba(245, 158, 11, 0.12) !important;
+  border-color: rgba(245, 158, 11, 0.45) !important;
+  border-radius: 10px;
+}
+.page-content .ant-alert-warning .ant-alert-message { color: #fbbf24 !important; font-weight: 600; }
+.page-content .ant-alert-info {
+  background: rgba(99, 179, 237, 0.1) !important;
+  border-color: rgba(99, 179, 237, 0.4) !important;
+  border-radius: 10px;
+}
+.page-content .ant-alert-info .ant-alert-message { color: #7cc0f5 !important; font-weight: 600; }
+.page-content .ant-alert-description { color: #cdd6e8 !important; }
+
 /* 提示条 / 选择下拉 */
 body .ant-select-dropdown {
   background: #1a2140; border: 1px solid rgba(99,179,237,0.15);

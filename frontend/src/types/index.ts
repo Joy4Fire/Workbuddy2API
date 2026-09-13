@@ -3,6 +3,8 @@
 export interface AccountInfo {
   uid: string
   enabled: boolean
+  /** 禁用原因（"手动停用"/"保活连续失败…"），启用时为空 */
+  disabled_reason?: string
   healthy: boolean
   cooldown_until: number
   failure_count: number
@@ -32,6 +34,16 @@ export interface Settings {
   aa_enabled?: boolean
   /** 清除 AA key 的标记 */
   clear_aa_api_key?: boolean
+  /** 积分预警开关：'1' 开启，'0' 关闭 */
+  alert_enabled?: string
+  /** 预警 webhook 地址（Bark/企业微信/飞书自动识别） */
+  alert_webhook_url?: string
+  /** 余额占比低于该百分比触发预警（1-90） */
+  alert_threshold_percent?: string
+  /** 积分 N 天内到期触发预警（1-90） */
+  alert_expiry_days?: string
+  /** 模型别名映射原文（每行一条：别名=真实模型） */
+  model_aliases?: string
 }
 
 export interface ModelReasoning {
@@ -126,6 +138,8 @@ export interface Overview {
   models: string[]
   usage: UsageSummary
   recent: UsageRecord[]
+  /** 积分预警横幅（余额低于阈值/积分即将到期），无预警为空数组 */
+  alerts?: { level: string; message: string }[]
   prediction?: {
     remaining_credits: number
     tokens_per_credit: number | null

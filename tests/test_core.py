@@ -2,6 +2,7 @@
 
 运行：python -m unittest discover -s tests
 """
+import asyncio
 import os
 import sys
 import tempfile
@@ -394,6 +395,105 @@ class TestDB(unittest.TestCase):
         finally:
             for f in list(tmp.glob("legacy.db*")) + list(tmp.glob("target.db*")):
                 f.unlink(missing_ok=True)
+
+
+
+
+class TestAppHelpers(unittest.TestCase):
+    """app.py 模块级帮助函数（token 估算 / 别名解析 / 流式心跳）。"""
+
+    def test_estimate_tokens_cjk_vs_latin(self):
+        from workbuddy_one.app import _estimate_tokens
+        # 同样字符数：中文估算应显著高于英文（CJK ~1.5 字符/token vs /4）
+        cjk = _estimate_tokens("这是一段中文测试文本用于验证估算" * 1, 1)
+        latin = _estimate_tokens("abcdefghij" * 3, 1)  # 30 字符
+        self.assertGreater(cjk, latin)
+        # 空文本有最小开销
+        self.assertEqual(_estimate_tokens("", 0), 4)
+
+    def test_parse_model_aliases(self):
+        from workbuddy_one.app import _parse_model_aliases
+        raw = "gpt-4o=deepseek-v4-pro\n\n  kimi = kimi-k3-1  \nbad-line\n=x\nx="
+        self.assertEqual(
+            _parse_model_aliases(raw),
+            {"gpt-4o": "deepseek-v4-pro", "kimi": "kimi-k3-1"},
+        )
+        self.assertEqual(_parse_model_aliases(""), {})
+
+
+class TestUsageSearch(unittest.TestCase):
+    def test_search_filters_and_escapes(self):
+        from workbuddy_one.db import Database
+        tmp = Path(__file__).resolve().parent / "_tmp"
+        tmp.mkdir(exist_ok=True)
+        db = Database(str(tmp / "search_test.db"))
+        try:
+            db.log_usage(model="m", protocol="chat", account_uid="u", status="ok",
+                         input_content="帮我写一个 quicksort 算法", output_content="def quicksort...")
+            db.log_usage(model="m", protocol="chat", account_uid="u", status="ok",
+                         input_content="今天天气怎么样", output_content="晴天")
+            db.log_usage(model="m", protocol="chat", account_uid="u", status="ok",
+                         input_content="带下划线的 a_b 搜索应转义", output_content="")
+            self.assertEqual(db.usage_count(search="quicksort"), 1)
+            self.assertEqual(db.usage_count(search="晴天"), 1)  # 输出侧命中
+            self.assertEqual(db.usage_count(search="不存在的内容xyz"), 0)
+            # LIKE 转义：下划线是通配符，必须按字面匹配
+            self.assertEqual(db.usage_count(search="a_b"), 1)
+            self.assertEqual(db.usage_count(search="axb"), 0)
+            rows = db.usage_recent(10, search="quicksort")
+            self.assertEqual(len(rows), 1)
+        finally:
+            db._conn.close()
+            for f in tmp.glob("search_test.db*"):
+                f.unlink(missing_ok=True)
+
+
+class TestDisabledReason(unittest.TestCase):
+    def test_persist_and_clear(self):
+        from workbuddy_one.db import Database
+        tmp = Path(__file__).resolve().parent / "_tmp"
+        tmp.mkdir(exist_ok=True)
+        db = Database(str(tmp / "reason_test.db"))
+        try:
+            db.upsert_account({"path": "/x"}, {"uid": "u-reason", "nickname": "n"})
+            db.set_account_state("u-reason", enabled=0, disabled_reason="保活连续失败")
+            row = db.get_account("u-reason")
+            self.assertEqual(row["enabled"], 0)
+            self.assertEqual(row["disabled_reason"], "保活连续失败")
+            db.set_account_state("u-reason", enabled=1, disabled_reason="")
+            row = db.get_account("u-reason")
+            self.assertEqual(row["enabled"], 1)
+            self.assertEqual(row["disabled_reason"], "")
+        finally:
+            db._conn.close()
+            for f in tmp.glob("reason_test.db*"):
+                f.unlink(missing_ok=True)
+
+
+class TestKeepalive(unittest.IsolatedAsyncioTestCase):
+    async def test_keepalive_injected_during_silence(self):
+        from workbuddy_one.app import _with_keepalive
+
+        async def slow():
+            yield "a"
+            await asyncio.sleep(0.15)  # 静默期 > interval，应插入心跳
+            yield "b"
+
+        out = [c if isinstance(c, str) else c.decode() async for c in _with_keepalive(slow(), 0.05)]
+        self.assertEqual(out[0], "a")
+        self.assertEqual(out[-1], "b")
+        self.assertTrue(any("keepalive" in t for t in out[1:-1]), out)
+
+    async def test_no_keepalive_when_streaming_fast(self):
+        from workbuddy_one.app import _with_keepalive
+
+        async def fast():
+            for i in range(5):
+                yield f"c{i}"
+                await asyncio.sleep(0.001)
+
+        out = [c if isinstance(c, str) else c.decode() async for c in _with_keepalive(fast(), 1.0)]
+        self.assertEqual(out, ["c0", "c1", "c2", "c3", "c4"])
 
 
 if __name__ == "__main__":

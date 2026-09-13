@@ -29,6 +29,9 @@ const loading = ref(false)
 
 const healthyCount = computed(() => data.value.accounts.filter((a) => a.healthy).length)
 
+// 积分预警横幅（后端按阈值计算：余额不足/积分即将到期）
+const alerts = computed(() => data.value.alerts ?? [])
+
 // 最近记录限条数：概览页只作速览（表格自身也限高滚动），完整列表去「使用记录」页
 const RECENT_LIMIT = 6
 const recentLimited = computed(() => (data.value.recent ?? []).slice(0, RECENT_LIMIT))
@@ -147,6 +150,15 @@ onUnmounted(() => {
 <template>
   <div>
     <a-spin :spinning="loading" tip="加载中…">
+      <!-- 积分预警横幅（余额不足/即将到期） -->
+      <a-alert
+        v-for="(a, i) in alerts"
+        :key="i"
+        :type="a.level === 'warning' ? 'warning' : 'info'"
+        show-icon
+        style="margin-bottom: 12px"
+        :message="a.message"
+      />
       <!-- 积分 → 预测 token 横幅 -->
       <div class="predict-banner">
         <div class="predict-icon"><DollarOutlined /></div>

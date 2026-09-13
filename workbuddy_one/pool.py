@@ -38,6 +38,7 @@ class Account:
         self.uid = uid
         self.mgr = mgr
         self.enabled = True
+        self.disabled_reason = ""         # 禁用原因（"手动停用"/"保活连续失败"…），启用时为空
         self.cooldown_until = 0.0          # 冷却截止时间
         self.failure_count = 0
         self.credits_remaining: int | None = None
@@ -86,6 +87,7 @@ class AccountPool:
         return [{
             "uid": a.uid,
             "enabled": a.enabled,
+            "disabled_reason": a.disabled_reason,
             "healthy": a.healthy(now),
             "cooldown_until": a.cooldown_until,
             "failure_count": a.failure_count,
@@ -98,11 +100,13 @@ class AccountPool:
             "source": _account_source(a),
         } for a in self.accounts]
 
-    def set_enabled(self, uid: str, enabled: bool):
+    def set_enabled(self, uid: str, enabled: bool, reason: str = ""):
+        """启停账号。禁用时必须带原因（供 WebUI 展示"为什么不可用"），启用时清空原因。"""
         with self._lock:
             for a in self.accounts:
                 if a.uid == uid:
                     a.enabled = enabled
+                    a.disabled_reason = "" if enabled else (reason or "已禁用")
                     return
 
     def set_credits(self, uid: str, remain, total, expire_at=None, packages: list[dict] | None = None):

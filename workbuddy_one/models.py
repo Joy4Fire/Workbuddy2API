@@ -153,6 +153,17 @@ class ModelRegistry:
         with self._lock:
             return dict(self._reasoning.get(model, {}))
 
+    def max_output_tokens(self, model: str) -> int | None:
+        """返回某模型的最大输出 token 上限（目录未知时 None，调用方不裁剪）。"""
+        with self._lock:
+            for m in (self._models or []):
+                if m.get("id") == model:
+                    try:
+                        return int(m.get("max_output_tokens") or 0) or None
+                    except (TypeError, ValueError):
+                        return None
+        return None
+
     def reasoning_efforts(self, model: str) -> list[str] | None:
         """返回某模型支持的思考强度档位（含 'off'，若可关闭思考）。
 

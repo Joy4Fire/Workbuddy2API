@@ -149,9 +149,10 @@ def create_app() -> FastAPI:
                                  _row.get("credits_expire_at"))
             if _row.get("priority"):
                 pool.set_priority(_acc.uid, _row.get("priority"))
-            # 恢复停用状态：手动停用/保活自动禁用的账号不能因重启"复活"
+            # 恢复停用状态：手动停用/保活自动禁用的账号不能因重启"复活"，
+            # 原因一并恢复（WebUI 展示"为什么不可用"）
             if _row.get("enabled") == 0:
-                pool.set_enabled(_acc.uid, False)
+                pool.set_enabled(_acc.uid, False, reason=_row.get("disabled_reason") or "手动停用")
     models = ModelRegistry(pool, db=db)
     benchmarks = AABenchmarks(db=db)
     scheduler = Scheduler(pool, db=db, models=models, benchmarks=benchmarks,
@@ -252,6 +253,17 @@ def create_app() -> FastAPI:
             _limiters[uid] = AsyncAccountRateLimiter(min_interval=config.ratelimit_interval)
         return _limiters[uid]
 
+    def _resolve_model(model: str) -> str:
+        """按设置里的 model_aliases 把别名解析为真实模型名（每行一条：别名=真实模型）。
+
+        让硬编码熟名字（gpt-4o 等）的客户端开箱即用。每次读 settings（几行的
+        SQLite 查询，单用户场景开销可忽略）。
+        """
+        if not model:
+            return model
+        aliases = _parse_model_aliases(db.get_settings().get("model_aliases") or "")
+        return aliases.get(model, model)
+
     def _get_headers(account):
         """取账号请求头（token 过期时自动刷新）；刷新失败转 503 并冷却该账号。
 
@@ -304,6 +316,16 @@ def create_app() -> FastAPI:
 
     def _enhance_body(body: dict) -> dict:
         """统一规整 + 可选脱敏，构造最终上游请求体。"""
+        # 模型别名解析：客户端用熟名字（gpt-4o 等）也能路由到真实模型
+        if body.get("model"):
+            body["model"] = _resolve_model(str(body["model"]))
+        # max_tokens 按模型实际上限裁剪：Claude Code 常发 32000+，
+        # 超过部分模型上限会被上游拒绝（目录未知时不裁剪）
+        max_out = models.max_output_tokens(str(body.get("model") or ""))
+        if max_out and body.get("max_tokens") and body["max_tokens"] > max_out:
+            logger.info("max_tokens %s 超过模型 %s 上限，裁剪为 %s",
+                        body["max_tokens"], body.get("model"), max_out)
+            body["max_tokens"] = max_out
         # 动态思考强度表：来自模型目录（动态获取），无则交给内置静态表
         model_id = body.get("model")
         dyn_efforts = None
@@ -483,7 +505,22 @@ def create_app() -> FastAPI:
     def list_models(authorization: str | None = Header(default=None),
                     x_api_key: str | None = Header(default=None, alias="X-Api-Key")):
         _check_api_key(authorization, x_api_key)
-        return {"object": "list", "data": models.list()}
+        data = models.list()
+        # 别名条目：复用真实模型的元数据（模态/上下文等），id 换成别名——
+        # 客户端模型下拉里直接出现熟名字（gpt-4o 等），选中即路由到真实模型
+        aliases = _parse_model_aliases(db.get_settings().get("model_aliases") or "")
+        if aliases:
+            seen = {m["id"] for m in data}
+            base_by_id = {m["id"]: m for m in data}
+            for alias, real in aliases.items():
+                if alias in seen or real not in base_by_id:
+                    continue
+                entry = dict(base_by_id[real])
+                entry["id"] = alias
+                entry["name"] = f"{alias}（{real} 别名）"
+                data.append(entry)
+                seen.add(alias)
+        return {"object": "list", "data": data}
 
     @app.post("/v1/messages/count_tokens")
     async def count_tokens(request: Request,
@@ -499,27 +536,25 @@ def create_app() -> FastAPI:
             body = await request.json()
         except Exception:  # noqa: BLE001
             raise HTTPException(status_code=400, detail={"error": {"message": "bad json", "type": "invalid_request_error"}})
-        text_len = 0
+        texts: list[str] = []
         n_msg = 0
         for m in body.get("messages") or []:
             n_msg += 1
             c = m.get("content")
             if isinstance(c, str):
-                text_len += len(c)
+                texts.append(c)
             elif isinstance(c, list):
                 for p in c:
                     if isinstance(p, dict):
-                        text_len += len(p.get("text", "") or "")
+                        texts.append(p.get("text", "") or "")
         system = body.get("system")
         if isinstance(system, str):
-            text_len += len(system)
+            texts.append(system)
         elif isinstance(system, list):
             for p in system:
                 if isinstance(p, dict):
-                    text_len += len(p.get("text", "") or "")
-        # 粗略估算：英文约 4 字符/token，另加每条消息 ~4 token 的结构开销
-        est = int(text_len / 4) + n_msg * 4 + 4
-        return {"input_tokens": est}
+                    texts.append(p.get("text", "") or "")
+        return {"input_tokens": _estimate_tokens(" ".join(t for t in texts if t), n_msg)}
 
     @app.post("/v1/chat/completions")
     async def chat_completions(request: Request,
@@ -539,7 +574,8 @@ def create_app() -> FastAPI:
         client_wants_stream = bool(payload.get("stream"))
         body = _enhance_body(build_upstream_body(payload))
         headers = _get_headers(account)
-        model_name = payload.get("model", "auto")
+        # 记账用解析后的真实模型名（别名请求按真实模型归因，避免按模型统计被打碎）
+        model_name = body.get("model", "auto")
         input_text = await _extract_input_text(body)
         t0 = time.time()
 
@@ -607,7 +643,7 @@ def create_app() -> FastAPI:
                               cooldown=COOLDOWN_SOFT)
                     yield f'data: {_json_error(502, str(e))}\n\n'.encode()
                     yield b"data: [DONE]\n\n"
-            return StreamingResponse(gen(), media_type="text/event-stream",
+            return StreamingResponse(_with_keepalive(gen(), 15.0), media_type="text/event-stream",
                                      headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
 
         try:
@@ -716,7 +752,7 @@ def create_app() -> FastAPI:
                 yield _err_anthropic(502, str(e)).encode()
 
         if client_wants_stream:
-            return StreamingResponse(gen(), media_type="text/event-stream",
+            return StreamingResponse(_with_keepalive(gen(), 15.0), media_type="text/event-stream",
                                      headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
         # 非流式：消费流并聚合（gen 内的 _log_usage 会记录，这里不再重复）；
         # 中途出错时返回上游真实状态码而非 200+半截内容
@@ -809,7 +845,7 @@ def create_app() -> FastAPI:
                 yield b"data: [DONE]\n\n"
 
         if client_wants_stream:
-            return StreamingResponse(gen(), media_type="text/event-stream",
+            return StreamingResponse(_with_keepalive(gen(), 15.0), media_type="text/event-stream",
                                      headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
         # 非流式：中途出错时返回上游真实状态码而非 200+半截内容
         async for _ in gen():
@@ -836,15 +872,15 @@ def create_app() -> FastAPI:
 
     @app.post("/admin/accounts/{uid}/enable")
     def admin_enable(uid: str):
-        pool.set_enabled(uid, True)
+        pool.set_enabled(uid, True)  # 启用时清空禁用原因
         # 同步落库：否则重启/重建容器后停用状态丢失，账号"复活"
-        db.set_account_state(uid, enabled=1)
+        db.set_account_state(uid, enabled=1, disabled_reason="")
         return {"ok": True}
 
     @app.post("/admin/accounts/{uid}/disable")
     def admin_disable(uid: str):
-        pool.set_enabled(uid, False)
-        db.set_account_state(uid, enabled=0)
+        pool.set_enabled(uid, False, reason="手动停用")
+        db.set_account_state(uid, enabled=0, disabled_reason="手动停用")
         return {"ok": True}
 
     @app.post("/admin/accounts/{uid}/priority")
@@ -931,9 +967,10 @@ def create_app() -> FastAPI:
     @app.get("/admin/usage/recent")
     def admin_usage_recent(page: int = 1, page_size: int = 20, protocol: str | None = None,
                            model: str | None = None, app_name: str | None = None,
-                           status: str | None = None):
+                           status: str | None = None, search: str | None = None):
         """最近使用记录（服务端分页），支持按 protocol/model/app_name/status 筛选。
 
+        search 为内容关键字搜索（输入/输出/思考链 LIKE 匹配）。
         返回 {records, total, page, page_size}：records 是 light 投影（不含大文本），
         total 是符合筛选条件的总数——分页必须由后端完成，前端本地分页只能翻到
         一次性拉回来的那批记录（老版本"到第 5 页就没了"的根因）；
@@ -944,9 +981,10 @@ def create_app() -> FastAPI:
         return {
             "records": db.usage_recent(page_size, offset=(page - 1) * page_size,
                                        protocol=protocol, model=model,
-                                       app_name=app_name, status=status, light=True),
+                                       app_name=app_name, status=status, light=True,
+                                       search=search),
             "total": db.usage_count(protocol=protocol, model=model,
-                                    app_name=app_name, status=status),
+                                    app_name=app_name, status=status, search=search),
             "page": page,
             "page_size": page_size,
         }
@@ -1077,6 +1115,33 @@ def create_app() -> FastAPI:
         blended = sum(p["weight"] * p["tokens_per_credit"] for p in pm) if pm else None
         predicted = (remaining * blended) if blended is not None and remaining else None
 
+        # 积分预警（WebUI 顶部横幅）：余额占比低于阈值或积分即将到期
+        try:
+            threshold = float(db.get_settings().get("alert_threshold_percent", "10"))
+        except (TypeError, ValueError):
+            threshold = 10.0
+        try:
+            expiry_days = float(db.get_settings().get("alert_expiry_days", "3"))
+        except (TypeError, ValueError):
+            expiry_days = 3.0
+        alerts = []
+        total_cap = sum(float(a.get("credits_total") or 0) for a in accounts)
+        if total_cap > 0 and remaining / total_cap * 100 < threshold:
+            alerts.append({
+                "level": "warning",
+                "message": f"积分余额 {remaining:.0f}/{total_cap:.0f}（占 {remaining / total_cap * 100:.0f}%），低于预警阈值 {threshold:.0f}%",
+            })
+        now_ts = time.time()
+        for a in accounts:
+            exp = a.get("credits_expire_at")
+            if exp and (a.get("credits_remaining") or 0) > 0:
+                days = (float(exp) - now_ts) / 86400
+                if 0 <= days <= expiry_days:
+                    alerts.append({
+                        "level": "info",
+                        "message": f"账号 {a['uid'][:8]} 的积分将在 {days:.1f} 天后到期（剩余 {a.get('credits_remaining'):.0f}），请及时消耗",
+                    })
+
         return {
             "accounts": accounts,
             # 概览是高频轮询端点：模型只读缓存快照，绝不触发上游网络请求
@@ -1093,6 +1158,7 @@ def create_app() -> FastAPI:
                 "tokens_used": int(stats["total_tokens"]),
                 "models": pm,
             },
+            "alerts": alerts,
         }
 
     # ---------------- 自动签到 / 额度刷新 设置 ----------------
@@ -1112,6 +1178,13 @@ def create_app() -> FastAPI:
             # 不回明文 key（掩码用于前端展示），完整 key 只在保存时传入、存 DB 即可
             "aa_api_key_masked": _mask_secret(aa_key),
             "aa_enabled": bool(aa_key),
+            # 积分预警
+            "alert_enabled": s.get("alert_enabled", "0"),
+            "alert_webhook_url": s.get("alert_webhook_url", ""),
+            "alert_threshold_percent": s.get("alert_threshold_percent", "10"),
+            "alert_expiry_days": s.get("alert_expiry_days", "3"),
+            # 模型别名映射（每行一条：别名=真实模型）
+            "model_aliases": s.get("model_aliases", ""),
         }
 
     def _validate_hour_field(value, field_name: str) -> str:
@@ -1164,6 +1237,38 @@ def create_app() -> FastAPI:
         if "keepalive_enabled" in body:
             val = str(body.get("keepalive_enabled") or "").strip()
             db.save_settings(keepalive_enabled="1" if val in ("1", "true", "on") else "0")
+        if "alert_enabled" in body:
+            val = str(body.get("alert_enabled") or "").strip().lower()
+            db.save_settings(alert_enabled="1" if val in ("1", "true", "on") else "0")
+        if "alert_webhook_url" in body:
+            db.save_settings(alert_webhook_url=str(body.get("alert_webhook_url") or "").strip())
+        if "alert_threshold_percent" in body:
+            try:
+                v = float(body.get("alert_threshold_percent"))
+                if not 1 <= v <= 90:
+                    raise ValueError
+            except (TypeError, ValueError):
+                raise HTTPException(status_code=400, detail={"error": {"message": "余额预警阈值需为 1-90 的数字"}})
+            db.save_settings(alert_threshold_percent=str(v))
+        if "alert_expiry_days" in body:
+            try:
+                v = float(body.get("alert_expiry_days"))
+                if not 1 <= v <= 90:
+                    raise ValueError
+            except (TypeError, ValueError):
+                raise HTTPException(status_code=400, detail={"error": {"message": "到期预警天数需为 1-90 的数字"}})
+            db.save_settings(alert_expiry_days=str(v))
+        if "model_aliases" in body:
+            raw = str(body.get("model_aliases") or "")
+            for ln in raw.splitlines():
+                ln = ln.strip()
+                if not ln:
+                    continue
+                alias, _, real = ln.partition("=")
+                if not alias.strip() or not real.strip():
+                    raise HTTPException(status_code=400,
+                                        detail={"error": {"message": f"模型别名格式错误：{ln}（应为 别名=真实模型）"}})
+            db.save_settings(model_aliases=raw)
         if "aa_api_key" in body:
             aa_key = str(body.get("aa_api_key") or "").strip()
             # 留空且已有配置 → 视为不修改（避免误清空）；显式清除用特殊标记
@@ -1224,6 +1329,9 @@ def create_app() -> FastAPI:
         """轮询扫码登录状态；ready 时自动落盘并注册账号。"""
         # oauth_poll 内含同步网络请求，放线程池避免阻塞事件循环
         result = await asyncio.to_thread(oauth_poll, state)
+        if result.get("status") == "expired":
+            # state 失效等不可恢复错误：明确告知前端，避免二维码永远转圈
+            return {"status": "expired"}
         if result.get("status") != "ready":
             return {"status": "pending"}
         auth = result["auth"]
@@ -1338,8 +1446,9 @@ def create_app() -> FastAPI:
         # 严格判定位于 dist 目录内（is_relative_to 避免 "dist-evil" 之类的兄弟目录前缀绕过）
         if f.is_file() and f.is_relative_to(_DIST_DIR):
             return FileResponse(f)
-        # SPA fallback：非 API 的未知路径返回 index.html
-        if (_DIST_DIR / "index.html").exists():
+        # SPA fallback：仅无扩展名的路径回退 index.html（前端路由）；
+        # 带扩展名的未知文件（如 /foo.js、/main.css）是真不存在，返回 404
+        if "." not in Path(asset_path).name and (_DIST_DIR / "index.html").exists():
             return FileResponse(_DIST_DIR / "index.html")
         raise HTTPException(status_code=404)
 
@@ -1374,6 +1483,82 @@ def _err_anthropic(status: int, message: str) -> str:
 
 def _json_error(status: int, message: str) -> str:
     return json.dumps({"error": {"message": message, "type": "upstream_error"}})
+
+
+
+
+
+async def _with_keepalive(gen, interval: float = 15.0):
+    """包一层 SSE 流：静默超过 interval 秒时插入 `: keepalive` 注释行。
+
+    防止长思考模型（DeepSeek 等）输出间隙的静默被客户端/中间代理掐断。
+    用 pump 任务 + 队列实现——不能对上游流迭代器本身做 wait_for 超时
+    （超时取消会把上游连接读断掉），只能对队列读取做超时，取消队列读取
+    不影响上游。客户端断开时 finally 取消 pump，连带触发内部 gen 的
+    CancelledError 分支（断开补记逻辑照常工作）。
+    """
+    queue: asyncio.Queue = asyncio.Queue()
+
+    async def pump():
+        try:
+            async for chunk in gen:
+                await queue.put(("chunk", chunk))
+        except (asyncio.CancelledError, GeneratorExit):
+            # pump 自身被取消（客户端断开触发 finally 的 task.cancel()）：
+            # 内部 gen 的 CancelledError 分支已在之前的迭代点执行过补记，
+            # 这里按"流结束"收场——不能把外部的 CancelledError 实例重新
+            # raise 到消费方（Python 3.14 会把它当作对消费任务的取消请求）
+            pass
+        except BaseException as e:  # noqa: BLE001
+            await queue.put(("error", e))
+        await queue.put(("done", None))
+
+    task = asyncio.create_task(pump())
+    try:
+        while True:
+            try:
+                kind, payload = await asyncio.wait_for(queue.get(), timeout=interval)
+            except asyncio.TimeoutError:
+                yield b": keepalive\n\n"
+                continue
+            if kind == "chunk":
+                yield payload
+            elif kind == "error":
+                raise payload
+            else:
+                return
+    finally:
+        task.cancel()
+
+
+_CJK_RE = re.compile(r"[\u4e00-\u9fff\u3000-\u303f\uff00-\uffef]")
+
+
+def _estimate_tokens(text: str, n_msg: int) -> int:
+    """本地粗估输入 token：CJK 约 1.5 字符/token，其它 4 字符/token，另加每条消息结构开销。
+
+    刻意不调用上游（Claude Code 发正式请求前的预检，打上游又慢又耗配额）；
+    英文经验公式 /4 对中文严重低估（实际约 1.5 字符/token），分段加权。
+    """
+    if not text:
+        return 4
+    cjk = len(_CJK_RE.findall(text))
+    other = len(text) - cjk
+    return max(1, int(cjk / 1.5) + int(other / 4) + n_msg * 4 + 4)
+
+
+def _parse_model_aliases(raw: str) -> dict[str, str]:
+    """解析设置里的模型别名映射（每行一条：别名=真实模型），非法行忽略。"""
+    out: dict[str, str] = {}
+    for line in str(raw or "").splitlines():
+        line = line.strip()
+        if not line or "=" not in line:
+            continue
+        alias, _, real = line.partition("=")
+        alias, real = alias.strip(), real.strip()
+        if alias and real:
+            out[alias] = real
+    return out
 
 
 def _safe_err(raw: bytes, status: int) -> dict:

@@ -55,6 +55,13 @@ const aaKeyMasked = ref('')
 const aaEnabled = ref(false)
 const aaClear = ref(false)
 const keepaliveEnabled = ref(true)
+// 积分预警
+const alertEnabled = ref(false)
+const alertWebhookUrl = ref('')
+const alertThreshold = ref(10)
+const alertExpiryDays = ref(3)
+// 模型别名映射（textarea 原文）
+const modelAliases = ref('')
 
 const anyUnchecked = computed(() => accounts.value.some((a) => !a.checkin_today))
 
@@ -141,6 +148,13 @@ function startPolling(state: string) {
   pollTimer = setInterval(async () => {
     try {
       const res = await api.oauthStatus(state)
+      if (res.status === 'expired') {
+        // state 失效（超时/已在别处完成登录）：停止轮询，明确告知而不是永远转圈
+        stopPolling()
+        qrOpen.value = false
+        message.warning('二维码已过期，请重新点击「扫码登录」获取')
+        return
+      }
       if (res.status === 'ready') {
         stopPolling()
         qrOpen.value = false
@@ -195,6 +209,11 @@ async function openSettings() {
     aaEnabled.value = !!res.aa_enabled
     aaKey.value = ''
     keepaliveEnabled.value = res.keepalive_enabled !== '0'
+    alertEnabled.value = res.alert_enabled === '1'
+    alertWebhookUrl.value = res.alert_webhook_url || ''
+    alertThreshold.value = parseInt(res.alert_threshold_percent as any, 10) || 10
+    alertExpiryDays.value = parseInt(res.alert_expiry_days as any, 10) || 3
+    modelAliases.value = res.model_aliases || ''
   } catch { /* 拦截器已提示 */ }
 }
 
@@ -214,6 +233,11 @@ async function saveSettings() {
     aa_refresh_hour: String(aaRefreshHour.value),
     keepalive_hour: String(keepaliveHour.value),
     keepalive_enabled: keepaliveEnabled.value ? '1' : '0',
+    alert_enabled: alertEnabled.value ? '1' : '0',
+    alert_webhook_url: alertWebhookUrl.value.trim(),
+    alert_threshold_percent: String(alertThreshold.value),
+    alert_expiry_days: String(alertExpiryDays.value),
+    model_aliases: modelAliases.value,
   }
   if (aaKey.value) {
     payload.aa_api_key = aaKey.value.trim()
@@ -364,6 +388,14 @@ onUnmounted(() => {
                 <a-tag color="orange">{{ statusOf(record).label }}</a-tag>
               </a-tooltip>
               <span style="font-size: 12px; color: #d97706">{{ statusOf(record).countdown }}后恢复</span>
+            </template>
+            <template v-else-if="!record.enabled">
+              <a-tooltip :title="record.disabled_reason || '已禁用'">
+                <a-tag color="default">已禁用</a-tag>
+              </a-tooltip>
+              <div v-if="record.disabled_reason" style="font-size: 11px; color: #8a94a6; line-height: 1.3; margin-top: 2px">
+                {{ record.disabled_reason }}
+              </div>
             </template>
             <a-tag v-else :color="statusOf(record).color">{{ statusOf(record).label }}</a-tag>
           </template>
@@ -536,6 +568,37 @@ onUnmounted(() => {
           <a-input-number v-model:value="keepaliveHour" :min="0" :max="23" style="width: 100%" :disabled="!keepaliveEnabled" />
           <div style="color: #999; font-size: 12px; margin-top: 4px">
             每天该小时自动刷新账号 token；连续多次失败（session 失效）的账号才会被自动停用
+          </div>
+        </a-form-item>
+        <a-form-item label="积分预警 webhook 推送">
+          <a-space direction="vertical" style="width: 100%">
+            <a-switch v-model:checked="alertEnabled" checked-children="开启" un-checked-children="关闭" />
+            <a-input
+              v-model:value="alertWebhookUrl"
+              placeholder="Bark / 企业微信 / 飞书 webhook 地址（自动识别）"
+              :disabled="!alertEnabled"
+            />
+            <a-space>
+              <span style="font-size: 12px; color: #999">余额低于</span>
+              <a-input-number v-model:value="alertThreshold" :min="1" :max="90" :disabled="!alertEnabled" style="width: 90px" />
+              <span style="font-size: 12px; color: #999">% 或积分</span>
+              <a-input-number v-model:value="alertExpiryDays" :min="1" :max="90" :disabled="!alertEnabled" style="width: 90px" />
+              <span style="font-size: 12px; color: #999">天内到期时推送</span>
+            </a-space>
+            <div style="color: #999; font-size: 12px">
+              每 30 分钟随额度刷新检查一次，同一警报 6 小时内只推送一次。Bark 直接粘贴完整地址（含 device key）。
+            </div>
+          </a-space>
+        </a-form-item>
+        <a-form-item label="模型别名映射（可选，每行一条：别名=真实模型）">
+          <a-textarea
+            v-model:value="modelAliases"
+            :rows="3"
+            :placeholder="`gpt-4o=deepseek-v4-pro
+claude-sonnet=glm-5.3`"
+          />
+          <div style="color: #999; font-size: 12px; margin-top: 4px">
+            让硬编码熟名字的客户端开箱即用：别名会出现在 /v1/models 列表中，请求别名即路由到真实模型（自动套用其思考/上限配置）。
           </div>
         </a-form-item>
         <a-form-item label="Artificial Analysis API Key（可选）">

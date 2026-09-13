@@ -61,9 +61,11 @@ async function onCreate() {
 }
 
 async function onToggle(a: AppInfo) {
-  await api.toggleApp(a.id)
-  message.success(a.enabled ? '已停用该应用' : '已启用该应用')
-  await load()
+  try {
+    await api.toggleApp(a.id)
+    message.success(a.enabled ? '已停用该应用' : '已启用该应用')
+    await load()
+  } catch { /* 拦截器已提示 */ }
 }
 
 // 查看明文 Key
@@ -92,9 +94,11 @@ async function onViewKey(a: AppInfo) {
 }
 
 async function onDelete(a: AppInfo) {
-  await api.deleteApp(a.id)
-  message.success('已删除应用')
-  await load()
+  try {
+    await api.deleteApp(a.id)
+    message.success('已删除应用')
+    await load()
+  } catch { /* 拦截器已提示 */ }
 }
 
 function copyText(text: string, label = 'API Key') {

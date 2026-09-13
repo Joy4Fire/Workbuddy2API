@@ -4,7 +4,8 @@
 > 用途：交给修复模型逐项执行。**每项独立可做，按优先级排序；做完一项跑一次测试。**
 > 原则：保持现有中文注释风格；不引入新依赖；不改动本清单未提及的行为。
 >
-> **状态（2026-09-12）：P0 全部完成、P1 全部完成、P2 全部完成（42 测试全绿 + 端到端冒烟通过 + 前端已重新构建）；P3 未动，仍可选。**
+> **状态（2026-09-13）：P0–P2 全部完成；P3 完成 #20/21/22/23/25/26/27/28（#24 部分完成：补 deepseek-v4.1-flash 档位；#29 跳过：应用下拉已分组，模型下拉属历史筛选低价值）。56+ 测试全绿，前后端已重新构建。**
+> **新增功能批次（2026-09-13，非 review 项）**：积分预警 webhook（Bark/企微/飞书自动识别 + 6h 去重 + 概览横幅）、账号禁用原因（schema v4 disabled_reason）、使用记录内容搜索、流式心跳（`: keepalive`，pump+队列实现防客户端超时）、每周自动全量备份（≥7 天触发，保留 4 份）、签到失败重试（2h×3 次）、模型别名映射（settings.model_aliases，/v1/models 别名条目 + 请求归一）。
 > 实现与方案的偏差已标注在对应条目内。
 
 ---
@@ -333,15 +334,15 @@
 
 | # | 问题 | 位置 | 方案 |
 |---|------|------|------|
-| 20 | **count_tokens 对中文严重低估**。注意：该端点是 Claude Code **发请求前**的预检估算（此时上游还没返回任何东西，不存在"用 WorkBuddy 返回的 token 数"的可能；真实请求的 token 已取自上游 usage 并记录在 usage_logs）。唯一改进方向是调准本地估算公式 | `app.py` `count_tokens`（line ~437-471）`est = text_len / 4 + n_msg*4 + 4` 是英文经验值 | 检测文本含 CJK 字符时按 ~1.5 字符/token 估算（CJK 判定：`\u4e00-\u9fff\u3000-\u303f\uff00-\uffef`），其余仍按 /4；两段加权求和。**不要**在 count_tokens 里调用上游 |
-| 21 | Dockerfile COPY 了 `uv.lock` 却用裸 `pip install` 约束，锁文件形同虚设 | `Dockerfile` line 21-30 | 二选一：`RUN pip install --no-cache-dir .`（用 pyproject）并删掉 COPY uv.lock；或构建期用 `uv export --frozen -o requirements.txt` 后 `pip install -r`。当前状态至少删掉误导性的 COPY |
-| 22 | compose 无 healthcheck，容器半死状态 restart 感知不到 | `docker-compose.yml` | service 下加：`healthcheck: test: ["CMD","python","-c","import urllib.request;urllib.request.urlopen('http://localhost:8787/health')"], interval: 30s, timeout: 5s, retries: 3` |
-| 23 | `config.api_key`/`API_KEY` 是死配置（鉴权早已走 apps 表），`__main__.py` 还打印它误导用户 | `config.py` line 54、`__main__.py` line 32-33 | 删除字段与打印，改为提示「API Key 请在 WebUI 应用页创建」 |
+| 20 ✅ | **count_tokens 对中文严重低估**。注意：该端点是 Claude Code **发请求前**的预检估算（此时上游还没返回任何东西，不存在"用 WorkBuddy 返回的 token 数"的可能；真实请求的 token 已取自上游 usage 并记录在 usage_logs）。唯一改进方向是调准本地估算公式 | `app.py` `count_tokens`（line ~437-471）`est = text_len / 4 + n_msg*4 + 4` 是英文经验值 | 检测文本含 CJK 字符时按 ~1.5 字符/token 估算（CJK 判定：`\u4e00-\u9fff\u3000-\u303f\uff00-\uffef`），其余仍按 /4；两段加权求和。**不要**在 count_tokens 里调用上游 |
+| 21 ✅ | Dockerfile COPY 了 `uv.lock` 却用裸 `pip install` 约束，锁文件形同虚设 | `Dockerfile` line 21-30 | 二选一：`RUN pip install --no-cache-dir .`（用 pyproject）并删掉 COPY uv.lock；或构建期用 `uv export --frozen -o requirements.txt` 后 `pip install -r`。当前状态至少删掉误导性的 COPY |
+| 22 ✅ | compose 无 healthcheck，容器半死状态 restart 感知不到 | `docker-compose.yml` | service 下加：`healthcheck: test: ["CMD","python","-c","import urllib.request;urllib.request.urlopen('http://localhost:8787/health')"], interval: 30s, timeout: 5s, retries: 3` |
+| 23 ✅ | `config.api_key`/`API_KEY` 是死配置（鉴权早已走 apps 表），`__main__.py` 还打印它误导用户 | `config.py` line 54、`__main__.py` line 32-33 | 删除字段与打印，改为提示「API Key 请在 WebUI 应用页创建」 |
 | 24 | `reasoning.KNOWN_EFFORTS` 静态表过时（缺 glm-5.3/kimi-k3/deepseek-v4.1/hy3 等；仅作模型缓存冷启动时的兜底） | `reasoning.py` line 17-28 | 同步上游当前模型档位；或兜底策略改为"未知模型统一降级 medium" |
-| 25 | Anthropic `max_tokens` 不按模型实际上限裁剪（Claude Code 常发 32000+，部分模型上限 32K/48K） | `anthropic.py` line 61-63 | 从模型目录查 `max_output_tokens`，`chat["max_tokens"] = min(请求值, 上限)`（目录查不到则不裁） |
-| 26 | `Apps.vue` `onToggle/onDelete` 无 try/catch，失败时 unhandled rejection 且按钮无反馈 | `Apps.vue` line 63-67、94-98 | 与其它页面一致包 `try { ... } catch {}`（拦截器已提示） |
-| 27 | 任意未知路径（含 `/foo.js` 这类明显是静态资源的）都 200 返回 index.html | `app.py` `web_assets`（line ~1204-1206 SPA fallback） | 仅当路径不含 `.`（无扩展名）时走 SPA fallback；带扩展名的未知文件返回真 404 |
-| 28 | `oauth_poll` 对 state 失效等不可恢复错误也返回 pending，前端永远转圈 | `oauth.py` `oauth_poll`（line ~156-191） | 借用 `oauth_login` 里已有的判定（`"HTTP 4" in str(e)` 等）：识别后返回 `{"status":"expired"}`；前端 `Accounts.vue` 轮询处加 expired 分支提示「二维码已过期，请重新获取」 |
+| 25 ✅ | Anthropic `max_tokens` 不按模型实际上限裁剪（Claude Code 常发 32000+，部分模型上限 32K/48K） | `anthropic.py` line 61-63 | 从模型目录查 `max_output_tokens`，`chat["max_tokens"] = min(请求值, 上限)`（目录查不到则不裁） |
+| 26 ✅ | `Apps.vue` `onToggle/onDelete` 无 try/catch，失败时 unhandled rejection 且按钮无反馈 | `Apps.vue` line 63-67、94-98 | 与其它页面一致包 `try { ... } catch {}`（拦截器已提示） |
+| 27 ✅ | 任意未知路径（含 `/foo.js` 这类明显是静态资源的）都 200 返回 index.html | `app.py` `web_assets`（line ~1204-1206 SPA fallback） | 仅当路径不含 `.`（无扩展名）时走 SPA fallback；带扩展名的未知文件返回真 404 |
+| 28 ✅ | `oauth_poll` 对 state 失效等不可恢复错误也返回 pending，前端永远转圈 | `oauth.py` `oauth_poll`（line ~156-191） | 借用 `oauth_login` 里已有的判定（`"HTTP 4" in str(e)` 等）：识别后返回 `{"status":"expired"}`；前端 `Accounts.vue` 轮询处加 expired 分支提示「二维码已过期，请重新获取」 |
 | 29 | 使用记录筛选下拉的模型列表含全部历史退役模型 | `db.py` `usage_filters` | 可接受（本就是历史筛选）；可选优化：下拉分组「最近 7 天 / 更早」 |
 
 ---

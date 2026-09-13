@@ -29,8 +29,7 @@ def main():
     print(f"WorkBuddy One 启动: http://{args.host}:{args.port}")
     print(f"  数据库: {config.db_path}")
     print("  模式: 单用户一体化（管理端点无需 Admin Token）")
-    if config.api_key:
-        print(f"  API Key: {config.api_key}")
+    print("  API Key: 请在 WebUI「应用」页创建（每个应用独立 Key，便于用量归因）")
     uvicorn.run(app, host=args.host, port=args.port)
 
 

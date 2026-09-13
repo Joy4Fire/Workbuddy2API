@@ -17,7 +17,7 @@ logger = logging.getLogger("workbuddy_one.db")
 
 # 当前数据库 schema 版本（用 SQLite PRAGMA user_version 持久化）。
 # 每次对表结构做不兼容/增量修改时 +1，并在 _migrate 里追加对应迁移步骤。
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
 
 
 def _local_midnight_ts() -> int:
@@ -70,11 +70,7 @@ class Database:
             backup_dir.mkdir(parents=True, exist_ok=True)
             name = f"{self.path.stem}.pre-migrate-v{ver}-to-v{SCHEMA_VERSION}.{int(time.time())}.bak"
             dst_path = backup_dir / name
-            dst = sqlite3.connect(str(dst_path))
-            try:
-                self._conn.backup(dst)
-            finally:
-                dst.close()
+            self.backup_to(str(dst_path))
             # 只保留最近 BACKUP_KEEP 份，清理更旧的
             backups = sorted(backup_dir.glob(f"{self.path.stem}.pre-migrate-*.bak"))
             for old in backups[: -self.BACKUP_KEEP]:
@@ -102,6 +98,7 @@ class Database:
                     domain TEXT,
                     auth_json TEXT,            -- 完整 auth 内容
                     enabled INTEGER DEFAULT 1,
+                    disabled_reason TEXT DEFAULT '',  -- 禁用原因（手动停用/保活失败）
                     priority INTEGER DEFAULT 0,
                     credits_remaining REAL,
                     credits_total REAL,
@@ -161,6 +158,7 @@ class Database:
             ("id", "INTEGER PRIMARY KEY AUTOINCREMENT"), ("uid", "TEXT"),
             ("nickname", "TEXT"), ("enterprise_id", "TEXT"), ("domain", "TEXT"),
             ("auth_json", "TEXT"), ("enabled", "INTEGER DEFAULT 1"),
+            ("disabled_reason", "TEXT DEFAULT ''"),
             ("priority", "INTEGER DEFAULT 0"), ("credits_remaining", "REAL"),
             ("credits_total", "REAL"), ("credits_expire_at", "TEXT"),
             ("last_used_at", "REAL"), ("last_checkin_date", "TEXT"),
@@ -208,12 +206,17 @@ class Database:
         """v3：apps 补 key_enc（加密明文 Key，配套应用鉴权改造）。"""
         self._add_column("apps", "key_enc", "TEXT")
 
+    def _migration_v4(self):
+        """v4：accounts 补 disabled_reason（禁用原因，供 WebUI 展示"为什么不可用"）。"""
+        self._add_column("accounts", "disabled_reason", "TEXT DEFAULT ''")
+
     # 迁移注册表：每个条目 = (目标版本号, 迁移函数)。按版本号升序。
     # 后续新增结构 → 在此追加新条目，并在 SCHEMA_VERSION 处 +1。
     _MIGRATIONS = [
         (1, _migration_v1),
         (2, _migration_v2),
         (3, _migration_v3),
+        (4, _migration_v4),
     ]
 
     def _user_version(self) -> int:
@@ -392,7 +395,7 @@ class Database:
         return cur.rowcount > 0
 
     def set_account_state(self, uid: str, **fields):
-        allowed = {"enabled", "priority", "credits_remaining", "credits_total",
+        allowed = {"enabled", "disabled_reason", "priority", "credits_remaining", "credits_total",
                    "credits_expire_at", "last_used_at", "failure_count", "cooldown_until"}
         sets = []
         vals = []
@@ -432,6 +435,11 @@ class Database:
         "aa_refresh_hour": "7",        # 每日自动刷新 AA 评测数据的小时（0-23）
         "keepalive_hour": "22",        # 每日 token 保活小时（0-23）
         "aa_api_key": "",              # Artificial Analysis API key（评测数据，空则不启用）
+        "alert_enabled": "0",          # 积分预警开关（webhook 推送）
+        "alert_webhook_url": "",       # 预警 webhook 地址（Bark/企微/飞书自动识别）
+        "alert_threshold_percent": "10",  # 余额占比低于该值触发预警
+        "alert_expiry_days": "3",      # 积分 N 天内到期触发预警
+        "model_aliases": "",           # 模型别名映射，每行一条：别名=真实模型
     }
 
     def get_settings(self) -> dict:
@@ -474,6 +482,18 @@ class Database:
                  float(credits or 0), app_name or ""),
             )
             self._conn.commit()
+
+    def backup_to(self, dest_path: str):
+        """把当前数据库完整快照到目标路径（含 WAL 中未 checkpoint 的事务）。
+
+        用 sqlite backup API 而非文件拷贝，保证备份文件一致性。
+        供迁移前备份与每周定时备份复用。
+        """
+        dst = sqlite3.connect(dest_path)
+        try:
+            self._conn.backup(dst)
+        finally:
+            dst.close()
 
     def cleanup_usage(self, retention_days: int, vacuum: bool = False):
         """删除超过保留期的使用记录。
@@ -574,7 +594,8 @@ class Database:
     )
 
     def _usage_where(self, protocol: str | None, model: str | None,
-                     app_name: str | None, status: str | None) -> tuple[str, list]:
+                     app_name: str | None, status: str | None,
+                     search: str | None = None) -> tuple[str, list]:
         """usage_logs 查询的公共 WHERE 子句（usage_recent / usage_count 共用）。"""
         clauses: list[str] = []
         params: list = []
@@ -591,20 +612,28 @@ class Database:
         if status:
             clauses.append("status = ?")
             params.append(status)
+        if search:
+            # 内容关键字搜索：LIKE 转义 %/_，命中任一 content 字段即可
+            like = "%" + search.replace("\\", "\\\\").replace("%", r"\%").replace("_", r"\_%") + "%"
+            clauses.append("(input_content LIKE ? ESCAPE '\\' "
+                           "OR output_content LIKE ? ESCAPE '\\' "
+                           "OR reasoning_content LIKE ? ESCAPE '\\')")
+            params.extend([like, like, like])
         where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
         return where, params
 
     def usage_recent(self, limit: int = 50, protocol: str | None = None,
                      model: str | None = None, app_name: str | None = None,
                      status: str | None = None, light: bool = False,
-                     offset: int = 0) -> list[dict]:
+                     offset: int = 0, search: str | None = None) -> list[dict]:
         """最近使用记录，支持按协议/模型/应用/状态筛选（空值表示该维度不筛选）。
 
         light=True 时只返回元数据列（不含 input/output/reasoning 大文本），
         用于概览页等高频轮询场景，避免每次把 base64 图片等超大 content 全部拉出来。
         offset 用于服务端分页（配合 usage_count 的总数）。
+        search 为内容关键字搜索（对大文本 LIKE，即使 light 投影不选 content 列也能过滤）。
         """
-        where, params = self._usage_where(protocol, model, app_name, status)
+        where, params = self._usage_where(protocol, model, app_name, status, search)
         params.extend([limit, offset])
         cols = self._USAGE_COLS if light else "*"
         with self._lock:
@@ -614,9 +643,10 @@ class Database:
         return [dict(r) for r in rows]
 
     def usage_count(self, protocol: str | None = None, model: str | None = None,
-                    app_name: str | None = None, status: str | None = None) -> int:
+                    app_name: str | None = None, status: str | None = None,
+                    search: str | None = None) -> int:
         """符合筛选条件的使用记录总数（服务端分页用，返回总页数依据）。"""
-        where, params = self._usage_where(protocol, model, app_name, status)
+        where, params = self._usage_where(protocol, model, app_name, status, search)
         with self._lock:
             row = self._conn.execute(f"SELECT COUNT(*) c FROM usage_logs {where}", params).fetchone()
         return row["c"]

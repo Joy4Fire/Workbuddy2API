@@ -20,8 +20,9 @@ const pagination = reactive({
   showTotal: (t: number) => `共 ${t} 条`,
 })
 
-// 筛选项（协议 / 模型 / 应用 / 状态）
-const filters = ref<{ protocol?: string; model?: string; app_name?: string; status?: string }>({})
+// 筛选项（协议 / 模型 / 应用 / 状态 / 内容关键字）
+const filters = ref<{ protocol?: string; model?: string; app_name?: string; status?: string; search?: string }>({})
+const searchText = ref('')
 const filterOptions = ref<{
   protocols: string[]
   models: string[]
@@ -59,6 +60,13 @@ function onTableChange(p: { current?: number; pageSize?: number }) {
   load()
 }
 
+function onSearch() {
+  // 内容关键字：去空格后为空视同清除
+  filters.value.search = searchText.value.trim() || undefined
+  pagination.current = 1
+  load()
+}
+
 async function loadFilters() {
   filterOptions.value = await api.usageFilters()
 }
@@ -71,6 +79,7 @@ function onFilterChange() {
 
 function clearFilters() {
   filters.value = {}
+  searchText.value = ''
   pagination.current = 1
   load()
 }
@@ -193,6 +202,13 @@ onMounted(async () => {
       <a-select v-model:value="filters.status" placeholder="全部状态" allow-clear style="width: 120px" @change="onFilterChange">
         <a-select-option v-for="s in filterOptions.statuses" :key="s" :value="s">{{ s === 'ok' ? '成功' : s }}</a-select-option>
       </a-select>
+      <a-input-search
+        v-model:value="searchText"
+        placeholder="搜索内容（输入/输出/思考链）"
+        allow-clear
+        style="width: 220px"
+        @search="onSearch"
+      />
       <a-button v-if="hasFilter()" size="small" @click="clearFilters">清除筛选</a-button>
       <span style="flex: 1"></span>
       <a-button @click="load"><ReloadOutlined />刷新</a-button>

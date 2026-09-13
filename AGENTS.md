@@ -174,4 +174,5 @@ docker compose up -d --build --force-recreate
 - 版本 0.4.1；56 个测试全绿；本地 8787 端口跑 uvicorn（Docker 部署需用户重建镜像）。
 - `CODE_REVIEW_TODO.md` 的 P0×4 / P1×4 / P2×11 已全部修复完成（每条带实现备注）；P3×10 打磨项仍开放，可做可跳过。后续问题登记在它后面，按优先级做。
 - 已吸收参考项目更新：developer 角色归一（防上游 11128）、DeepSeek thinking 注入与多轮 reasoning_content 回填、deepseek-v4.1-flash 档位（均见 `reasoning.py`）。
+- 已上线新功能批次：积分预警 webhook（settings: alert_*）、账号 disabled_reason、记录内容搜索（usage_recent search）、流式心跳（`_with_keepalive`）、每周备份、签到失败重试、模型别名（settings: model_aliases）。
 - 上游模型 15 个（动态拉取），AA 评测 11 个有数据；账号 1 个（支持多账号，见 `pool.py`）。

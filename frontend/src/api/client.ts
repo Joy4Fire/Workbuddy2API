@@ -96,13 +96,18 @@ export const api = {
       `/admin/usage/timeseries?granularity=${granularity}&points=${points}${model ? `&model=${encodeURIComponent(model)}` : ''}`,
     ),
   // 服务端分页：page/page_size + 筛选条件，返回 records + total（总数驱动分页器）
-  usageRecent: (page = 1, pageSize = 20, filters: { protocol?: string; model?: string; app_name?: string; status?: string } = {}) => {
+  usageRecent: (
+    page = 1,
+    pageSize = 20,
+    filters: { protocol?: string; model?: string; app_name?: string; status?: string; search?: string } = {},
+  ) => {
     const p = new URLSearchParams({ page: String(page), page_size: String(pageSize), light: '1' })
     if (filters.protocol) p.set('protocol', filters.protocol)
     if (filters.model) p.set('model', filters.model)
     // app_name 允许空字符串（筛"未记录应用"的旧记录），用 != null 判断而非真值
     if (filters.app_name != null) p.set('app_name', filters.app_name)
     if (filters.status) p.set('status', filters.status)
+    if (filters.search) p.set('search', filters.search)
     return http.get<unknown, RecordsResponse>(`/admin/usage/recent?${p.toString()}`)
   },
   // 单条记录详情（含完整输入/输出/COT）：列表走 light 投影，点开详情才按需取大文本
@@ -140,7 +145,7 @@ export const api = {
   // 扫码登录
   oauthStart: () => http.post<unknown, { ok: boolean; state: string; authUrl: string }>('/admin/oauth/start'),
   oauthStatus: (state: string) =>
-    http.get<unknown, { status: 'pending' | 'ready'; account?: AccountInfo }>(
+    http.get<unknown, { status: 'pending' | 'ready' | 'expired'; account?: AccountInfo }>(
       `/admin/oauth/status?state=${encodeURIComponent(state)}`,
     ),
 

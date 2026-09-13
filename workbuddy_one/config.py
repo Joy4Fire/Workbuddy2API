@@ -51,7 +51,6 @@ def _parse_int_list(s: str) -> tuple[int, ...]:
 class Config:
     host: str = field(default_factory=lambda: _get("HOST", "127.0.0.1"))
     port: int = field(default_factory=lambda: int(_get("PORT", "8787")))
-    api_key: str = field(default_factory=lambda: _get("API_KEY", ""))
     admin_token: str = field(default_factory=lambda: _get("ADMIN_TOKEN", ""))
     auth_dir: str = field(default_factory=lambda: _get("AUTH_DIR", ""))
     db_path: str = field(default_factory=lambda: _resolve_db_path(_get("DB_PATH", "data/workbuddy.db")))

@@ -17,10 +17,10 @@ RUN apt-get update \
     && apt-get install -y --no-install-recommends tzdata \
     && rm -rf /var/lib/apt/lists/*
 
-# 先拷贝依赖清单以利用构建缓存
-COPY pyproject.toml uv.lock ./
+# 拷贝依赖清单（uv.lock 仅供 uv 使用，pip 安装不读它，不入构建上下文）
+COPY pyproject.toml ./
 
-# 安装运行时依赖（pip 安装，保持与 pyproject 一致）
+# 安装运行时依赖（pip 安装，版本约束与 pyproject 一致）
 RUN pip install --no-cache-dir \
         "fastapi>=0.110" \
         "uvicorn[standard]>=0.29" \

@@ -11,6 +11,8 @@ import time
 from datetime import datetime
 from pathlib import Path
 
+import httpx
+
 from . import billing
 from .pool import AccountPool
 
@@ -78,6 +80,13 @@ class Scheduler:
         self._keepalive_fails: dict[str, int] = {}
         # 保活连续失败阈值：达到才视为 session 失效并禁用账号
         self._keepalive_fail_threshold = 3
+        # 签到失败重试：失败后间隔 2 小时重试，最多 3 次，避免当天积分白丢
+        self._checkin_fail_count = 0
+        self._checkin_retry_at = 0.0
+        # 每周全量备份的节奏（上次备份时间；重启后从磁盘最近一份周备份恢复节奏）
+        self._last_backup_dt: datetime | None = None
+        # 积分预警去重：同一警报 6 小时内只推送一次
+        self._last_alert_at = 0.0
 
     async def start(self):
         self._running = True
@@ -189,7 +198,8 @@ class Scheduler:
             except Exception as e:  # noqa: BLE001
                 logger.warning("签到失败 %s: %s", acc.uid, e)
                 results.append((acc.uid, {"ok": False, "message": str(e)}))
-        self._last_checkin_date = today
+        # 注意：不再在这里置位 _last_checkin_date——由 _run 根据结果决定
+        # （全部成功/已签到才置位，存在失败则按重试策略补签），手动签到不受影响
         # 签到后刷新额度（含自动解冻）
         await self.refresh_credits()
         return results
@@ -216,10 +226,11 @@ class Scheduler:
                 self._keepalive_fails[acc.uid] = fails
                 if fails >= self._keepalive_fail_threshold:
                     logger.error("token 保活 %s: 连续 %d 次失败（session 可能失效），自动禁用", acc.uid, fails)
-                    self.pool.set_enabled(acc.uid, False)
+                    self.pool.set_enabled(acc.uid, False, reason="保活连续失败（session 可能失效），请重新扫码登录")
                     # 同步落库：否则重启后账号"复活"，坏 session 继续打上游
                     if self.db:
-                        self.db.set_account_state(acc.uid, enabled=0)
+                        self.db.set_account_state(acc.uid, enabled=0,
+                                                  disabled_reason="保活连续失败（session 可能失效），请重新扫码登录")
                     self._keepalive_fails[acc.uid] = 0  # 禁用后重置，等待用户重新登录
                 else:
                     logger.warning("token 保活 %s: 失败 %d/%d 次（暂不禁用）", acc.uid, fails,
@@ -270,6 +281,97 @@ class Scheduler:
             logger.warning("附件清理异常: %s", e)
         return changed
 
+    def _backup_dir(self) -> Path:
+        return self.db.path.parent / "backups"
+
+    def _weekly_backup(self):
+        """执行一次每周全量备份（backup API 快照），保留最近 4 份。"""
+        bdir = self._backup_dir()
+        bdir.mkdir(parents=True, exist_ok=True)
+        name = f"workbuddy.db.weekly.{datetime.now().strftime('%Y%m%d_%H%M%S')}.bak"
+        self.db.backup_to(str(bdir / name))
+        backups = sorted(bdir.glob("workbuddy.db.weekly.*.bak"))
+        for old in backups[:-4]:
+            try:
+                old.unlink()
+            except OSError:
+                pass
+        self._last_backup_dt = datetime.now()
+        logger.info("每周备份完成: %s", name)
+
+    def _backup_due(self, now: datetime) -> bool:
+        """距上次全量备份 ≥7 天则到期。重启后从磁盘最近一份周备份恢复节奏。"""
+        if not self.db:
+            return False
+        if self._last_backup_dt is None:
+            bdir = self._backup_dir()
+            weekly = sorted(bdir.glob("workbuddy.db.weekly.*.bak")) if bdir.is_dir() else []
+            if weekly:
+                self._last_backup_dt = datetime.fromtimestamp(weekly[-1].stat().st_mtime)
+        if self._last_backup_dt is None:
+            return True
+        return (now - self._last_backup_dt).total_seconds() >= 7 * 86400
+
+    async def _check_credit_alert(self):
+        """积分预警：余额占比低于阈值或积分即将到期时推送 webhook。
+
+        6 小时内不重复推送（警报持续时每 6 小时提醒一次，解除后重置）。
+        """
+        if self._setting("alert_enabled", "0") != "1":
+            return
+        url = self._setting("alert_webhook_url", "").strip()
+        if not url:
+            return
+        try:
+            threshold = float(self._setting("alert_threshold_percent", "10"))
+        except (TypeError, ValueError):
+            threshold = 10.0
+        try:
+            expiry_days = float(self._setting("alert_expiry_days", "3"))
+        except (TypeError, ValueError):
+            expiry_days = 3.0
+        accounts = self.pool.all_accounts()
+        remain = sum(float(a.get("credits_remaining") or 0) for a in accounts)
+        cap = sum(float(a.get("credits_total") or 0) for a in accounts)
+        messages: list[str] = []
+        now_ts = time.time()
+        if cap > 0 and remain / cap * 100 < threshold:
+            messages.append(f"积分余额 {remain:.0f}/{cap:.0f}（占 {remain / cap * 100:.0f}%），低于预警阈值 {threshold:.0f}%")
+        for a in accounts:
+            exp = a.get("credits_expire_at")
+            if exp and (a.get("credits_remaining") or 0) > 0:
+                days = (float(exp) - now_ts) / 86400
+                if 0 <= days <= expiry_days:
+                    messages.append(f"账号 {a['uid'][:8]} 的积分将在 {days:.1f} 天后到期，请及时消耗")
+        if not messages:
+            self._last_alert_at = 0.0  # 警报解除，重置去重窗口
+            return
+        if now_ts - self._last_alert_at < 6 * 3600:
+            return
+        ok = await self._send_webhook(url, "Workbuddy2API 积分预警", "\n".join(messages))
+        if ok:
+            self._last_alert_at = now_ts
+            logger.info("积分预警已推送: %s", "；".join(messages))
+
+    async def _send_webhook(self, url: str, title: str, body: str) -> bool:
+        """按 URL 自动识别 webhook 平台（企微/飞书/Bark/通用 JSON）。失败只记日志。"""
+        try:
+            if "qyapi.weixin.qq.com" in url:
+                payload = {"msgtype": "text", "text": {"content": f"{title}\n{body}"}}
+            elif "open.feishu.cn" in url:
+                payload = {"msg_type": "text", "content": {"text": f"{title}\n{body}"}}
+            else:  # Bark 与通用 JSON webhook 均接受 {"title","body"}
+                payload = {"title": title, "body": body}
+            async with httpx.AsyncClient(timeout=10, trust_env=False) as client:
+                resp = await client.post(url, json=payload)
+            if resp.status_code >= 400:
+                logger.warning("webhook 推送失败 HTTP %d: %s", resp.status_code, resp.text[:200])
+                return False
+            return True
+        except Exception as e:  # noqa: BLE001
+            logger.warning("webhook 推送异常: %s", e)
+            return False
+
     async def _run(self):
         last_credit = 0.0
         while self._running:
@@ -278,13 +380,40 @@ class Scheduler:
             hours = self._checkin_hours()
             # 每日签到：追赶语义——只要已过当天最早的签到点且今天未签就执行，
             # 服务在签到窗口之后才启动（本机开发常态）也能补上当天签到；
-            # do_checkin 内部按 DB 记录跳过已签账号，且 _last_checkin_date 无条件置位，
-            # 不会每分钟重复请求上游
-            if now.hour >= min(hours) and self._last_checkin_date != today:
+            # do_checkin 内部按 DB 记录跳过已签账号。
+            # 失败重试：存在失败时每 2 小时补签一次，最多 3 次，避免当天积分白丢
+            if now.hour >= min(hours) and self._last_checkin_date != today and now.timestamp() >= self._checkin_retry_at:
+                failed: list[str] = []
                 try:
-                    await self.do_checkin()
+                    results = await self.do_checkin()
+                    failed = [uid for uid, r in results if not r.get("ok") and not r.get("already")]
                 except Exception as e:  # noqa: BLE001
                     logger.warning("签到任务异常: %s", e)
+                    failed = ["exception"]
+                if failed:
+                    self._checkin_fail_count += 1
+                    if self._checkin_fail_count >= 3:
+                        logger.warning("签到连续失败 %d 次（%s），今天不再重试",
+                                       self._checkin_fail_count, "、".join(failed))
+                        self._last_checkin_date = today  # 放弃今天，明天重来
+                    else:
+                        self._checkin_retry_at = now.timestamp() + 7200
+                        logger.warning("签到有失败（%s），%.1f 小时后重试（第 %d/3 次）",
+                                       "、".join(failed), 2.0, self._checkin_fail_count)
+                else:
+                    self._checkin_fail_count = 0
+                    self._last_checkin_date = today
+            # 每周全量备份（每天 3 点检查，距上次 ≥7 天才执行；错过窗口会自动补上）
+            if now.hour == 3 and self._backup_due(now):
+                try:
+                    await asyncio.to_thread(self._weekly_backup)
+                except Exception as e:  # noqa: BLE001
+                    logger.warning("每周备份失败: %s", e)
+            # 积分预警检查（内部自带开关/去重，成本可忽略）
+            try:
+                await self._check_credit_alert()
+            except Exception as e:  # noqa: BLE001
+                logger.warning("积分预警检查异常: %s", e)
             # 每日 token 保活
             if now.hour == self._keepalive_hour() and self._last_keepalive_date != today:
                 try:
