@@ -1,6 +1,6 @@
 [project]
 name = "workbuddy2api"
-version = "0.4.0"
+version = "0.4.1"
 description = "WorkBuddy2API：单用户专属 WorkBuddy API 网关，OpenAI Chat + Responses + Anthropic 三协议，多账号、SQLite、Vue3 WebUI"
 readme = "README.md"
 requires-python = ">=3.11"
