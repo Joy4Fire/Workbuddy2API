@@ -15,6 +15,7 @@
 | v1 | 初始结构：`accounts` / `usage_logs` / `settings` / `apps` 基础表 |
 | v2 | `accounts` 补 `last_checkin_date`；`usage_logs` 补 `input_content` / `output_content` / `reasoning_content` / `credits` / `app_name` |
 | v3 | `apps` 补 `key_enc`（应用 Key 加密存储） |
+| v4 | `accounts` 补 `disabled_reason`（禁用原因，供 WebUI 展示"为什么不可用"） |
 
 ## 旧库自动合并
 
@@ -27,7 +28,7 @@
 
 每当你需要修改表结构（加列 / 建表 / 改类型），按以下步骤操作：
 
-1. **`SCHEMA_VERSION` +1**（例如从 3 → 4）
+1. **`SCHEMA_VERSION` +1**（例如从 4 → 5）
 2. **新增一个迁移方法**，如：
 
 ```python
@@ -56,7 +57,12 @@ _MIGRATIONS = [
 
 ## 迁移安全说明
 
+- **迁移前自动备份**：检测到旧版本库即将升级时，先把整个库快照到
+  `data/backups/workbuddy.db.pre-migrate-v旧-v新.时间戳.bak`（SQLite backup API，
+  含 WAL 未落盘事务），最多保留 5 份；升级出问题可改名回滚。
 - 迁移在启动时、同事务内执行；任一迁移失败会抛出异常阻止启动（避免半迁移状态）。
+- 索引由 `_ensure_indexes` 在迁移**补列之后**统一创建——不要把 CREATE INDEX
+  写回 `_init_schema` 的建表脚本（极老库缺列会直接打不开）。
 - 新增列用 `ALTER TABLE ... ADD COLUMN`（仅支持添加，不支持删除/改名/改类型）。
 - 若需要**删除列 / 改名 / 改类型**：SQLite 需**重建表**（建新表 → 拷数据 → 改名 → 重建索引），请在迁移方法内自行实现，并保证幂等。
 - 新库（`user_version=0`）也会走完整迁移链，但所有操作幂等，无副作用。

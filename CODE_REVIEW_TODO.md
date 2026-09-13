@@ -18,7 +18,7 @@
 | 前端构建 | `cd frontend && pnpm build`（改任何 .vue/.ts 后必须重新 build，否则 WebUI 不更新） |
 | 本地起服务 | `.venv\Scripts\python.exe -m uvicorn workbuddy_one.app:create_app --factory --host 127.0.0.1 --port 8787`（改任何 .py 后必须重启进程） |
 | Docker 重建 | `docker compose up -d --build --force-recreate`（宿主机 data/、auths/ 是挂载卷，不受影响） |
-| 数据库 | `data/workbuddy.db`，SQLite WAL 模式，schema 版本 `PRAGMA user_version` 当前为 3；改表结构需按 `db.py` 的 `_MIGRATIONS` 框架加版本号 |
+| 数据库 | `data/workbuddy.db`，SQLite WAL 模式，schema 版本 `PRAGMA user_version` 当前为 4；改表结构需按 `db.py` 的 `_MIGRATIONS` 框架加版本号 |
 | 项目结构 | `app.py`=FastAPI 主文件（约1246行）；`db.py`=SQLite 层；`pool.py`=账号池；`scheduler.py`=定时任务；`upstream.py`=上游转发；`adapters/anthropic.py`、`adapters/responses.py`=协议转换；`credentials.py`=token 管理；前端在 `frontend/src/views/` |
 
 ---
