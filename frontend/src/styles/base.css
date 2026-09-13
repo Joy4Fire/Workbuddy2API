@@ -1,0 +1,199 @@
+/* 基础布局样式：外壳 / 侧边栏 / 顶栏 / 内容区（从 App.vue 拆出，内容不变） */
+html, body { margin: 0; }
+body { background: #0d1120; }
+#app { min-height: 100vh; }
+
+/* ---------- 全局暗色滚动条 ----------
+   原生白色滚动条在深色主题里非常刺眼（内容区/表格/弹窗/下拉全受影响），
+   这里统一覆盖为半透明品牌色细条。 */
+::-webkit-scrollbar { width: 10px; height: 10px; }
+::-webkit-scrollbar-thumb {
+  background: rgba(99, 179, 237, 0.22);
+  border-radius: 6px;
+  border: 2px solid transparent;
+  background-clip: padding-box;
+}
+::-webkit-scrollbar-thumb:hover { background-color: rgba(99, 179, 237, 0.4); }
+::-webkit-scrollbar-track, ::-webkit-scrollbar-corner { background: transparent; }
+html { scrollbar-color: rgba(99, 179, 237, 0.3) transparent; scrollbar-width: thin; }
+.app-shell {
+  height: 100vh;
+  overflow: hidden;
+  background: #0d1120;
+}
+.main-col {
+  height: 100vh;
+  overflow: hidden;
+  display: flex;
+  flex-direction: column;
+}
+
+/* ---------- 侧边栏 ---------- */
+.app-sider {
+  background: linear-gradient(180deg, #161d38 0%, #0f1428 100%) !important;
+  border-right: 1px solid rgba(99, 179, 237, 0.12);
+  position: relative;
+  overflow: hidden;
+}
+.app-sider::before {
+  content: '';
+  position: absolute; top: -60px; right: -60px; width: 180px; height: 180px;
+  background: radial-gradient(circle, rgba(99,179,237,0.18), transparent 70%);
+  pointer-events: none;
+}
+.app-sider::after {
+  content: '';
+  position: absolute; bottom: 90px; left: -50px; width: 160px; height: 160px;
+  background: radial-gradient(circle, rgba(139,92,246,0.15), transparent 70%);
+  pointer-events: none;
+}
+
+.brand {
+  display: flex; align-items: center; gap: 12px;
+  padding: 22px 20px 18px;
+  border-bottom: 1px solid rgba(255,255,255,0.06);
+  position: relative; z-index: 1;
+}
+.brand-logo {
+  width: 44px; height: 44px; border-radius: 12px;
+  object-fit: cover; display: block;
+  box-shadow: 0 4px 14px rgba(99,102,241,0.45);
+}
+.brand-text { display: flex; flex-direction: column; }
+.brand-name {
+  font-weight: 800; font-size: 14.5px; letter-spacing: 0.2px; white-space: nowrap;
+  background: linear-gradient(90deg, #fff, #c4b5fd);
+  -webkit-background-clip: text; background-clip: text; -webkit-text-fill-color: transparent;
+}
+.brand-sub { font-size: 11px; color: #7d8aa5; margin-top: 2px; }
+
+.menu-title {
+  font-size: 11px; color: #5c6a8a; letter-spacing: 2px;
+  padding: 16px 24px 8px; font-weight: 600;
+  position: relative; z-index: 1;
+}
+
+.app-menu {
+  background: transparent !important;
+  border-right: none !important;
+  position: relative; z-index: 1;
+  /* 矮窗口下菜单可纵向滚动（底部留出 sider-footer 的高度，避免最后一项被压住）。
+     必须显式 overflow-x: hidden：antd inline 菜单的固有宽度比容器宽 ~12px，
+     overflow-y: auto 会连带把 overflow-x 也变成 auto，侧边栏底部会冒出横向滚动条 */
+  flex: 1;
+  overflow-y: auto;
+  overflow-x: hidden;
+  padding-bottom: 64px;
+}
+.app-sider .ant-layout-sider-children { display: flex; flex-direction: column; height: 100%; }
+.app-menu .ant-menu-item {
+  height: 52px; line-height: 1.2;
+  /* antd 默认 item 宽度按 4px 边距计算（calc(100% - 8px)）；这里自定义 10px 边距，
+     宽度必须同步改为 calc(100% - 20px)，否则每项右溢 12px：
+     选中高亮会顶到侧边栏边缘、菜单底部还会冒出横向滚动条 */
+  margin: 4px 10px; border-radius: 10px;
+  width: calc(100% - 20px);
+  color: #9aa5bd;
+  transition: all 0.2s ease;
+  position: relative;
+  display: flex; align-items: center;
+  padding: 0 14px !important;
+}
+.app-menu .ant-menu-item .ant-menu-item-icon { font-size: 17px; }
+.app-menu .ant-menu-item .menu-text {
+  display: flex; flex-direction: column; line-height: 1.2;
+}
+.app-menu .ant-menu-item .menu-label { font-size: 14px; font-weight: 600; }
+.app-menu .ant-menu-item .menu-desc {
+  font-size: 11px; color: #8794ad;
+  margin-top: 2px;
+}
+.app-menu .ant-menu-item:hover {
+  color: #fff !important;
+  background: rgba(99,179,237,0.10) !important;
+}
+.app-menu .ant-menu-item-selected {
+  color: #fff !important;
+  background: linear-gradient(90deg, rgba(99,179,237,0.22), rgba(139,92,246,0.22)) !important;
+  box-shadow: inset 0 0 0 1px rgba(99,179,237,0.35), 0 4px 14px rgba(99,179,237,0.15);
+}
+.app-menu .ant-menu-item-selected::before {
+  content: '';
+  position: absolute; left: 0; top: 10px; bottom: 10px; width: 3px;
+  border-radius: 3px;
+  background: linear-gradient(180deg, #63b3ed, #8b5cf6);
+  box-shadow: 0 0 8px rgba(99,179,237,0.8);
+}
+.app-menu .ant-menu-item-selected .menu-desc { color: #a5b8d8; }
+.app-menu .ant-menu-item-selected .ant-menu-item-icon { color: #c4b5fd; }
+
+.sider-footer {
+  position: absolute; bottom: 0; left: 0; right: 0; z-index: 1;
+  display: flex; align-items: center; gap: 8px;
+  padding: 16px 22px;
+  border-top: 1px solid rgba(255,255,255,0.06);
+  font-size: 12px; color: #7d8aa5;
+}
+.health-badge {
+  display: inline-flex; align-items: center; gap: 6px;
+  padding: 3px 10px; border-radius: 20px; font-size: 12px; font-weight: 600;
+}
+.health-badge.ok { color: #4ade80; background: rgba(34,197,94,0.14); border: 1px solid rgba(34,197,94,0.35); }
+.health-badge.bad { color: #fb7185; background: rgba(244,63,94,0.14); border: 1px solid rgba(244,63,94,0.35); }
+.health-badge.loading { color: #8a94a6; background: rgba(148,163,184,0.12); border: 1px solid rgba(148,163,184,0.3); }
+.health-dot { width: 7px; height: 7px; border-radius: 50%; background: currentColor; display: inline-block; }
+.version-tag { margin-left: auto; color: #5c6a8a; }
+.status-dot {
+  width: 8px; height: 8px; border-radius: 50%;
+  background: #22c55e;
+  box-shadow: 0 0 8px rgba(34,197,94,0.9);
+  animation: pulse 2s infinite;
+}
+@keyframes pulse { 0%,100% { opacity: 1; } 50% { opacity: 0.4; } }
+
+/* ---------- 顶栏 ---------- */
+.app-header {
+  background: linear-gradient(90deg, #12182e 0%, #1a2140 100%) !important;
+  border-bottom: 1px solid rgba(99,179,237,0.12);
+  display: flex; align-items: center; justify-content: space-between;
+  padding: 0 24px; height: 56px; line-height: 56px;
+}
+.header-left { display: flex; align-items: center; gap: 8px; color: #e6edf7; font-weight: 600; font-size: 15px; }
+.header-bolt { color: #8b5cf6; font-size: 18px; }
+.header-right { display: flex; align-items: center; gap: 14px; }
+/* 非交互状态标签（圆点 + 文字，无边框） */
+.status-tag {
+  display: inline-flex; align-items: center; gap: 6px;
+  height: 30px; box-sizing: border-box;
+  font-size: 12px; color: #86efac;
+  user-select: none;
+  background: rgba(34,197,94,0.12);
+  border: 1px solid rgba(34,197,94,0.3);
+  border-radius: 8px;
+  padding: 0 10px;
+}
+.status-tag .status-dot { width: 7px; height: 7px; background: #4ade80; }
+.token-btn {
+  color: #e6edf7 !important;
+  border-color: rgba(99,179,237,0.45) !important;
+  background: rgba(99,179,237,0.12) !important;
+  border-radius: 8px !important;
+}
+.token-btn:hover { border-color: #63b3ed !important; color: #63b3ed !important; }
+
+/* ---------- 内容区（独立滚动，侧边栏/顶栏固定） ---------- */
+.page-content {
+  flex: 1;
+  overflow: auto;
+  padding: 24px;
+  background:
+    radial-gradient(1000px 400px at 15% -10%, rgba(99, 179, 237, 0.12), transparent 60%),
+    radial-gradient(900px 400px at 100% 0%, rgba(139, 92, 246, 0.12), transparent 55%),
+    linear-gradient(160deg, #0d1120 0%, #141a30 100%);
+}
+.page-content .ant-card {
+  border-radius: 12px;
+  box-shadow: 0 4px 16px rgba(0,0,0,0.25);
+  border: 1px solid rgba(255,255,255,0.06);
+}
+.page-content .ant-card-head { font-weight: 700; }

@@ -403,7 +403,7 @@ class TestAppHelpers(unittest.TestCase):
     """app.py 模块级帮助函数（token 估算 / 别名解析 / 流式心跳）。"""
 
     def test_estimate_tokens_cjk_vs_latin(self):
-        from workbuddy_one.app import _estimate_tokens
+        from workbuddy_one.reasoning import estimate_tokens as _estimate_tokens
         # 同样字符数：中文估算应显著高于英文（CJK ~1.5 字符/token vs /4）
         cjk = _estimate_tokens("这是一段中文测试文本用于验证估算" * 1, 1)
         latin = _estimate_tokens("abcdefghij" * 3, 1)  # 30 字符
@@ -412,7 +412,7 @@ class TestAppHelpers(unittest.TestCase):
         self.assertEqual(_estimate_tokens("", 0), 4)
 
     def test_parse_model_aliases(self):
-        from workbuddy_one.app import _parse_model_aliases
+        from workbuddy_one.reasoning import parse_model_aliases as _parse_model_aliases
         raw = "gpt-4o=deepseek-v4-pro\n\n  kimi = kimi-k3-1  \nbad-line\n=x\nx="
         self.assertEqual(
             _parse_model_aliases(raw),
@@ -472,7 +472,7 @@ class TestDisabledReason(unittest.TestCase):
 
 class TestKeepalive(unittest.IsolatedAsyncioTestCase):
     async def test_keepalive_injected_during_silence(self):
-        from workbuddy_one.app import _with_keepalive
+        from workbuddy_one.gateway.sse import with_keepalive as _with_keepalive
 
         async def slow():
             yield "a"
@@ -485,7 +485,7 @@ class TestKeepalive(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(any("keepalive" in t for t in out[1:-1]), out)
 
     async def test_no_keepalive_when_streaming_fast(self):
-        from workbuddy_one.app import _with_keepalive
+        from workbuddy_one.gateway.sse import with_keepalive as _with_keepalive
 
         async def fast():
             for i in range(5):

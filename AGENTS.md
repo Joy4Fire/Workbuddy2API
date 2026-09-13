@@ -51,7 +51,22 @@ _log_usage()  # 完整输入/输出/思考链入库（刻意全量保留，见 �
 ```
 Workbuddy2API/
 ├── workbuddy_one/            # 后端包（唯一 Python 包）
-│   ├── app.py                # FastAPI 工厂 create_app()；全部路由、中间件、WebUI 托管（~1250 行，核心）
+│   ├── app.py                # FastAPI 装配：依赖初始化 + 路由注册 + 安全中间件（~150 行，不放业务逻辑）
+│   ├── context.py            # GatewayContext：db/pool/models/scheduler/managers/limiters 共享依赖
+│   ├── routes/               # 按业务域拆分的路由模块（每个暴露 register(app, ctx)）
+│   │   ├── inference.py      # 三协议推理端点（chat/messages/responses）+ count_tokens + /v1/models
+│   │   ├── accounts.py       # 账号列表/启停/优先级/删除 + 上传 + 扫码 OAuth
+│   │   ├── apps.py           # 应用 API Key CRUD
+│   │   ├── usage.py          # 使用记录（分页/搜索/详情/筛选/瘦身）
+│   │   ├── models_admin.py   # 模型目录 + AA 评测
+│   │   ├── overview.py       # 概览聚合（含积分预警计算）
+│   │   ├── settings.py       # 设置读写（预警/别名等）
+│   │   └── webui.py          # /health + WebUI 静态托管（catch-all，必须最后注册）
+│   ├── gateway/              # 推理链路可复用逻辑（与路由解耦，函数首参 GatewayContext）
+│   │   ├── inference.py      # 鉴权/选号/限速/请求体增强(别名+裁剪+思考)/上游连接重试/用量记账
+│   │   ├── attachments.py    # DSH 附件归档 + 输入文本提取（记录用，完整入库）
+│   │   ├── sse.py            # SSE 增量解析/Chat 行清洗/流式心跳（pump+队列）
+│   │   └── errors.py         # 错误响应构造（safe_err/json_error/err_anthropic/conv_usage）
 │   ├── upstream.py           # 上游转发：白名单构造 body、SSE 流、非流式聚合、共享 AsyncClient
 │   ├── pool.py               # 账号池：加权随机选号（快到期优先 + 额度/成功率/闲置/优先级因子）、冷却
 │   ├── db.py                 # SQLite 层：4 张表 CRUD、版本化迁移框架、用量统计聚合
@@ -61,17 +76,18 @@ Workbuddy2API/
 │   ├── credentials.py        # auth 文件读取、token 过期判定与自动刷新（原子写回）
 │   ├── oauth.py              # 扫码登录（设备授权流）：oauth_begin / oauth_poll
 │   ├── billing.py            # 额度查询（新三接口+旧接口降级）、每日签到；浏览器 UA 绕 WAF
-│   ├── reasoning.py          # sanitize_body：tool_choice 归一化 + reasoning_effort 按模型降级
+│   ├── reasoning.py          # sanitize_body：tool_choice 归一化 + effort 降级 + developer/思维链归一 + 别名解析 + token 估算
 │   ├── desensitize.py        # 敏感词零宽空格注入（仅 system/developer 角色，默认开）
 │   ├── ratelimit.py          # 账号级最小间隔限速（默认 1.5s ± 抖动）
 │   ├── _crypto.py            # 应用 Key 可逆加密（主密钥 data/.secret_key）
 │   ├── config.py             # 环境变量/.env 配置（dataclass）
 │   └── __main__.py           # CLI 入口：python -m workbuddy_one [--login]
 ├── frontend/
-│   ├── src/api/client.ts     # axios 实例：X-Admin-Token 注入、GET 指数退避重试、错误 toast 去重
+│   ├── src/api/              # http.ts（axios 实例 + 拦截器）+ 按域拆分（accounts/usage/models/apps/settings）+ client.ts 组装
 │   ├── src/views/            # Overview / Accounts / Models / Usage / Apps / Records 六页
-│   ├── src/App.vue           # 布局 + 全局暗色主题 CSS（见 §7 前端要点）
-│   └── dist/                 # 构建产物（由后端 app.py 直接伺服；改动前端后必须重新 build）
+│   ├── src/components/       # AppSidebar / TokenManager / CheckinSettingsModal / QrLoginModal / RecordDetailModal
+│   ├── src/styles/           # base.css（布局）+ dark-theme.css（antd 深色覆盖，见 §7 前端要点）
+│   └── dist/                 # 构建产物（跟踪进 git；由后端 app.py 直接伺服；改动前端后必须重新 build）
 ├── tests/                    # unittest 测试（test_core.py、test_models_scheduler.py，56 个用例）
 ├── data/                     # 运行时数据：workbuddy.db、attachments/、.secret_key   ←机密，见 §8
 ├── auths/                    # 账号 auth 文件（.info JSON）                          ←机密，见 §8
@@ -114,6 +130,9 @@ docker compose up -d --build --force-recreate
 5. **DB 结构改动必须走迁移框架**：`db.py` 里 `SCHEMA_VERSION +1` + `_MIGRATIONS` 追加幂等迁移函数，禁止直接改 CREATE TABLE 期望生效。启动时版本升级前会自动备份旧库到 `data/backups/`（保留 5 份）；索引统一由 `_ensure_indexes` 在迁移补列后创建——不要把 CREATE INDEX 写回建表脚本（极老库缺列会直接打不开）。
 6. **settings 表有白名单**：`db.save_settings` 只接受 `DEFAULT_SETTINGS` 里的 key；加新配置项要同步改 `DEFAULT_SETTINGS`、`admin_get_settings`、`admin_save_settings` 三处。
 7. **错误信息面向用户**：HTTPException 的 message 用中文说清楚"发生了什么 + 用户该做什么"。
+8. **新逻辑按域落位，不回堆 app.py**：路由进 `routes/<域>.py`（register(app, ctx) 签名），
+   与路由解耦的可复用逻辑进 `gateway/`（函数首参 GatewayContext）；新文件里的
+   `Path(__file__)` 相对路径一律用 `config.PACKAGE_ROOT`（子目录层级不同，parent.parent 会算错）。
 
 ---
 

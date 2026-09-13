@@ -6,6 +6,7 @@ reasoning_effort 需要按模型支持的档位降级。
 from __future__ import annotations
 
 import logging
+import re
 from typing import Any
 
 logger = logging.getLogger("workbuddy_one.reasoning")
@@ -118,6 +119,45 @@ def sanitize_body(body: dict, efforts: dict[str, list[str]] | None = None) -> di
     body = inject_thinking(body)
     body = backfill_reasoning_content(body)
     return body
+
+
+# ---------------- 模型别名映射 ----------------
+
+def parse_model_aliases(raw: str) -> dict[str, str]:
+    """解析设置里的模型别名映射（每行一条：别名=真实模型），非法行忽略。"""
+    out: dict[str, str] = {}
+    for line in str(raw or "").splitlines():
+        line = line.strip()
+        if not line or "=" not in line:
+            continue
+        alias, _, real = line.partition("=")
+        alias, real = alias.strip(), real.strip()
+        if alias and real:
+            out[alias] = real
+    return out
+
+
+def resolve_model_alias(model: str, aliases: dict[str, str]) -> str:
+    """把客户端请求的模型名解析为真实模型名（无匹配时原样返回）。"""
+    return aliases.get(model, model)
+
+
+# ---------------- token 估算（count_tokens 预检用） ----------------
+
+_CJK_RE = re.compile(r"[\u4e00-\u9fff\u3000-\u303f\uff00-\uffef]")
+
+
+def estimate_tokens(text: str, n_msg: int) -> int:
+    """本地粗估输入 token：CJK 约 1.5 字符/token，其它 4 字符/token，另加每条消息结构开销。
+
+    刻意不调用上游（Claude Code 发正式请求前的预检，打上游又慢又耗配额）；
+    英文经验公式 /4 对中文严重低估（实际约 1.5 字符/token），分段加权。
+    """
+    if not text:
+        return 4
+    cjk = len(_CJK_RE.findall(text))
+    other = len(text) - cjk
+    return max(1, int(cjk / 1.5) + int(other / 4) + n_msg * 4 + 4)
 
 
 def normalize_roles(body: dict) -> dict:

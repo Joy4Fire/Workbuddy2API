@@ -1,10 +1,11 @@
 <script setup lang="ts">
 import { ref, reactive, onMounted } from 'vue'
 import { message } from 'ant-design-vue'
-import { BulbOutlined, RobotOutlined, InboxOutlined, WarningOutlined, ReloadOutlined, FilterOutlined, DownloadOutlined } from '@ant-design/icons-vue'
+import { ReloadOutlined, FilterOutlined, DownloadOutlined } from '@ant-design/icons-vue'
 import { api } from '@/api/client'
 import type { UsageRecord } from '@/types'
 import dayjs from 'dayjs'
+import RecordDetailModal from '@/components/RecordDetailModal.vue'
 
 const records = ref<UsageRecord[]>([])
 const loading = ref(false)
@@ -33,8 +34,7 @@ const filterOptions = ref<{
 }>({ protocols: [], models: [], apps: [], apps_history: [], statuses: [] })
 
 const detailVisible = ref(false)
-const detail = ref<UsageRecord | null>(null)
-const detailLoading = ref(false)
+const lightRecord = ref<UsageRecord | null>(null)
 const exporting = ref(false)
 
 async function load() {
@@ -60,19 +60,19 @@ function onTableChange(p: { current?: number; pageSize?: number }) {
   load()
 }
 
-function onSearch() {
-  // 内容关键字：去空格后为空视同清除
-  filters.value.search = searchText.value.trim() || undefined
-  pagination.current = 1
-  load()
-}
-
 async function loadFilters() {
   filterOptions.value = await api.usageFilters()
 }
 
 function onFilterChange() {
   // 筛选变化后回到第 1 页
+  pagination.current = 1
+  load()
+}
+
+function onSearch() {
+  // 内容关键字：去空格后为空视同清除
+  filters.value.search = searchText.value.trim() || undefined
   pagination.current = 1
   load()
 }
@@ -87,27 +87,14 @@ function clearFilters() {
 // 是否有生效中的筛选（app_name 允许空字符串=未记录应用，故按 != null 判断）
 const hasFilter = () => Object.values(filters.value).some((v) => v != null)
 
-async function openDetail(r: UsageRecord) {
-  // 列表是 light 投影（不含大文本 content）：先展示元数据，再按需拉取完整内容
-  detail.value = r
+function openDetail(r: UsageRecord) {
+  // 列表是 light 投影（不含大文本 content）：完整内容由详情弹窗按需拉取
+  lightRecord.value = r
   detailVisible.value = true
-  detailLoading.value = true
-  try {
-    const res = await api.usageDetail(r.id)
-    detail.value = res.record
-  } catch { /* 拦截器已提示 */ } finally {
-    detailLoading.value = false
-  }
 }
 
 function fmtTime(ts: number) {
   return dayjs(ts * 1000).format('YYYY-MM-DD HH:mm:ss')
-}
-
-function short(s: string | null | undefined, n = 8) {
-  if (!s) return '-'
-  const str = String(s).replace(/\s+/g, ' ')
-  return str.length > n ? str.slice(0, n) + '…' : str
 }
 
 function fmtLatency(ms: number | null | undefined) {
@@ -263,67 +250,7 @@ onMounted(async () => {
       </a-table>
     </a-card>
 
-    <!-- 详情弹窗 -->
-    <a-modal
-      v-model:open="detailVisible"
-      :title="detail ? `请求详情 · ${detail.model} (${detail.protocol})` : '请求详情'"
-      :footer="null"
-      width="720px"
-    >
-      <a-spin :spinning="detailLoading" tip="加载详情…">
-        <div v-if="detail">
-          <div style="margin-bottom: 12px; color: #8a94a6; font-size: 12px">
-            {{ fmtTime(detail.ts) }} · {{ detail.input_tokens || 0 }}/{{ detail.output_tokens || 0 }} tokens ·
-            {{ Math.round(detail.latency_ms || 0) }}ms
-            <template v-if="detail.credits"> · <span style="color: #fbbf24">{{ detail.credits.toFixed(2) }} 积分</span></template>
-            · 账号 {{ short(detail.account_uid) }}
-            <a-tag :color="detail.status === 'ok' ? 'green' : 'red'" style="margin-left: 6px">{{ detail.status }}</a-tag>
-          </div>
-
-          <!-- 思考链 / COT -->
-          <div v-if="detail.reasoning_content" class="sec">
-            <div class="sec-title reasoning"><BulbOutlined style="margin-right: 5px" />思考链 (COT)</div>
-            <pre class="content-box reasoning">{{ detail.reasoning_content }}</pre>
-          </div>
-
-          <!-- 输出 -->
-          <div class="sec">
-            <div class="sec-title output"><RobotOutlined style="margin-right: 5px" />模型输出</div>
-            <pre class="content-box" v-if="detail.output_content">{{ detail.output_content }}</pre>
-            <div v-else class="empty">（无输出内容）</div>
-          </div>
-
-          <!-- 输入 -->
-          <div class="sec">
-            <div class="sec-title input"><InboxOutlined style="margin-right: 5px" />请求输入</div>
-            <pre class="content-box input" v-if="detail.input_content">{{ detail.input_content }}</pre>
-            <div v-else class="empty">（无输入内容）</div>
-          </div>
-
-          <div v-if="detail.error" class="sec">
-            <div class="sec-title" style="color: #ff6b6b"><WarningOutlined style="margin-right: 5px" />错误</div>
-            <pre class="content-box error">{{ detail.error }}</pre>
-          </div>
-        </div>
-      </a-spin>
-    </a-modal>
+    <!-- 详情弹窗（内容按需拉取，独立组件） -->
+    <RecordDetailModal v-model:open="detailVisible" :record="lightRecord" />
   </div>
 </template>
-
-<style scoped>
-.sec { margin-top: 14px; }
-.sec-title { font-size: 13px; font-weight: 700; margin-bottom: 6px; color: #e6edf7; }
-.sec-title.reasoning { color: #c4b5fd; }
-.sec-title.output { color: #7cc0f5; }
-.sec-title.input { color: #86efac; }
-.content-box {
-  background: #121a30; border: 1px solid rgba(99,179,237,0.15);
-  border-radius: 8px; padding: 12px; max-height: 260px; overflow: auto;
-  white-space: pre-wrap; word-break: break-word;
-  font-size: 12.5px; line-height: 1.55; color: #cdd6e8; margin: 0;
-}
-.content-box.reasoning { border-color: rgba(167,139,250,0.3); background: rgba(76,29,149,0.12); color: #ddd6fe; }
-.content-box.input { border-color: rgba(34,197,94,0.25); }
-.content-box.error { border-color: rgba(244,63,94,0.4); color: #fb7185; }
-.empty { color: #6b7794; font-size: 12px; }
-</style>

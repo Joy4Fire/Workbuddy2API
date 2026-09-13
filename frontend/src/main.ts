@@ -2,6 +2,9 @@ import { createApp } from 'vue'
 import { createRouter, createWebHashHistory } from 'vue-router'
 import Antd from 'ant-design-vue'
 import 'ant-design-vue/dist/reset.css'
+// 全局样式：基础布局 + antd 深色主题覆盖（从 App.vue 拆出，便于维护）
+import './styles/base.css'
+import './styles/dark-theme.css'
 import App from './App.vue'
 
 // 路由懒加载：每个页面独立 chunk，首屏只加载当前页
