@@ -72,3 +72,20 @@ _MIGRATIONS = [
 ```bash
 sqlite3 data/workbuddy.db "PRAGMA user_version;"
 ```
+
+## 独立迁移脚本
+
+除启动时自动迁移外，还提供可独立运行的迁移脚本（升级前预迁移 / 无人值守部署 / 只查版本）：
+
+```bash
+# 只查看版本，不修改
+python scripts/migrate_db.py --check
+
+# 执行迁移（默认 data/workbuddy.db；低于最新版本时先自动备份再迁移）
+python scripts/migrate_db.py
+
+# 迁移指定数据库
+python scripts/migrate_db.py --db /path/to/workbuddy.db
+```
+
+脚本幂等：已是最新版本时原样退出；迁移结果会校验 user_version 并输出数据保留情况。
