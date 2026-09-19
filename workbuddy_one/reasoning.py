@@ -210,13 +210,17 @@ def inject_thinking(body: dict) -> dict:
 def backfill_reasoning_content(body: dict) -> dict:
     """DeepSeek 多轮一致性：回填 assistant 消息的 reasoning_content（非 deepseek 零改动）。
 
-    DeepSeek 对多轮会话有约束——历史 assistant 消息带思考痕迹时，后续请求的
-    所有 assistant 消息必须带 reasoning_content 字段（字符串，可为空串），
-    否则上游按缺字段校验/语义异常处理。规则（参考 Sliverkiss）：
-    - 任一 assistant 消息带非空 reasoning/reasoning_content → 所有 assistant
-      消息确保有 reasoning_content：有 reasoning 无 reasoning_content 的复制之，
-      已有字符串的保留（不覆盖，空串视为客户端明确意图），两者皆无的补空串
-    - 无任何思考痕迹 → 零改动（不白白加字段）
+    DeepSeek 对多轮会话有约束——后续请求的 assistant 消息必须带 reasoning_content
+    字段（字符串，可为空串），否则上游按缺字段校验/语义异常处理。
+
+    门控对齐官方 ReasoningContentBackfillRule（Sliverkiss #165）：**thinkingEnabled
+    || hasTrace**——「开思考就补」，不依赖历史痕迹（本网关对 deepseek 无条件注入
+    thinking:enabled，官方语义落到这里 = 非 disabled 一律补；旧门控只认 hasTrace，
+    第三方客户端零痕迹多轮时永不触发，与官方行为相悖）。
+
+    值归一化：已有字符串的保留（不覆盖）；reasoning_content 为 null/数字等非法值
+    归一化为 ""（官方 "string"!=typeof 同语义）；有 reasoning 无 reasoning_content
+    的复制之；两者皆无的补空串。
     """
     if not _is_deepseek(body.get("model")):
         return body
@@ -224,16 +228,25 @@ def backfill_reasoning_content(body: dict) -> dict:
     if not isinstance(msgs, list):
         return body
     assistants = [m for m in msgs if isinstance(m, dict) and m.get("role") == "assistant"]
+    if not assistants:
+        return body
+
+    # 门控：thinking 显式开启（inject_thinking 先行，这里读的是注入后的值）
+    # 或任一 assistant 消息带非空思考痕迹
+    th = body.get("thinking")
+    thinking_enabled = isinstance(th, dict) and str(th.get("type") or "").strip().lower() == "enabled"
 
     def _has_trace(m: dict) -> bool:
         rc, r = m.get("reasoning_content"), m.get("reasoning")
         return (isinstance(rc, str) and bool(rc)) or (isinstance(r, str) and bool(r))
 
-    if not any(_has_trace(m) for m in assistants):
+    if not thinking_enabled and not any(_has_trace(m) for m in assistants):
         return body
     for m in assistants:
-        if isinstance(m.get("reasoning_content"), str):
+        rc = m.get("reasoning_content")
+        if isinstance(rc, str):
             continue
+        # 非法值（null/数字等）不视为"已有"，归一化补齐
         reason = m.get("reasoning")
         m["reasoning_content"] = reason if isinstance(reason, str) else ""
     return body

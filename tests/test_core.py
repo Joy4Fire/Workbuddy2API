@@ -124,16 +124,192 @@ class TestReasoning(unittest.TestCase):
         self.assertEqual(msgs[3]["reasoning_content"], "")       # 两者皆无补空串
 
     def test_backfill_no_trace_untouched(self):
+        # 无 thinking 且无痕迹 → 零改动（门控 thinkingEnabled||hasTrace 两者皆不成立）
         from workbuddy_one.reasoning import backfill_reasoning_content
         b = {"model": "deepseek-v4-pro", "messages": [{"role": "assistant", "content": "a"}]}
         backfill_reasoning_content(b)
         self.assertNotIn("reasoning_content", b["messages"][0])
+
+    def test_backfill_thinking_enabled_fills_even_without_trace(self):
+        # 门控对齐官方（Sliverkiss #165）：thinking enabled 时无痕迹也补（开思考就补）
+        from workbuddy_one.reasoning import backfill_reasoning_content
+        b = {"model": "deepseek-v4-pro", "thinking": {"type": "enabled"},
+             "messages": [{"role": "assistant", "content": "a"}]}
+        backfill_reasoning_content(b)
+        self.assertEqual(b["messages"][0]["reasoning_content"], "")
+
+    def test_backfill_normalizes_illegal_values(self):
+        # reasoning_content 为 null/数字等非法值 → 归一化为 ""（不视为"已有"）
+        from workbuddy_one.reasoning import backfill_reasoning_content
+        b = {"model": "deepseek-v4-pro", "thinking": {"type": "enabled"},
+             "messages": [{"role": "assistant", "content": "a", "reasoning_content": None},
+                          {"role": "assistant", "content": "b", "reasoning_content": 42}]}
+        backfill_reasoning_content(b)
+        self.assertEqual(b["messages"][0]["reasoning_content"], "")
+        self.assertEqual(b["messages"][1]["reasoning_content"], "")
 
     def test_backfill_non_deepseek_untouched(self):
         from workbuddy_one.reasoning import backfill_reasoning_content
         b = {"model": "glm-5.3", "messages": [{"role": "assistant", "content": "a", "reasoning": "x"}]}
         backfill_reasoning_content(b)
         self.assertNotIn("reasoning_content", b["messages"][0])
+
+
+class TestRateLimitDetection(unittest.TestCase):
+    """限流文案识别 + 重置墙钟解析（吸收 Sliverkiss #28/#31）。"""
+
+    def test_is_rate_limit_body(self):
+        from workbuddy_one.gateway.errors import is_rate_limit_body
+        assert is_rate_limit_body(b'{"code":11140,"msg":"The model provider is rate-limiting requests."}')
+        assert is_rate_limit_body(b"usage exceeds frequency limit")
+        assert is_rate_limit_body("请求过于频繁，请稍后再试".encode("utf-8"))
+        assert not is_rate_limit_body(b'{"error":"invalid api key"}')
+
+    def test_parse_rate_reset_cn_and_en(self):
+        from workbuddy_one.gateway.errors import parse_rate_reset, rate_limit_cooldown
+        import time as _t
+        from datetime import datetime, timedelta, timezone
+        cn = parse_rate_reset("将在 2099-01-01 12:00:00 UTC+8 重置".encode("utf-8"))
+        en = parse_rate_reset(b"your usage will reset at 2099-01-01 12:00:00 UTC+8")
+        assert cn is not None and en is not None
+        # 两个形态指同一墙钟（UTC+8 显式解释）
+        self.assertEqual(cn, en)
+        assert cn > _t.time()
+        # 近期重置 → 冷却对齐
+        wall = datetime.fromtimestamp(_t.time() + 600, tz=timezone(timedelta(hours=8))).strftime("%Y-%m-%d %H:%M:%S")
+        cd = rate_limit_cooldown(f"将在 {wall} UTC+8 重置".encode("utf-8"))
+        self.assertTrue(540 <= cd <= 660, cd)
+        # 无时间文案 → base
+        self.assertEqual(rate_limit_cooldown(b"rate limited"), 300.0)
+        # 远期重置 → cap
+        self.assertEqual(rate_limit_cooldown("将在 2099-01-01 12:00:00 UTC+8 重置".encode("utf-8")), 7200.0)
+
+    def test_cooldown_for_error_matrix(self):
+        from workbuddy_one.gateway.inference import cooldown_for_error
+        self.assertEqual(cooldown_for_error(401, b"x"), 1800.0)
+        self.assertEqual(cooldown_for_error(500, b"internal error"), 120.0)
+        self.assertEqual(cooldown_for_error(429, b"no time text"), 300.0)
+        # 非 429 但带限流文案 → 按限流处理（旧版漏判）
+        self.assertEqual(cooldown_for_error(502, b'{"msg":"rate-limiting"}'), 300.0)
+        self.assertEqual(cooldown_for_error(200, "请求过于频繁".encode("utf-8")), 300.0)
+        # 429 + 重置墙钟 → 精确对齐（cap）
+        self.assertEqual(cooldown_for_error(429, "将在 2099-01-01 12:00:00 UTC+8 重置".encode("utf-8")), 7200.0)
+
+
+class TestEmptyStreamSentinel(unittest.IsolatedAsyncioTestCase):
+    """非流式聚合的空流哨兵 + sawDone 截断检测（吸收 Sliverkiss 修复）。
+
+    mock stream_upstream：collect_upstream 内部会走真实上游，单测必须隔断网络。
+    """
+
+    @staticmethod
+    def _mock_stream(lines):
+        from unittest.mock import patch
+        import asyncio
+
+        async def fake(headers, body):
+            for ln in lines:
+                yield ln
+
+        return patch("workbuddy_one.upstream.stream_upstream", fake)
+
+    async def test_empty_stream_raises_502(self):
+        from workbuddy_one.upstream import collect_upstream, UpstreamError
+        with self._mock_stream(["data: [DONE]"]):
+            with self.assertRaises(UpstreamError) as cm:
+                await collect_upstream({}, {"model": "m"})
+        self.assertEqual(cm.exception.status_code, 502)
+
+    async def test_truncated_tool_calls_dropped_on_eof(self):
+        from workbuddy_one.upstream import collect_upstream
+        lines = [
+            'data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"c1","function":{"name":"f","arguments":"{\\"a\\":"}}]}}]}',
+            'data: {"choices":[{"delta":{"content":"部分"}}]}',
+        ]
+        with self._mock_stream(lines):
+            result = await collect_upstream({}, {"model": "m"})
+        msg = result["choices"][0]["message"]
+        self.assertEqual(msg["content"], "部分")
+        self.assertNotIn("tool_calls", msg)  # 残缺 tool_call 已丢弃
+
+    async def test_complete_stream_untouched(self):
+        from workbuddy_one.upstream import collect_upstream
+        lines = [
+            'data: {"choices":[{"delta":{"content":"你好"}}]}',
+            'data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"c1","function":{"name":"f","arguments":"{\\"x\\":1}"}}]}}]}',
+            "data: [DONE]",
+        ]
+        with self._mock_stream(lines):
+            result = await collect_upstream({}, {"model": "m"})
+        msg = result["choices"][0]["message"]
+        self.assertEqual(msg["content"], "你好")
+        self.assertEqual(len(msg["tool_calls"]), 1)
+
+
+class TestSessionSticky(unittest.TestCase):
+    """会话粘性路由（简化版）。"""
+
+    def test_extract_key_priority(self):
+        from workbuddy_one.gateway.session import extract_session_key
+        # prompt_cache_key 优先
+        b = {"prompt_cache_key": "s1", "user": "u" * 20,
+             "messages": [{"role": "user", "content": "hi"}]}
+        self.assertEqual(extract_session_key(b), "pck:s1")
+        # metadata.conversation_id 次之
+        b2 = {"user": "u" * 20, "metadata": {"conversation_id": "c9"},
+              "messages": [{"role": "user", "content": "hi"}]}
+        self.assertEqual(extract_session_key(b2), "cid:c9")
+        # 兜底：首条 user 消息指纹（多轮追加后仍稳定）
+        b3 = {"messages": [{"role": "user", "content": "第一句"},
+                           {"role": "assistant", "content": "回复"},
+                           {"role": "user", "content": "第二句"}]}
+        k3 = extract_session_key(b3)
+        b3["messages"].append({"role": "assistant", "content": "再来"})
+        b3["messages"].append({"role": "user", "content": "第三句"})
+        self.assertEqual(extract_session_key(b3), k3)
+        # 无任何特征 → 空串
+        self.assertEqual(extract_session_key({"messages": []}), "")
+
+    def test_router_bind_lookup_unbind(self):
+        from workbuddy_one.gateway.session import SessionRouter
+        from workbuddy_one.pool import AccountPool
+        pool = AccountPool({})
+        pool.add_account("acc1", None)
+        router = SessionRouter(ttl=60)
+        self.assertIsNone(router.lookup("k", pool))
+        router.bind("k", "acc1")
+        self.assertEqual(router.lookup("k", pool), "acc1")
+        # 账号停用 → 解粘
+        pool.set_enabled("acc1", False)
+        self.assertIsNone(router.lookup("k", pool))
+        self.assertEqual(len(router), 0)
+        # 重新启用后再绑
+        pool.set_enabled("acc1", True, reason="")
+        router.bind("k", "acc1")
+        self.assertEqual(router.lookup("k", pool), "acc1")
+        # 账号移除 → 解粘
+        pool.remove_account("acc1")
+        self.assertIsNone(router.lookup("k", pool))
+
+    def test_acquire_account_binds_and_reuses(self):
+        from workbuddy_one.gateway.session import SessionRouter
+        from workbuddy_one.pool import AccountPool
+        from workbuddy_one.context import GatewayContext
+        from workbuddy_one.gateway import inference
+
+        pool = AccountPool({})
+        pool.add_account("a", None)
+        pool.add_account("b", None)
+        for a in pool.accounts:
+            a.credits_remaining = 100
+        ctx = GatewayContext(db=None, pool=pool, models=None, benchmarks=None,
+                             scheduler=None, managers={})
+        body = {"messages": [{"role": "user", "content": "会话内容"}]}
+        acc1, key = inference.acquire_account(ctx, body)
+        self.assertTrue(key.startswith("fb:"))
+        # 同会话第二次请求应粘住同一账号（池内两账号，正常轮换会漂移）
+        uids = {inference.acquire_account(ctx, body)[0].uid for _ in range(10)}
+        self.assertEqual(uids, {acc1.uid})
 
 
 class TestDesensitize(unittest.TestCase):

@@ -87,6 +87,9 @@ class Scheduler:
         self._last_backup_dt: datetime | None = None
         # 积分预警去重：同一警报 6 小时内只推送一次
         self._last_alert_at = 0.0
+        # auths 目录热加载：上次的目录指纹（文件名+mtime+size），变化时自动注册新账号
+        self._auth_dir_fingerprint: str | None = None
+        self._reload_auths: object = None  # 由 app.py 装配时注入回调（避免循环导入）
 
     async def start(self):
         self._running = True
@@ -372,6 +375,35 @@ class Scheduler:
             logger.warning("webhook 推送异常: %s", e)
             return False
 
+    def _check_auth_dir_changes(self):
+        """auths 目录指纹变化时触发重载回调（新增账号自动进池，免重启）。
+
+        回调由 app.py 装配时注入（需要访问 CredentialManager/账号池/DB，
+        放 scheduler 里会循环导入）。只做"新增"，不自动删除——移除账号
+        仍走 WebUI 手动操作（含清理 DB/限速器等副作用，自动删风险大）。
+        """
+        if self._reload_auths is None:
+            return
+        try:
+            from .credentials import find_auth_files
+            parts = []
+            for f in find_auth_files():
+                try:
+                    st = f.stat()
+                    parts.append(f"{f.name}:{int(st.st_mtime)}:{st.st_size}")
+                except OSError:
+                    continue
+            fp = "|".join(sorted(parts))
+            if self._auth_dir_fingerprint is None:
+                self._auth_dir_fingerprint = fp  # 首轮只记基线，不触发
+                return
+            if fp != self._auth_dir_fingerprint:
+                self._auth_dir_fingerprint = fp
+                logger.info("auths 目录变化，触发热加载")
+                self._reload_auths()
+        except Exception as e:  # noqa: BLE001
+            logger.warning("auths 热加载检查异常: %s", e)
+
     async def _run(self):
         last_credit = 0.0
         while self._running:
@@ -414,6 +446,8 @@ class Scheduler:
                 await self._check_credit_alert()
             except Exception as e:  # noqa: BLE001
                 logger.warning("积分预警检查异常: %s", e)
+            # auths 目录热加载：新增凭证文件自动进池，免手动重启（Sliverkiss 同款思路）
+            self._check_auth_dir_changes()
             # 每日 token 保活
             if now.hour == self._keepalive_hour() and self._last_keepalive_date != today:
                 try:

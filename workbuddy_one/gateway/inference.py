@@ -14,6 +14,8 @@ from fastapi import HTTPException
 
 from ..config import config
 from ..desensitize import desensitize_body
+from .errors import is_rate_limit_body  # noqa: F401（re-export 供 routes 使用）
+from . import session
 from ..ratelimit import AsyncAccountRateLimiter
 from ..reasoning import sanitize_body
 from ..upstream import stream_upstream, UpstreamError
@@ -40,6 +42,22 @@ def cooldown_for(status_code: int) -> float:
     if status_code >= 500:
         return 120.0
     return COOLDOWN_SOFT
+
+
+def cooldown_for_error(status_code: int, raw: bytes) -> float:
+    """按状态码 + 响应体综合决策冷却时长（Sliverkiss #28/#31 的吸收）。
+
+    - 429 或响应体含限流文案（200+11140 "rate-limiting"、400+"rate limit"、
+      6004 "frequency limit" 等）都视为限流——此前非 429 的限流响应漏判，
+      账号不被冷却、反复被选中撞同一堵墙；
+    - 限流时优先解析响应体里的「将在 …重置」墙钟（6004 模型级限流携带），
+      按上游明示的恢复时刻精确冷却（夹在 [60s, 2h]）；无时间文案退回固定
+      5 分钟。绝不臆造时间。
+    """
+    from .errors import is_rate_limit_body, rate_limit_cooldown
+    if status_code == 429 or is_rate_limit_body(raw):
+        return rate_limit_cooldown(raw)
+    return cooldown_for(status_code)
 
 
 def hash_key(key: str) -> str:
@@ -85,6 +103,29 @@ def pick_account(ctx):
     return acc
 
 
+def acquire_account(ctx, body: dict):
+    """选号（含会话粘性）。返回 (account, session_key)。
+
+    粘性（多账号场景）：同一会话键此前绑定的账号若仍健康（启用且不在冷却），
+    直接复用——保住上游 prompt cache 命中；账号进入冷却/被停用则解粘，
+    回池按权重重选并重绑新账号。单账号场景键照常提取，行为不变。
+    """
+    key = session.extract_session_key(body)
+    sticky_uid = ctx.session_router.lookup(key, ctx.pool) if key else None
+    if sticky_uid:
+        for a in ctx.pool.accounts:
+            if a.uid == sticky_uid:
+                if a.cooldown_until - time.time() <= 30:  # 与 pick_account 同一冷却兜底
+                    return a, key
+                # 粘住的账号在冷却：解粘走正常轮换
+                ctx.session_router.unbind(key)
+                break
+    acc = pick_account(ctx)
+    if key:
+        ctx.session_router.bind(key, acc.uid)
+    return acc, key
+
+
 def get_headers(ctx, account):
     """取账号请求头（token 过期时自动刷新）；刷新失败转 503 并冷却该账号。
 
@@ -121,10 +162,12 @@ async def open_upstream(ctx, account, body: dict):
         it, first = await open_upstream_once(ctx, account, body)
         return it, first, account
     except UpstreamError as e:
-        if e.status_code not in (429, 502, 503):
+        if e.status_code not in (429, 502, 503) and not is_rate_limit_body(e.raw):
+            # 非限流、非换号候选错误：原样抛给调用方
             raise
-        # 该账号已确认打不通：先上冷却，避免下面 pick() 又选中它原地重试
-        ctx.pool.on_failure(account.uid, cooldown_for(e.status_code))
+        # 该账号已确认打不通：先上冷却（限流按响应体重置墙钟/文案精确决策），
+        # 避免下面 pick() 又选中它原地重试
+        ctx.pool.on_failure(account.uid, cooldown_for_error(e.status_code, e.raw))
         if ctx.pool.healthy_count() < 1:
             # 没有其它健康账号：放弃重试，按原错误交给调用方记录/返回
             #（后续请求会被 pick_account 的冷却兜底挡下并得到 503）

@@ -64,6 +64,35 @@ def create_app() -> FastAPI:
                          scheduler=scheduler, managers=managers,
                          auth_files_count=len(auth_files))
 
+    def _reload_auths():
+        """auths 目录热加载（scheduler 指纹检测触发）：新凭证文件自动注册进账号池。
+
+        只注册池中尚不存在的 uid（幂等）；已存在的账号刷新其 DB 摘要。
+        删除账号不走此路径（WebUI 手动操作，含限速器/文件清理等副作用）。
+        """
+        registered = 0
+        for f in find_auth_files():
+            try:
+                mgr = CredentialManager(f)
+                summary = mgr.summary()
+                uid = summary.get("uid")
+                if not uid:
+                    continue
+                db.upsert_account({"path": str(f)}, summary)
+                if uid not in managers:
+                    managers[uid] = mgr
+                    pool.add_account(uid, mgr)
+                    logger.info("热加载：新账号 %s 已进入账号池", uid[:8])
+                    registered += 1
+                else:
+                    managers[uid] = mgr  # 刷新 mgr（token 可能已被文件更新）
+            except Exception as e:  # noqa: BLE001
+                logger.warning("热加载 auth 文件失败 %s: %s", f, e)
+        if registered:
+            logger.info("热加载完成：新增 %d 个账号", registered)
+
+    scheduler._reload_auths = _reload_auths
+
     @app.on_event("startup")
     async def _startup():
         await scheduler.start()

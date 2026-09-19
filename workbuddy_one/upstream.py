@@ -7,11 +7,14 @@
 from __future__ import annotations
 
 import json
+import logging
 from typing import AsyncIterator
 
 import httpx
 
 from .config import config
+
+logger = logging.getLogger("workbuddy_one.upstream")
 
 # 透传 body 白名单字段
 PASSTHROUGH_BODY_KEYS = {
@@ -61,17 +64,27 @@ async def stream_upstream(headers: dict, body: dict) -> AsyncIterator[str]:
 
 
 async def collect_upstream(headers: dict, body: dict) -> dict:
-    """消费上游 SSE，聚合成单个非流式 chat.completion 对象。"""
+    """消费上游 SSE，聚合成单个非流式 chat.completion 对象。
+
+    流完整性（吸收 Sliverkiss 空流/截断修复）：
+    - 空流哨兵：整个流没有任何 content/reasoning/tool_calls 增量时抛
+      UpstreamError(502)——上游偶发返回空流，聚合成 200+空消息会把故障
+      伪装成"模型回答为空"，误导调用方重试策略与观测；
+    - sawDone 截断检测：上游未发 `data: [DONE]` 就断连（EOF）视为截断，
+      丢弃 arguments 非法 JSON 的残缺 tool_calls（客户端解析会卡死会话）。
+    """
     content_parts: list[str] = []
     reasoning_parts: list[str] = []
     tool_calls: dict[int, dict] = {}
     model: str | None = None
     finish_reason: str | None = None
     usage: dict | None = None
+    saw_done = False
 
     async for line in stream_upstream(headers, body):
         data = line[5:].strip()
         if data == "[DONE]":
+            saw_done = True
             break
         try:
             chunk = json.loads(data)
@@ -98,10 +111,26 @@ async def collect_upstream(headers: dict, body: dict) -> dict:
                 if tc.get("function", {}).get("arguments"):
                     slot["function"]["arguments"] += tc["function"]["arguments"]
 
+    # 截断收尾（EOF 未发 [DONE]）：丢弃 arguments 解析失败的残缺 tool_calls
+    # （正常 [DONE] 收尾零影响；finish_reason=length 的主动截断同此处理）
+    if not saw_done and tool_calls:
+        for idx in list(tool_calls):
+            args = tool_calls[idx]["function"]["arguments"]
+            try:
+                json.loads(args or "{}")
+            except json.JSONDecodeError:
+                del tool_calls[idx]
+                logger.warning("上游流截断：丢弃 arguments 残缺的 tool_call idx=%d", idx)
+
     content = "".join(content_parts)
+    reasoning = "".join(reasoning_parts)
+    # 空流哨兵：无任何内容增量（含截断后 tool_calls 全被丢弃的场景）
+    if not content and not reasoning and not tool_calls and not usage:
+        raise UpstreamError(502, b'{"error":{"message":"upstream returned an empty stream","type":"upstream_error"}}')
+
     message: dict = {"role": "assistant", "content": content}
     if reasoning_parts:
-        message["reasoning_content"] = "".join(reasoning_parts)
+        message["reasoning_content"] = reasoning
     if tool_calls:
         message["tool_calls"] = [tool_calls[k] for k in sorted(tool_calls)]
 

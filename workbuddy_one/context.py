@@ -10,6 +10,7 @@ from dataclasses import dataclass, field
 from .benchmarks import AABenchmarks
 from .credentials import CredentialManager
 from .db import Database
+from .gateway.session import SessionRouter
 from .models import ModelRegistry
 from .pool import AccountPool
 from .ratelimit import AsyncAccountRateLimiter
@@ -25,4 +26,5 @@ class GatewayContext:
     scheduler: Scheduler
     managers: dict[str, CredentialManager]
     limiters: dict[str, AsyncAccountRateLimiter] = field(default_factory=dict)
+    session_router: SessionRouter = field(default_factory=SessionRouter)
     auth_files_count: int = 0

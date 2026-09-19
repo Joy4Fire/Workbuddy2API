@@ -14,6 +14,7 @@ import httpx
 from fastapi import FastAPI, Header, HTTPException, Request
 from fastapi.responses import JSONResponse, StreamingResponse
 
+from ..config import config
 from ..adapters.anthropic import anthropic_request_to_chat, AnthropicStreamConverter
 from ..adapters.responses import responses_request_to_chat, ResponsesStreamConverter
 from ..gateway import inference
@@ -89,7 +90,6 @@ def register(app: FastAPI, ctx) -> None:
                                x_api_key: str | None = Header(default=None, alias="X-Api-Key")):
         app_name = inference.check_api_key(ctx, authorization, x_api_key)
         log_usage = partial(inference.log_usage, ctx, app_name=app_name)
-        account = inference.pick_account(ctx)
         try:
             payload = await request.json()
         except Exception:
@@ -100,6 +100,8 @@ def register(app: FastAPI, ctx) -> None:
 
         client_wants_stream = bool(payload.get("stream"))
         body = inference.enhance_body(ctx, build_upstream_body(payload))
+        # 选号（含会话粘性）：在 body 构建后执行，会话键从转换后的请求体提取
+        account, session_key = inference.acquire_account(ctx, body)
         headers = inference.get_headers(ctx, account)
         # 记账用解析后的真实模型名（别名请求按真实模型归因，避免按模型统计被打碎）
         model_name = body.get("model", "auto")
@@ -111,9 +113,12 @@ def register(app: FastAPI, ctx) -> None:
             # （换号重试后 account 会被重新绑定，gen() 里记账用的就是实际服务的账号）
             try:
                 it, first, account = await inference.open_upstream(ctx, account, body)
+                # 换号重试后把会话重绑到实际服务的账号（刷新 TTL）
+                if session_key:
+                    ctx.session_router.bind(session_key, account.uid)
             except UpstreamError as e:
                 log_usage("chat", model_name, account, t0, "error", f"HTTP {e.status_code}", input_content=input_text,
-                          cooldown=inference.cooldown_for(e.status_code))
+                          cooldown=inference.cooldown_for_error(e.status_code, e.raw))
                 raise HTTPException(status_code=e.status_code, detail=safe_err(e.raw, e.status_code))
             except httpx.HTTPError as e:
                 log_usage("chat", model_name, account, t0, "error", str(e), input_content=input_text,
@@ -162,7 +167,7 @@ def register(app: FastAPI, ctx) -> None:
                     raise
                 except UpstreamError as e:
                     log_usage("chat", model_name, account, t0, "error", f"HTTP {e.status_code}", input_content=input_text,
-                              cooldown=inference.cooldown_for(e.status_code))
+                              cooldown=inference.cooldown_for_error(e.status_code, e.raw))
                     yield f'data: {json_error(e.status_code, str(e.raw.decode("utf-8", "replace")))}\n\n'.encode()
                     yield b"data: [DONE]\n\n"
                 except Exception as e:  # noqa: BLE001
@@ -174,6 +179,8 @@ def register(app: FastAPI, ctx) -> None:
                                      headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
 
         try:
+            if config.ratelimit:
+                await inference.limiter(ctx, account.uid).wait_if_needed()
             collected = await collect_upstream(headers, body)
             _msg = (collected.get("choices") or [{}])[0].get("message", {})
             # 工具调用摘要并入输出记录（非流式 agent 回复常只有 tool_calls）
@@ -187,7 +194,7 @@ def register(app: FastAPI, ctx) -> None:
             return JSONResponse(content=collected)
         except UpstreamError as e:
             log_usage("chat", model_name, account, t0, "error", f"HTTP {e.status_code}", input_content=input_text,
-                      cooldown=inference.cooldown_for(e.status_code))
+                      cooldown=inference.cooldown_for_error(e.status_code, e.raw))
             raise HTTPException(status_code=e.status_code, detail=safe_err(e.raw, e.status_code))
         except httpx.HTTPError as e:
             log_usage("chat", model_name, account, t0, "error", str(e), input_content=input_text,
@@ -201,7 +208,6 @@ def register(app: FastAPI, ctx) -> None:
                        anthropic_version: str | None = Header(default=None, alias="anthropic-version")):
         app_name = inference.check_api_key(ctx, authorization, x_api_key)
         log_usage = partial(inference.log_usage, ctx, app_name=app_name)
-        account = inference.pick_account(ctx)
         try:
             payload = await request.json()
         except Exception:
@@ -210,6 +216,7 @@ def register(app: FastAPI, ctx) -> None:
         chat_body = inference.enhance_body(ctx, anthropic_request_to_chat(payload))
         model_name = chat_body.get("model", "auto")
         input_text = await extract_input_text(chat_body)
+        account, session_key = inference.acquire_account(ctx, chat_body)
         t0 = time.time()
 
         # Anthropic 默认流式；客户端可用 stream=false 请求非流式
@@ -220,9 +227,12 @@ def register(app: FastAPI, ctx) -> None:
         # （换号重试后 account 会被重新绑定，gen() 里记账用的就是实际服务的账号）
         try:
             it, first, account = await inference.open_upstream(ctx, account, chat_body)
+            # 换号重试后把会话重绑到实际服务的账号（刷新 TTL）
+            if session_key:
+                ctx.session_router.bind(session_key, account.uid)
         except UpstreamError as e:
             log_usage("anthropic", model_name, account, t0, "error", f"HTTP {e.status_code}", input_content=input_text,
-                      cooldown=inference.cooldown_for(e.status_code))
+                      cooldown=inference.cooldown_for_error(e.status_code, e.raw))
             raise HTTPException(status_code=e.status_code, detail=safe_err(e.raw, e.status_code))
         except httpx.HTTPError as e:
             log_usage("anthropic", model_name, account, t0, "error", str(e), input_content=input_text,
@@ -266,7 +276,7 @@ def register(app: FastAPI, ctx) -> None:
                 errored["status"] = e.status_code
                 errored["msg"] = str(e.raw.decode("utf-8", "replace"))
                 log_usage("anthropic", model_name, account, t0, "error", f"HTTP {e.status_code}", input_content=input_text,
-                          cooldown=inference.cooldown_for(e.status_code))
+                          cooldown=inference.cooldown_for_error(e.status_code, e.raw))
                 yield err_anthropic(e.status_code, errored["msg"]).encode()
             except Exception as e:  # noqa: BLE001
                 errored["flag"] = True
@@ -294,7 +304,6 @@ def register(app: FastAPI, ctx) -> None:
                         x_api_key: str | None = Header(default=None, alias="X-Api-Key")):
         app_name = inference.check_api_key(ctx, authorization, x_api_key)
         log_usage = partial(inference.log_usage, ctx, app_name=app_name)
-        account = inference.pick_account(ctx)
         try:
             payload = await request.json()
         except Exception:
@@ -303,6 +312,7 @@ def register(app: FastAPI, ctx) -> None:
         chat_body = inference.enhance_body(ctx, responses_request_to_chat(payload))
         model_name = chat_body.get("model", "auto")
         input_text = await extract_input_text(chat_body)
+        account, session_key = inference.acquire_account(ctx, chat_body)
         t0 = time.time()
 
         converter = ResponsesStreamConverter(model=model_name)
@@ -312,9 +322,12 @@ def register(app: FastAPI, ctx) -> None:
         # （换号重试后 account 会被重新绑定，gen() 里记账用的就是实际服务的账号）
         try:
             it, first, account = await inference.open_upstream(ctx, account, chat_body)
+            # 换号重试后把会话重绑到实际服务的账号（刷新 TTL）
+            if session_key:
+                ctx.session_router.bind(session_key, account.uid)
         except UpstreamError as e:
             log_usage("responses", model_name, account, t0, "error", f"HTTP {e.status_code}", input_content=input_text,
-                      cooldown=inference.cooldown_for(e.status_code))
+                      cooldown=inference.cooldown_for_error(e.status_code, e.raw))
             raise HTTPException(status_code=e.status_code, detail=safe_err(e.raw, e.status_code))
         except httpx.HTTPError as e:
             log_usage("responses", model_name, account, t0, "error", str(e), input_content=input_text,
@@ -357,7 +370,7 @@ def register(app: FastAPI, ctx) -> None:
                 errored["status"] = e.status_code
                 errored["msg"] = str(e.raw.decode("utf-8", "replace"))
                 log_usage("responses", model_name, account, t0, "error", f"HTTP {e.status_code}", input_content=input_text,
-                          cooldown=inference.cooldown_for(e.status_code))
+                          cooldown=inference.cooldown_for_error(e.status_code, e.raw))
                 yield f'data: {json_error(e.status_code, errored["msg"])}\n\n'.encode()
                 yield b"data: [DONE]\n\n"
             except Exception as e:  # noqa: BLE001
