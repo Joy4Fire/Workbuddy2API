@@ -100,8 +100,9 @@ def register(app: FastAPI, ctx) -> None:
 
         client_wants_stream = bool(payload.get("stream"))
         body = inference.enhance_body(ctx, build_upstream_body(payload))
-        # 选号（含会话粘性）：在 body 构建后执行，会话键从转换后的请求体提取
-        account, session_key = inference.acquire_account(ctx, body)
+        # 选号（含会话粘性）：会话键从原始 payload 提取（白名单会剥掉
+        # prompt_cache_key/metadata 等粘性键来源）
+        account, session_key = inference.acquire_account(ctx, body, raw=payload)
         headers = inference.get_headers(ctx, account)
         # 记账用解析后的真实模型名（别名请求按真实模型归因，避免按模型统计被打碎）
         model_name = body.get("model", "auto")
@@ -216,7 +217,7 @@ def register(app: FastAPI, ctx) -> None:
         chat_body = inference.enhance_body(ctx, anthropic_request_to_chat(payload))
         model_name = chat_body.get("model", "auto")
         input_text = await extract_input_text(chat_body)
-        account, session_key = inference.acquire_account(ctx, chat_body)
+        account, session_key = inference.acquire_account(ctx, chat_body, raw=payload)
         t0 = time.time()
 
         # Anthropic 默认流式；客户端可用 stream=false 请求非流式
@@ -312,7 +313,7 @@ def register(app: FastAPI, ctx) -> None:
         chat_body = inference.enhance_body(ctx, responses_request_to_chat(payload))
         model_name = chat_body.get("model", "auto")
         input_text = await extract_input_text(chat_body)
-        account, session_key = inference.acquire_account(ctx, chat_body)
+        account, session_key = inference.acquire_account(ctx, chat_body, raw=payload)
         t0 = time.time()
 
         converter = ResponsesStreamConverter(model=model_name)

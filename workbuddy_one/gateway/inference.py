@@ -103,14 +103,17 @@ def pick_account(ctx):
     return acc
 
 
-def acquire_account(ctx, body: dict):
+def acquire_account(ctx, body: dict, raw: dict | None = None):
     """选号（含会话粘性）。返回 (account, session_key)。
 
+    会话键从 raw（客户端原始 payload）提取——build_upstream_body 的白名单
+    会剥掉 prompt_cache_key/metadata 等非透传字段，从过滤后的 body 提取会
+    丢失这两个键来源（只剩 user 字段与消息指纹兜底）。raw 缺省回落 body。
     粘性（多账号场景）：同一会话键此前绑定的账号若仍健康（启用且不在冷却），
     直接复用——保住上游 prompt cache 命中；账号进入冷却/被停用则解粘，
     回池按权重重选并重绑新账号。单账号场景键照常提取，行为不变。
     """
-    key = session.extract_session_key(body)
+    key = session.extract_session_key(raw if raw is not None else body)
     sticky_uid = ctx.session_router.lookup(key, ctx.pool) if key else None
     if sticky_uid:
         for a in ctx.pool.accounts:

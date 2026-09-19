@@ -291,6 +291,33 @@ class TestSessionSticky(unittest.TestCase):
         pool.remove_account("acc1")
         self.assertIsNone(router.lookup("k", pool))
 
+    def test_acquire_account_uses_raw_payload_for_key(self):
+        # 回归：白名单会剥掉 prompt_cache_key，会话键必须从原始 payload 提取
+        from workbuddy_one.gateway.session import SessionRouter, extract_session_key
+        from workbuddy_one.pool import AccountPool
+        from workbuddy_one.context import GatewayContext
+        from workbuddy_one.gateway import inference
+        from workbuddy_one.upstream import build_upstream_body
+
+        payload = {"model": "m", "prompt_cache_key": "sess-1",
+                   "messages": [{"role": "user", "content": "hi"}]}
+        body = build_upstream_body(payload)
+        # 白名单后的 body 提取不到 pck（只剩消息指纹），raw 才能提取到
+        self.assertFalse(extract_session_key(body).startswith("pck:"))
+        self.assertEqual(extract_session_key(payload), "pck:sess-1")
+
+        pool = AccountPool({})
+        pool.add_account("a", None)
+        pool.add_account("b", None)
+        for a in pool.accounts:
+            a.credits_remaining = 100
+        ctx = GatewayContext(db=None, pool=pool, models=None, benchmarks=None,
+                             scheduler=None, managers={})
+        acc, key = inference.acquire_account(ctx, body, raw=payload)
+        self.assertTrue(key.startswith("pck:"))
+        uids = {inference.acquire_account(ctx, body, raw=payload)[0].uid for _ in range(8)}
+        self.assertEqual(uids, {acc.uid})
+
     def test_acquire_account_binds_and_reuses(self):
         from workbuddy_one.gateway.session import SessionRouter
         from workbuddy_one.pool import AccountPool
