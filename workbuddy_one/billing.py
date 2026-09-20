@@ -14,6 +14,7 @@ from datetime import datetime
 
 import httpx
 
+from . import net, region
 from .config import config
 # 官方计费商品码（逆向自 Electron 客户端 app.asar）。#97550 重构后按码集分派：
 # 付费包走 paid-packages、免费/赠送/体验包走 free-packages；PackageCodes 为必填。
@@ -54,11 +55,25 @@ _OLD_ACCOUNTS_PATH = ("data", "Response", "Data", "Accounts")
 _NEW_ACCOUNTS_PATH = ("data", "Accounts")
 
 
+def _billing_base(mgr) -> str:
+    """按账号区域选计费 host（国内版 copilot.tencent.com / 国际版 www.workbuddy.ai）。"""
+    return region.billing_base(getattr(mgr, "domain", "") or config.domain)
+
+
 def _billing_headers(mgr) -> dict:
-    """billing 接口专用请求头（不含 X-Refresh-Token），强制浏览器 UA 绕过网关 WAF。"""
+    """billing 接口专用请求头（不含 X-Refresh-Token），强制浏览器 UA 绕过网关 WAF。
+
+    国际版额外补上与其 host 同源的 Origin/Referer（国际站 WAF 比国内严）；
+    国内版保持既有行为（只带 UA 即可通过），不动已经在跑的额度查询。
+    """
     headers = mgr.get_headers()
     headers = {k: v for k, v in headers.items()}
     headers["User-Agent"] = _BROWSER_UA
+    domain = headers.get("X-Domain") or config.domain
+    if region.detect_region(domain).id == "global":
+        o = region.origin(domain)
+        headers.setdefault("Origin", o)
+        headers.setdefault("Referer", o + "/")
     return headers
 
 
@@ -199,7 +214,7 @@ def _num(v) -> float:
 
 async def _post_json(mgr, url: str, body: dict) -> dict:
     headers = _billing_headers(mgr)
-    async with httpx.AsyncClient(timeout=20, trust_env=False) as client:
+    async with net.async_client(timeout=20) as client:
         resp = await client.post(url, headers=headers, json=body)
         try:
             return resp.json()
@@ -212,7 +227,7 @@ async def _fetch_new_credits(mgr) -> dict | None:
     now = datetime.now()
     day_start = now.strftime("%Y-%m-%d 00:00:00")
     day_end = now.strftime("%Y-%m-%d 23:59:59")
-    base = f"{config.backend}/billing/meter"
+    base = f"{_billing_base(mgr)}/billing/meter"
     accounts: list = []
     endpoints: list[tuple[str, dict]] = [
         # 1) summary（聚合）
@@ -244,7 +259,7 @@ async def _fetch_new_credits(mgr) -> dict | None:
 
 async def _fetch_old_credits(mgr) -> dict | None:
     """降级：旧单一接口 get-user-resource（官方兼容期仍可用）。"""
-    url = f"{config.backend}/v2/billing/meter/get-user-resource"
+    url = f"{_billing_base(mgr)}/v2/billing/meter/get-user-resource"
     now = datetime.now()
     body = {
         "PageNumber": 1, "PageSize": 100, "ProductCode": "p_tcaca",
@@ -283,9 +298,9 @@ async def fetch_credits(mgr) -> dict:
 
 async def daily_checkin(mgr) -> dict:
     """执行每日签到。返回 {ok, message}。"""
-    url = f"{config.backend}/v2/billing/meter/daily-checkin"
+    url = f"{_billing_base(mgr)}/v2/billing/meter/daily-checkin"
     headers = _billing_headers(mgr)
-    async with httpx.AsyncClient(timeout=20, trust_env=False) as client:
+    async with net.async_client(timeout=20) as client:
         resp = await client.post(url, headers=headers, json={})
         data = resp.json()
     code = data.get("code")

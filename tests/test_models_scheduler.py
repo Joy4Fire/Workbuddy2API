@@ -3,12 +3,29 @@
 运行：python -m unittest discover -s tests
 """
 import os
+import shutil
 import sys
 import tempfile
 import unittest
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
+# 测试库统一落在**系统临时目录**（原因同 test_core：仓库可能位于网络盘，
+# 网络盘没有回收站，删除会退化成失败的 SHFileOperationW，单次 10~36 秒）。
+_TMP = Path(tempfile.mkdtemp(prefix="wb_sched_"))
+
+
+def setUpModule():
+    """清掉上一轮残留的测试库（原因同 test_core.setUpModule：固定文件名 + 共享
+    _TMP，残留会让后续整轮运行读到上次的数据而失败）。"""
+    if _TMP.is_dir():
+        for f in list(_TMP.glob("*.db*")):
+            f.unlink(missing_ok=True)
+
+
+def tearDownModule():
+    shutil.rmtree(_TMP, True)
 
 
 class TestConfigDbPath(unittest.TestCase):
@@ -73,7 +90,7 @@ class TestModelRegistry(unittest.TestCase):
         # TTL 可从 DB settings（model_ttl_min）动态读取
         from workbuddy_one.models import ModelRegistry, DEFAULT_TTL
         from workbuddy_one.db import Database
-        tmp = Path(__file__).resolve().parent / "_tmp"
+        tmp = _TMP
         tmp.mkdir(exist_ok=True)
         db = Database(str(tmp / "ttl.db"))
         try:
@@ -187,7 +204,7 @@ class TestSchedulerParsing(unittest.TestCase):
 class TestSettingsValidation(unittest.TestCase):
     def test_settings_roundtrip_and_whitelist(self):
         from workbuddy_one.db import Database
-        tmp = Path(__file__).resolve().parent / "_tmp"
+        tmp = _TMP
         tmp.mkdir(exist_ok=True)
         db = Database(str(tmp / "sett.db"))
         try:
@@ -214,7 +231,7 @@ class TestSettingsValidation(unittest.TestCase):
 class TestAccountDelete(unittest.TestCase):
     def test_delete_account(self):
         from workbuddy_one.db import Database
-        tmp = Path(__file__).resolve().parent / "_tmp"
+        tmp = _TMP
         tmp.mkdir(exist_ok=True)
         db = Database(str(tmp / "del.db"))
         try:
@@ -254,7 +271,7 @@ class TestAABenchmarks(unittest.TestCase):
     def test_key_prefers_db(self):
         from workbuddy_one.benchmarks import AABenchmarks
         from workbuddy_one.db import Database
-        tmp = Path(__file__).resolve().parent / "_tmp"
+        tmp = _TMP
         tmp.mkdir(exist_ok=True)
         db = Database(str(tmp / "aa.db"))
         try:
@@ -328,7 +345,7 @@ class TestAABenchmarks(unittest.TestCase):
 class TestUsageContent(unittest.TestCase):
     def test_log_usage_content_roundtrip(self):
         from workbuddy_one.db import Database
-        tmp = Path(__file__).resolve().parent / "_tmp"
+        tmp = _TMP
         tmp.mkdir(exist_ok=True)
         db = Database(str(tmp / "usage.db"))
         try:
@@ -354,7 +371,7 @@ class TestUsageContent(unittest.TestCase):
 
     def test_log_usage_empty_content_defaults(self):
         from workbuddy_one.db import Database
-        tmp = Path(__file__).resolve().parent / "_tmp"
+        tmp = _TMP
         tmp.mkdir(exist_ok=True)
         db = Database(str(tmp / "usage2.db"))
         try:
@@ -370,7 +387,7 @@ class TestUsageContent(unittest.TestCase):
 
     def test_usage_content_columns_exist_in_schema(self):
         from workbuddy_one.db import Database
-        tmp = Path(__file__).resolve().parent / "_tmp"
+        tmp = _TMP
         tmp.mkdir(exist_ok=True)
         db = Database(str(tmp / "usage3.db"))
         try:
@@ -384,7 +401,7 @@ class TestUsageContent(unittest.TestCase):
 
     def test_log_usage_credits(self):
         from workbuddy_one.db import Database
-        tmp = Path(__file__).resolve().parent / "_tmp"
+        tmp = _TMP
         tmp.mkdir(exist_ok=True)
         db = Database(str(tmp / "usage4.db"))
         try:
@@ -403,7 +420,7 @@ class TestUsageContent(unittest.TestCase):
 
     def test_usage_credit_stats_per_model(self):
         from workbuddy_one.db import Database
-        tmp = Path(__file__).resolve().parent / "_tmp"
+        tmp = _TMP
         tmp.mkdir(exist_ok=True)
         db = Database(str(tmp / "usage5.db"))
         try:

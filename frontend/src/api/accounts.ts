@@ -21,10 +21,15 @@ export const accountsApi = {
     })
   },
 
-  // 扫码登录
-  oauthStart: () => http.post<unknown, { ok: boolean; state: string; authUrl: string }>('/admin/oauth/start'),
-  oauthStatus: (state: string) =>
+  // 扫码登录。region 必须显式传："cn"（国内版，默认）/"global"（国际版）——
+  // 两个区域的控制面 host 不同，国际版账号打到国内站会拿不到有效二维码。
+  // status 轮询必须回传 start 返回的 region，否则两次请求会打到不同控制面。
+  oauthStart: (region: 'cn' | 'global' = 'cn') =>
+    http.post<unknown, { ok: boolean; state: string; authUrl: string; region: string }>(
+      `/admin/oauth/start?region=${encodeURIComponent(region)}`,
+    ),
+  oauthStatus: (state: string, region: 'cn' | 'global' = 'cn') =>
     http.get<unknown, { status: 'pending' | 'ready' | 'expired'; account?: AccountInfo }>(
-      `/admin/oauth/status?state=${encodeURIComponent(state)}`,
+      `/admin/oauth/status?state=${encodeURIComponent(state)}&region=${encodeURIComponent(region)}`,
     ),
 }

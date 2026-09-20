@@ -22,9 +22,11 @@ const now = ref(Date.now() / 1000)
 const qrOpen = ref(false)
 const settingsOpen = ref(false)
 
-// 账号状态细分：已禁用 / 冷却中 / 余额不足 / 健康
+// 账号状态细分：已禁用 / 登录态已加密 / 冷却中 / 余额不足 / 健康
 function statusOf(record: AccountInfo): { label: string; color: string; countdown?: string } {
   if (!record.enabled) return { label: '已禁用', color: 'default' }
+  // 加密登录态排在冷却之前：冷却会自愈，加密不会——必须先让用户看到真正的原因
+  if (isEncrypted(record)) return { label: '登录态已加密', color: 'orange' }
   if (record.cooldown_until && record.cooldown_until > now.value) {
     const sec = Math.ceil(record.cooldown_until - now.value)
     const countdown = sec < 60 ? `${sec} 秒` : `${Math.ceil(sec / 60)} 分钟`
@@ -34,6 +36,27 @@ function statusOf(record: AccountInfo): { label: string; color: string; countdow
     return { label: '余额不足', color: 'red' }
   }
   return { label: '健康', color: 'green' }
+}
+
+// 登录态是否被 $wbEncrypted 加密（桌面端 5.6.0+）。加密的账号当前不可用，
+// 且**不能**靠"刷新额度/token 保活"恢复——必须换明文 auth 或提供官方客户端。
+function isEncrypted(record: AccountInfo): boolean {
+  return !!record.auth_encrypted_fields?.length
+}
+
+function encryptedTip(record: AccountInfo): string {
+  const fields = (record.auth_encrypted_fields || []).join('、')
+  return `WorkBuddy 桌面端 5.6.0+ 加密了登录态（${fields}），本机无法解密。`
+    + '请改用「上传 auth 文件」导入明文凭据，或配置 WORKBUDDY_EXE 指向官方客户端安装路径。'
+}
+
+const encryptedAccounts = computed(() => accounts.value.filter(isEncrypted))
+
+// 区域标签：国内版（蓝）/ 国际版（紫）。区域由 auth 文件的 domain 自动判定，
+// 不做成用户可改的字段——避免与真实凭据不一致。
+function regionTag(record: AccountInfo): { text: string; color: string } {
+  if (record.region === 'global') return { text: record.region_label || '国际版', color: 'purple' }
+  return { text: record.region_label || '国内版', color: 'blue' }
 }
 
 // 上传 auth 文件
@@ -184,7 +207,7 @@ onUnmounted(() => {
       <span style="width: 1px; height: 24px; background: rgba(255,255,255,0.12)"></span>
       <a-button @click="refreshCredits">刷新额度</a-button>
       <a-button @click="load">刷新列表</a-button>
-      <a-button @click="settingsOpen = true" style="margin-left: 4px">自动签到设置</a-button>
+      <a-button @click="settingsOpen = true" style="margin-left: 4px">设置</a-button>
       <span v-if="!anyUnchecked && accounts.length" style="margin-left: auto; display: inline-flex; align-items: center; gap: 5px; color: #4ade80; font-size: 12px; background: rgba(34,197,94,0.12); padding: 3px 10px; border-radius: 20px; border: 1px solid rgba(34,197,94,0.3)">
         <CheckCircleOutlined />今日已全部签到
       </span>
@@ -195,6 +218,15 @@ onUnmounted(() => {
       accept=".info,.json"
       style="display: none"
       @change="onFileChange"
+    />
+
+    <a-alert
+      v-if="encryptedAccounts.length"
+      type="warning"
+      show-icon
+      style="margin-bottom: 12px"
+      :message="`${encryptedAccounts.length} 个账号的登录态已被加密，当前无法使用`"
+      description="WorkBuddy 桌面端 5.6.0+ 会把 accessToken / refreshToken 加密后落盘，密钥只存在于官方客户端里。请上传明文 auth 文件，或配置 WORKBUDDY_EXE 指向官方客户端安装路径。加密文件不会被本服务回写（写回明文会让官方客户端认不出自己的登录态）。"
     />
 
     <a-alert
@@ -214,11 +246,19 @@ onUnmounted(() => {
         :loading="loading"
         row-key="uid"
         :pagination="false"
-        :scroll="{ x: 1210 }"
+        :scroll="{ x: 1340 }"
         table-layout="fixed"
       >
         <a-table-column title="UID" key="uid" :width="200">
           <template #default="{ record }"><a-tooltip :title="record.uid"><code>{{ short(record.uid, 24) }}</code></a-tooltip></template>
+        </a-table-column>
+        <a-table-column title="区域" key="region" :width="110">
+          <template #default="{ record }">
+            <!-- 区域由 auth 文件的 domain 自动判定，鼠标悬浮可看到原始域名 -->
+            <a-tooltip :title="record.domain ? `域名：${record.domain}` : '域名未知（按国内版处理）'">
+              <a-tag :color="regionTag(record).color">{{ regionTag(record).text }}</a-tag>
+            </a-tooltip>
+          </template>
         </a-table-column>
         <a-table-column title="来源" key="source" :width="130">
           <template #default="{ record }">
@@ -227,7 +267,7 @@ onUnmounted(() => {
             <a-tag v-else color="default">未知</a-tag>
           </template>
         </a-table-column>
-        <a-table-column title="状态" key="healthy" :width="130">
+        <a-table-column title="状态" key="healthy" :width="150">
           <template #default="{ record }">
             <template v-if="statusOf(record).label === '冷却中'">
               <a-tooltip :title="`${statusOf(record).countdown}后恢复`">
@@ -241,6 +281,14 @@ onUnmounted(() => {
               </a-tooltip>
               <div v-if="record.disabled_reason" style="font-size: 11px; color: #8a94a6; line-height: 1.3; margin-top: 2px">
                 {{ record.disabled_reason }}
+              </div>
+            </template>
+            <template v-else-if="isEncrypted(record)">
+              <a-tooltip :title="encryptedTip(record)">
+                <a-tag color="orange">登录态已加密</a-tag>
+              </a-tooltip>
+              <div style="font-size: 11px; color: #8a94a6; line-height: 1.3; margin-top: 2px">
+                需明文 auth 文件
               </div>
             </template>
             <a-tag v-else :color="statusOf(record).color">{{ statusOf(record).label }}</a-tag>

@@ -10,10 +10,30 @@ import threading
 import time
 from pathlib import Path
 
+from . import region
 from .credentials import CredentialManager
 
 # 项目 auths/ 目录（账号来源分类用）
 _PROJECT_AUTHS = (Path(__file__).resolve().parent.parent / "auths")
+
+
+def _mgr_domain(mgr) -> str:
+    """安全取凭据所属域名。
+
+    部分测试用 Account(uid=..., mgr=None) 构造纯逻辑账号（只验证权重/冷却），
+    所以这里必须容忍 mgr 缺失，缺失即按默认区域（国内版）处理。
+    """
+    return getattr(mgr, "domain", "") if mgr is not None else ""
+
+
+def _mgr_encrypted_fields(mgr) -> list[str]:
+    """安全取凭据的加密字段列表（mgr 缺失或读不出都按「未加密」处理）。"""
+    if mgr is None:
+        return []
+    try:
+        return list(mgr.encrypted_fields())
+    except Exception:  # noqa: BLE001  仅用于展示，不因展示失败影响账号列表
+        return []
 
 
 def _account_source(acc) -> str:
@@ -46,6 +66,10 @@ class Account:
         self.credit_packages: list[dict] = []         # 积分构成明细（按商品聚合，运行时数据不落库）
         self.priority: int = 0             # 用户指定优先级（越大权重越高）
         self.last_used = 0.0
+        # 区域（"cn"/"global"）：账号一建立就按 auth 文件里的 domain 定下来。
+        # 缓存到实例上而不是每次 pick 现算——pick 持池锁，不该在里面反复 stat 文件。
+        # domain 对同一账号不会变（换区域等于换账号），缓存是安全的。
+        self.region_id = region.detect_region(_mgr_domain(mgr)).id
 
     def healthy(self, now: float) -> bool:
         if not self.enabled:
@@ -97,6 +121,13 @@ class AccountPool:
             "priority": a.priority,
             "weight": round(self._weight(a, now), 3),
             "source": _account_source(a),
+            # 区域：混池时前端要能看出每个账号是国内版还是国际版（模型集不同）
+            "domain": _mgr_domain(a.mgr),
+            "region": a.region_id,
+            "region_label": region.REGIONS[a.region_id].label,
+            # $wbEncrypted 加密登录态（WorkBuddy 5.6.0+）：非空表示该账号当前不可用，
+            # 前端据此给出「登录态已加密」而不是误导性的「token 过期」
+            "auth_encrypted_fields": _mgr_encrypted_fields(a.mgr),
         } for a in self.accounts]
 
     def set_enabled(self, uid: str, enabled: bool, reason: str = ""):
@@ -161,7 +192,7 @@ class AccountPool:
     # 到期紧迫阈值（天）：距到期 ≤ 此天数视为「快到期」，进入硬性优先池
     EXPIRY_PRIORITY_DAYS = 7
 
-    def pick(self):
+    def pick(self, regions: set[str] | None = None):
         """加权随机选择下一个健康账号。
 
         两阶段策略（积分优先消耗）：
@@ -169,15 +200,24 @@ class AccountPool:
                  只在快到期账号里按 (优先级×额度×成功率) 加权选——先消耗快过期的积分。
           阶段 2：否则在所有健康账号里按全因子（含闲置补偿）加权选。
         无健康账号时退回「最早冷却到期账号」顶班。
+
+        regions: 可选，限定只在指定区域（"cn"/"global"）的账号里选。用于「模型只在
+        某一个区域存在」的场景——混池下把 gpt-5.4 发给国内版账号会被上游 400 拒绝。
+        指定区域内没有健康账号时**退回不过滤**（宁可试一次，也不要直接 503）。
         """
         with self._lock:
             now = time.time()
-            candidates = [a for a in self.accounts if a.healthy(now)]
+            all_enabled = [a for a in self.accounts if a.enabled]
+            if regions:
+                scoped = [a for a in all_enabled if a.region_id in regions]
+                # 限定区域内一个可用账号都没有 → 放弃过滤，走原逻辑
+                all_enabled = scoped or all_enabled
+            candidates = [a for a in all_enabled if a.healthy(now)]
             if not candidates:
                 # 没有健康账号：找一个已过期冷却的最早冷却账号（尽量）
                 best = None
                 best_expiry = float("inf")
-                for acc in self.accounts:
+                for acc in all_enabled:
                     if acc.enabled and acc.cooldown_until < best_expiry:
                         best = acc
                         best_expiry = acc.cooldown_until

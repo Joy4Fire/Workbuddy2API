@@ -14,6 +14,7 @@ from fastapi import HTTPException
 
 from ..config import config
 from ..desensitize import desensitize_body
+from ..region import region_of_account
 from .errors import is_rate_limit_body  # noqa: F401（re-export 供 routes 使用）
 from . import session
 from ..ratelimit import AsyncAccountRateLimiter
@@ -90,9 +91,13 @@ def limiter(ctx, uid: str) -> AsyncAccountRateLimiter:
     return ctx.limiters[uid]
 
 
-def pick_account(ctx):
-    """从池中选择一个账号，返回 Account；无账号则 503。"""
-    acc = ctx.pool.pick()
+def pick_account(ctx, regions: set[str] | None = None):
+    """从池中选择一个账号，返回 Account；无账号则 503。
+
+    regions: 可选，限定区域（见 pool.pick 与 models.regions_for）。混池下按请求的
+    模型把候选账号收敛到「确实提供该模型」的区域，避免被上游 400（11102）拒绝。
+    """
+    acc = ctx.pool.pick(regions=regions)
     if acc is None:
         raise HTTPException(status_code=503, detail={"error": {"message": "无可用账号（全部冷却或额度耗尽），请检查账号状态", "type": "auth_error"}})
     # fallback 顶班账号（无健康账号时选出的最早冷却到期者）若还要冷却 30 秒以上，
@@ -103,8 +108,26 @@ def pick_account(ctx):
     return acc
 
 
+def model_regions(ctx, body: dict) -> set[str] | None:
+    """请求模型可用的区域集合；返回 None 表示「不限制区域」。
+
+    混池下国内外模型集大部分不重叠（实测国际版 18 个 / 国内版 16 个，交集仅 5 个），
+    把区域专属模型发给另一个区域的账号会被上游 400（code=11102 service info not found）。
+
+    目录里没有该模型时（别名、新模型、目录尚未拉到）返回 None —— **不限制**，
+    保持原有随机轮换，避免把未知模型直接打成不可用。
+    """
+    models = getattr(ctx, "models", None)
+    if models is None or not hasattr(models, "regions_for"):
+        return None  # 无模型目录（部分测试用的精简 ctx）：不限制区域
+    model = str(body.get("model") or "").strip()
+    if not model:
+        return None
+    return models.regions_for(model) or None
+
+
 def acquire_account(ctx, body: dict, raw: dict | None = None):
-    """选号（含会话粘性）。返回 (account, session_key)。
+    """选号（含会话粘性 + 按模型限定区域）。返回 (account, session_key)。
 
     会话键从 raw（客户端原始 payload）提取——build_upstream_body 的白名单
     会剥掉 prompt_cache_key/metadata 等非透传字段，从过滤后的 body 提取会
@@ -114,16 +137,21 @@ def acquire_account(ctx, body: dict, raw: dict | None = None):
     回池按权重重选并重绑新账号。单账号场景键照常提取，行为不变。
     """
     key = session.extract_session_key(raw if raw is not None else body)
+    regions = model_regions(ctx, body)
     sticky_uid = ctx.session_router.lookup(key, ctx.pool) if key else None
     if sticky_uid:
         for a in ctx.pool.accounts:
             if a.uid == sticky_uid:
+                if regions and a.region_id not in regions:
+                    # 粘住的账号所在区域不提供该模型：解粘，让下面按区域重选
+                    ctx.session_router.unbind(key)
+                    break
                 if a.cooldown_until - time.time() <= 30:  # 与 pick_account 同一冷却兜底
                     return a, key
                 # 粘住的账号在冷却：解粘走正常轮换
                 ctx.session_router.unbind(key)
                 break
-    acc = pick_account(ctx)
+    acc = pick_account(ctx, regions=regions)
     if key:
         ctx.session_router.bind(key, acc.uid)
     return acc, key
@@ -161,6 +189,8 @@ async def open_upstream(ctx, account, body: dict):
     返回 (iterator, 首行, 实际使用的账号)——429/502/503 时会自动换健康账号重试一次
     （仅一次，不递归），换号后调用方必须用返回的账号记账，而不是最初的账号。
     """
+    # 脱敏在选号后、发上游前施加：只在此处做一次，避免换号重试时重复注入零宽字符
+    body = apply_desensitize(body, account)
     try:
         it, first = await open_upstream_once(ctx, account, body)
         return it, first, account
@@ -175,7 +205,7 @@ async def open_upstream(ctx, account, body: dict):
             # 没有其它健康账号：放弃重试，按原错误交给调用方记录/返回
             #（后续请求会被 pick_account 的冷却兜底挡下并得到 503）
             raise
-        alt = pick_account(ctx)
+        alt = pick_account(ctx, regions=model_regions(ctx, body))
         try:
             it, first = await open_upstream_once(ctx, alt, body)
         except (UpstreamError, httpx.HTTPError):
@@ -185,19 +215,28 @@ async def open_upstream(ctx, account, body: dict):
 
 
 def enhance_body(ctx, body: dict) -> dict:
-    """统一规整 + 可选脱敏，构造最终上游请求体。"""
+    """统一规整，构造最终上游请求体。
+
+    刻意不含反审核脱敏：脱敏必须按「最终选中的账号属于哪个区域」决定（见
+    apply_desensitize），而本函数在选号之前调用，此时账号还未知。
+    """
     from ..reasoning import parse_model_aliases, resolve_model_alias
     # 模型别名解析：客户端用熟名字（gpt-4o 等）也能路由到真实模型
     if body.get("model"):
         aliases = parse_model_aliases(ctx.db.get_settings().get("model_aliases") or "")
         body["model"] = resolve_model_alias(str(body["model"]), aliases)
-    # max_tokens 按模型实际上限裁剪：Claude Code 常发 32000+，
-    # 超过部分模型上限会被上游拒绝（目录未知时不裁剪）
+    # 输出上限按模型实际能力裁剪：Claude Code 常发 32000+，超过部分模型上限会被
+    # 上游拒绝（目录未知时不裁剪）。max_tokens 与 max_completion_tokens 都要管——
+    # OpenAI 新客户端（Responses 系）发的是后者，只裁前者会漏掉。
     max_out = ctx.models.max_output_tokens(str(body.get("model") or ""))
-    if max_out and body.get("max_tokens") and body["max_tokens"] > max_out:
-        logger.info("max_tokens %s 超过模型 %s 上限，裁剪为 %s",
-                    body["max_tokens"], body.get("model"), max_out)
-        body["max_tokens"] = max_out
+    if max_out:
+        for key in ("max_tokens", "max_completion_tokens"):
+            value = body.get(key)
+            # 只裁显式给的正整数；None/字符串等交给上游自己判
+            if type(value) is int and value > max_out:
+                logger.info("%s %s 超过模型 %s 上限，裁剪为 %s",
+                            key, value, body.get("model"), max_out)
+                body[key] = max_out
     # 动态思考强度表：来自模型目录（动态获取），无则交给内置静态表
     model_id = body.get("model")
     dyn_efforts = None
@@ -206,9 +245,24 @@ def enhance_body(ctx, body: dict) -> dict:
         if efforts:
             dyn_efforts = {model_id: efforts}
     body = sanitize_body(body, efforts=dyn_efforts)
-    if config.desensitize:
-        body = desensitize_body(body, roles=("system", "developer"))
     return body
+
+
+def apply_desensitize(body: dict, account) -> dict:
+    """按账号所属区域决定是否做反审核脱敏。
+
+    脱敏（system/developer 里插零宽空格）是为绕国内内容审核而做的，国际版没有
+    这层审核，注入零宽字符只会白白降低 system prompt 的保真度。所以只在国内版
+    账号上施加；config.desensitize 关掉时两个区域都不做。
+
+    混池场景下按「本次实际选中的账号」判定，同一份请求发给国内版账号会被脱敏、
+    发给国际版账号则保持原文。
+    """
+    if not config.desensitize:
+        return body
+    if region_of_account(account).id == "global":
+        return body
+    return desensitize_body(body, roles=("system", "developer"))
 
 
 def log_usage(ctx, protocol, model_name, account, t0, status, err="", usage=None,

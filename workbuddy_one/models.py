@@ -1,10 +1,11 @@
 """模型目录服务：从上游动态拉取可用模型并缓存。
 
 参考 Sliverkiss 的 fetchDynamicModels：
-  - GET {backend}/console/enterprises/personal/models
+  - GET {backend}{catalog_path}（国内版 /console/enterprises/personal/models，
+    国际版 /v2/enterprises/personal/models，见 region.py）
   - 取 agents[] 中 name=="cli" 的模型 ID，过滤 disabled，附加上下文/最大输出元数据
   - 1h 正向缓存 + 5min 失败负缓存，避免反复打上游
-  - 拉取失败回退到静态默认列表
+  - 拉取失败回退到最后一份成功缓存
 """
 from __future__ import annotations
 
@@ -12,8 +13,8 @@ import logging
 import threading
 import time
 
-import httpx
 
+from . import net, region
 from .config import config
 
 logger = logging.getLogger("workbuddy_one.models")
@@ -66,6 +67,7 @@ class ModelRegistry:
         self._lock = threading.Lock()
         self._models: list[dict] | None = None   # [{id,name,context_length,max_output_tokens,reasoning}]
         self._reasoning: dict[str, dict] = {}    # model id → reasoning 配置（动态获取）
+        self._model_regions: dict[str, set[str]] = {}  # model id → 可用区域 id 集合
         self._fetched_at: float = 0.0
         self._last_fail: float = 0.0
         self._source: str = "static"   # 当前模型来源：dynamic=上游拉取, static=静态兜底
@@ -127,13 +129,17 @@ class ModelRegistry:
                 self._source = "dynamic" if self._models else "empty"
             logger.warning("模型拉取失败，%s", "保留上次缓存" if self._models else "无缓存可用")
             return self._fallback()
+        entries, model_regions = fetched
         with self._lock:
-            self._models = [m[0] for m in fetched]
-            self._reasoning = dict(m[1] for m in fetched if m[1])
+            self._models = [m[0] for m in entries]
+            self._reasoning = dict(m[1] for m in entries if m[1])
+            self._model_regions = model_regions
             self._fetched_at = time.time()
             self._last_fail = 0.0
             self._source = "dynamic"
-        logger.info("模型列表已刷新: %d 个", len(fetched))
+        logger.info("模型列表已刷新: %d 个（区域: %s）", len(entries),
+                    {r: sum(1 for v in model_regions.values() if r in v) for r in
+                     {x for v in model_regions.values() for x in v}})
         return [self._with_standard_fields(dict(m)) for m in self._models]
 
     def set_static(self) -> list[dict]:
@@ -152,6 +158,22 @@ class ModelRegistry:
         with self._lock:
             return dict(self._reasoning.get(model, {}))
 
+    def regions_for(self, model: str) -> set[str]:
+        """返回该模型**出现在哪些区域的目录里**。
+
+        空集表示「未知」（目录里没这个模型，或还没拉到目录）——调用方**不要**据此
+        过滤账号，保持原来的随机轮换，否则会让别名/新模型完全不可用。
+
+        ⚠️ 目录 ≠ 可用性（2026-09-20 真实双账号实测）：
+          - hy3-x / deepseek-v4-pro 只在国内版目录，国际版调用确实
+            400 code=11102 service info not found —— 区域路由的必要性成立；
+          - 但 auto（只在国内版目录）与 deep-model（只在国际版目录）在**另一区域
+            同样能正常调用**。
+        所以本方法的结果只适合做"提示/筛选"，不适合当作"能不能用"的判据去禁用模型。
+        """
+        with self._lock:
+            return set(self._model_regions.get(str(model or ""), set()))
+
     def max_output_tokens(self, model: str) -> int | None:
         """返回某模型的最大输出 token 上限（目录未知时 None，调用方不裁剪）。"""
         with self._lock:
@@ -167,6 +189,12 @@ class ModelRegistry:
         """返回某模型支持的思考强度档位（含 'off'，若可关闭思考）。
 
         供 reasoning 降级用；无动态数据时返回 None（调用方回退静态表）。
+
+        **onlyReasoning 模型不提供 off**：这类模型（如 auto、部分 DeepSeek 档位）
+        上游只产思维链，关掉思考等于语义冲突。即使目录同时写了
+        ``canDisableThinking: true`` 也不放开——目录字段的优先级低于 onlyReasoning
+        这个更强的语义约束（cli2api 的同类规则：catalog effort wins）。
+        客户端若仍请求 off，降级逻辑会把它抬到该模型的最低支持档。
         """
         with self._lock:
             cfg = self._reasoning.get(model)
@@ -175,8 +203,8 @@ class ModelRegistry:
         efforts = list(cfg.get("supportedEfforts") or [])
         if not efforts and cfg.get("defaultEffort"):
             efforts = [cfg["defaultEffort"]]
-        # 可关闭思考 → 追加 off（允许不思考）
-        if cfg.get("canDisableThinking") and "off" not in efforts:
+        # 可关闭思考 → 追加 off（允许不思考）；onlyReasoning 模型除外
+        if cfg.get("canDisableThinking") and not cfg.get("onlyReasoning") and "off" not in efforts:
             efforts.append("off")
         return efforts or None
 
@@ -185,20 +213,20 @@ class ModelRegistry:
         with self._lock:
             return [dict(m) for m in (self._models or [])]
 
-    def _fetch_from_upstream(self) -> list[dict] | None:
-        """从池中任一健康账号拉取模型列表。"""
-        account = self.pool.pick()
-        if account is None:
-            return None
+    def _fetch_one(self, account) -> list[tuple[dict, dict]] | None:
+        """从单个账号拉取其所在区域的模型目录。失败返回 None（并给该账号上冷却）。"""
         try:
             headers = account.mgr.get_headers()
-            headers.setdefault("Origin", f"https://{headers.get('X-Domain') or config.domain}")
-            headers.setdefault("Referer", f"https://{headers.get('X-Domain') or config.domain}/")
-            url = f"{config.backend}/console/enterprises/personal/models"
-            with httpx.Client(timeout=20, trust_env=False) as client:
+            domain = headers.get("X-Domain") or config.domain
+            # Origin/Referer 与模型目录路径都必须按区域选：国际版的 console 路径是
+            # OIDC 页面（302 跳 Keycloak / 认证后 500 HTML），国内版反之。
+            headers.setdefault("Origin", region.origin(domain))
+            headers.setdefault("Referer", region.origin(domain) + "/")
+            url = f"{region.chat_base(domain)}{region.catalog_path(domain)}"
+            with net.client(timeout=20) as client:
                 resp = client.get(url, headers=headers)
                 if resp.status_code != 200:
-                    logger.warning("models api status %d", resp.status_code)
+                    logger.warning("models api status %d (%s)", resp.status_code, account.uid)
                     self.pool.on_failure(account.uid, 60)
                     return None
                 data = resp.json()
@@ -224,20 +252,50 @@ class ModelRegistry:
             m = dyn.get(mid)
             if not m or m.get("disabled"):
                 continue
-            entry = self._entry(mid, m.get("name", mid),
-                                m.get("maxInputTokens") or 0, m.get("maxOutputTokens") or 0)
+            entry = self._entry(mid, m.get("name", mid), *_capacity(m))
             entry["reasoning"] = _extract_reasoning(m)
             entry.update(_extract_caps(m))
             out.append((entry, (mid, _extract_reasoning(m))))
-        if not out:
+        return out or None
+
+    def _fetch_from_upstream(self) -> tuple[list, dict[str, set[str]]] | None:
+        """按区域各取一个健康账号拉取目录，合并成并集。
+
+        国内外两个区域的模型集**大部分不重叠**（实测国际版 18 个 / 国内版 16 个，
+        交集仅 5 个）。只拉一个区域就当成全局目录会出事：目录里列了 A 模型，请求却被
+        路由到没有 A 的区域，上游返回 400（code=11102 service info not found）。
+
+        返回 (模型条目列表, {模型 id: 可用区域 id 集合})；后者供选号时按模型过滤账号。
+        """
+        by_region: dict[str, list] = {}
+        for acc in self.pool.accounts:
+            by_region.setdefault(acc.region_id, []).append(acc)
+
+        merged: dict[str, tuple[dict, dict]] = {}
+        model_regions: dict[str, set[str]] = {}
+        for rid in sorted(by_region):
+            acc = self.pool.pick(regions={rid})
+            if acc is None:
+                continue
+            fetched = self._fetch_one(acc)
+            if not fetched:
+                continue
+            for entry, meta in fetched:
+                mid = entry["id"]
+                model_regions.setdefault(mid, set()).add(rid)
+                merged.setdefault(mid, (entry, meta))
+
+        if not merged:
             return None
-        # 确保 "auto" 在列表里
-        if "auto" not in {x[0]["id"] for x in out}:
+        out = list(merged.values())
+        # 确保 "auto" 在列表里。auto 是用户最常手写的"随便挑一个"，且实测
+        # 两个区域都能调用（虽然国际版目录里并不列出它）——目录缺了它不该让它消失。
+        if "auto" not in merged:
             auto_entry = self._entry("auto", "Auto", 0, 0)
             auto_entry["reasoning"] = {"supportsReasoning": True, "onlyReasoning": True}
             auto_entry["modality"] = "text"
             out.insert(0, (auto_entry, ("auto", {"supportsReasoning": True, "onlyReasoning": True})))
-        return out
+        return out, model_regions
 
     @staticmethod
     def _with_standard_fields(entry: dict) -> dict:
@@ -272,6 +330,25 @@ class ModelRegistry:
     def _static_entries(self) -> list[dict]:
         """兼容保留（测试引用）：返回当前缓存，不再构造静态模型表。"""
         return self._fallback()
+
+
+def _capacity(row: dict) -> tuple[int, int]:
+    """从目录条目里取 (上下文长度, 最大输出) —— 只认正整数，缺省 0（表示未知）。
+
+    上游各区域/各版本的字段拼写不统一（camelCase 为主，偶有 snake_case），
+    挨个试一遍；非正整数（None/字符串/0/负数）一律视为「未提供」，因为 0 会让
+    ``max_output_tokens()`` 返回 None 从而不裁剪——正是我们想要的保守行为。
+    """
+    def _pick(*names: str) -> int:
+        for name in names:
+            value = row.get(name)
+            if type(value) is int and value > 0:
+                return value
+        return 0
+
+    ctx = _pick("maxInputTokens", "max_input_tokens", "context_window", "context_length")
+    out = _pick("maxOutputTokens", "max_output_tokens")
+    return ctx, out
 
 
 def _extract_reasoning(m: dict) -> dict:

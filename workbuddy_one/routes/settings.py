@@ -3,6 +3,9 @@ from __future__ import annotations
 
 from fastapi import FastAPI, HTTPException, Request
 
+from ..config import config
+from ..region import REGIONS
+
 
 def _mask_secret(s: str) -> str:
     """掩码密钥：保留前 4 位 + 末 4 位，中间用 *。"""
@@ -24,7 +27,21 @@ def _validate_hour_field(value, field_name: str) -> str:
 
 
 def register(app: FastAPI, ctx) -> None:
-    db = ctx.db
+    db, pool = ctx.db, ctx.pool
+
+    def _region_counts() -> list[dict]:
+        """账号池的区域分布：设置页要能让用户一眼看出"我现在有哪些区域的账号"。
+
+        区域由账号 auth 文件里的 domain 决定，用户不能直接改——这里只做统计展示。
+        """
+        counts: dict[str, int] = {}
+        for a in pool.all_accounts():
+            rid = str(a.get("region") or "cn")
+            counts[rid] = counts.get(rid, 0) + 1
+        return [
+            {"id": rid, "label": REGIONS[rid].label if rid in REGIONS else rid, "count": counts[rid]}
+            for rid in sorted(counts)
+        ]
 
     @app.get("/admin/settings")
     def admin_get_settings():
@@ -48,6 +65,15 @@ def register(app: FastAPI, ctx) -> None:
             "alert_expiry_days": s.get("alert_expiry_days", "3"),
             # 模型别名映射（每行一条：别名=真实模型）
             "model_aliases": s.get("model_aliases", ""),
+            # 区域与网络：DB 值（用户设过的）与环境变量值分开返回——
+            # 前端才能显示"你没设过，当前生效的是环境变量里的 XXX"，而不是误导成空。
+            "regions": _region_counts(),
+            "backend": s.get("backend", ""),
+            "proxy": s.get("proxy", ""),
+            "workbuddy_exe": s.get("workbuddy_exe", ""),
+            "env_backend": config.backend,
+            "env_proxy": config.proxy,
+            "env_workbuddy_exe": config.workbuddy_exe,
         }
 
     @app.post("/admin/settings")
@@ -133,6 +159,24 @@ def register(app: FastAPI, ctx) -> None:
                 # 否则忽略（不覆盖）
             else:
                 db.save_settings(aa_api_key=aa_key)
+        if "backend" in body:
+            v = str(body.get("backend") or "").strip().rstrip("/")
+            if v and not v.startswith(("http://", "https://")):
+                raise HTTPException(status_code=400, detail={"error": {"message":
+                    "BACKEND 需为 http:// 或 https:// 开头的地址；留空表示按账号区域自动选择（推荐）"}})
+            db.save_settings(backend=v)
+        if "proxy" in body:
+            v = str(body.get("proxy") or "").strip()
+            if v and not v.startswith(("http://", "https://", "socks5://", "socks5h://")):
+                raise HTTPException(status_code=400, detail={"error": {"message":
+                    "PROXY 需为 http:// / https:// / socks5:// 开头的地址；留空表示直连"}})
+            db.save_settings(proxy=v)
+        if "workbuddy_exe" in body:
+            # 允许直接粘贴带引号的 Windows 路径（用户从资源管理器复制出来的样子）
+            db.save_settings(workbuddy_exe=str(body.get("workbuddy_exe") or "").strip().strip('"'))
+        # 这三项是"每次调用现读"的（区域判定 / 出站客户端 / 解密探测），
+        # 所以保存后立刻重载覆盖即可生效，不需要重启进程。
+        config.load_overrides(db.get_settings())
         # 设置已存入 DB，调度器下个周期自动生效；响应结构与 GET 一致（不回明文 key）
         resp = dict(admin_get_settings())
         resp["ok"] = True

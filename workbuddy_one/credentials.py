@@ -6,15 +6,19 @@ Phase 2 将增加浏览器 OAuth 登录 + 自动降级。
 from __future__ import annotations
 
 import json
+import logging
 import os
 import sys
 import threading
 import time
 from pathlib import Path
 
-import httpx
 
+from . import atrest, net
 from .config import config
+from .region import Region, chat_base, detect_region
+
+logger = logging.getLogger("workbuddy_one.credentials")
 
 # 项目 auths/ 目录（--login / 上传 / 扫码登录 的落盘位置），锚定到包根目录
 # 而非进程 cwd，避免启动目录不同导致重启后扫描不到已落盘的 auth 文件。
@@ -58,6 +62,11 @@ class CredentialManager:
         self._lock = threading.Lock()
         self._cached: dict | None = None
         self._mtime: float = 0.0
+        # $wbEncrypted 支持（WorkBuddy 5.6.0+ 加密登录态）：
+        #   _file_encrypted —— 磁盘上的文件是否含加密信封（决定能否回写，见 _refresh）
+        #   _decrypt_mtime  —— 上次尝试解密的 mtime（同一版本只试一次，避免每请求起子进程）
+        self._file_encrypted: bool = False
+        self._decrypt_mtime: float | None = None
 
     def _read_raw(self) -> dict:
         with open(self.path, "r", encoding="utf-8") as f:
@@ -71,6 +80,24 @@ class CredentialManager:
         if self._cached is None or mt != self._mtime:
             self._cached = self._read_raw()
             self._mtime = mt
+            # 记录磁盘原始形态：加密文件绝不被我们改写成明文（见 _refresh）
+            self._file_encrypted = atrest.is_encrypted(self._cached)
+
+    def _ensure_decrypted(self) -> None:
+        """确保内存里的登录态可用；加密且解不开时抛 EncryptedAuthError。
+
+        为什么必须显式抛：加密后 ``accessToken`` 是 dict，直接拼 ``Bearer {dict}``
+        会发出一个必然 401 的请求，而读不到 ``expiresAt`` 又会被误判成「token 过期」
+        进而尝试刷新——症状是「莫名其妙登录失效」，排查成本极高。
+        """
+        s = self._session()
+        if not atrest.is_encrypted(s):
+            return
+        if self._decrypt_mtime != self._mtime:
+            self._decrypt_mtime = self._mtime
+            atrest.decrypt_session(s)
+        if atrest.envelope_fields(s):
+            raise atrest.encrypted_auth_error(self.path)
 
     def _session(self) -> dict:
         self._load_if_stale()
@@ -83,12 +110,46 @@ class CredentialManager:
         expires_at = (s.get("auth") or {}).get("expiresAt") or 0
         return time.time() * 1000 >= (expires_at - 60_000)
 
+    @property
+    def domain(self) -> str:
+        """账号所属域名（取自 auth 文件的 auth.domain，缺失或读不出时回落 config.domain）。
+
+        国际版账号的 auth 文件里 domain 是 www.workbuddy.ai，据此可判定区域；
+        国内版是 www.codebuddy.cn。整个区域适配都建立在这个字段上，
+        所以它是唯一权威来源，不额外引入配置项。
+        """
+        try:
+            s = self._session()
+        except Exception:  # noqa: BLE001  仅用于展示/路由，读不出不抛
+            return config.domain
+        return (s.get("auth") or {}).get("domain") or config.domain
+
+    @property
+    def region(self) -> Region:
+        """账号所属区域（国内版 / 国际版）。"""
+        return detect_region(self.domain)
+
+    def encrypted_fields(self) -> list[str]:
+        """当前仍处于 $wbEncrypted 加密状态的字段路径（能解密时为空）。
+
+        刻意不触发解密：这是给 WebUI 做状态展示用的，不该让一次列表请求去起子进程。
+        真正需要 token 的路径（get_headers）才会解密。
+        """
+        try:
+            return atrest.envelope_fields(self._session())
+        except Exception:  # noqa: BLE001  仅用于展示，读不出不抛
+            return []
+
     def _build_headers_from(self, auth: dict, account: dict) -> dict:
         domain = auth.get("domain") or config.domain
+        token = auth.get("accessToken")
+        if not isinstance(token, str):
+            # 加密信封（或任何非字符串）：绝不能拼进 Authorization 头
+            raise atrest.encrypted_auth_error(self.path)
         h = {
             "Content-Type": "application/json",
             "Accept": "application/json",
-            "Authorization": f"Bearer {auth.get('accessToken','')}",
+            "Authorization": f"Bearer {token}",
             "X-User-Id": account.get("uid", ""),
             "X-Enterprise-Id": account.get("enterpriseId", ""),
             "X-Tenant-Id": account.get("enterpriseId", ""),
@@ -104,8 +165,8 @@ class CredentialManager:
         headers = self._build_headers_from(auth, account)
         headers["X-Refresh-Token"] = auth.get("refreshToken", "")
         headers["X-Auth-Refresh-Source"] = "plugin"
-        url = f"{config.backend}/v2/plugin/auth/token/refresh"
-        with httpx.Client(timeout=15, trust_env=False) as c:
+        url = f"{chat_base(self.domain)}/v2/plugin/auth/token/refresh"
+        with net.client(timeout=15) as c:
             r = c.post(url, headers=headers, json={})
             try:
                 data = r.json()
@@ -123,6 +184,12 @@ class CredentialManager:
         if not new_auth.get("refreshExpiresAt") and new_auth.get("refreshExpiresIn"):
             new_auth["refreshExpiresAt"] = int(time.time() * 1000) + new_auth["refreshExpiresIn"] * 1000
         s["auth"] = new_auth
+        # 加密登录态不回写：官方客户端用 $wbEncrypted 落盘，我们写回明文可能让客户端
+        # 认不出自己的登录态。刷新结果只留在内存里，下次读到磁盘仍会重新解密。
+        if self._file_encrypted:
+            logger.info("auth 文件为 $wbEncrypted 加密格式，刷新结果仅保留在内存、不回写：%s", self.path)
+            self._cached = s
+            return
         # 原子写回
         tmp = self.path.with_suffix(self.path.suffix + ".tmp")
         with open(tmp, "w", encoding="utf-8") as f:
@@ -133,6 +200,7 @@ class CredentialManager:
 
     def get_headers(self) -> dict:
         with self._lock:
+            self._ensure_decrypted()
             if self._is_expired():
                 self._refresh()
             s = self._session()
@@ -142,6 +210,7 @@ class CredentialManager:
         """强制刷新 token（保活用）。成功返回 True；session 失效等失败返回 False。"""
         with self._lock:
             try:
+                self._ensure_decrypted()
                 self._refresh()
                 return True
             except Exception:  # noqa: BLE001
@@ -152,9 +221,18 @@ class CredentialManager:
         auth = s.get("auth") or {}
         acct = s.get("account") or {}
         exp = auth.get("expiresAt", 0)
+        region = self.region
+        encrypted = atrest.envelope_fields(s)
         return {
             "uid": acct.get("uid"),
             "nickname": acct.get("nickname"),
             "enterprise_id": acct.get("enterpriseId"),
             "token_expired": self._is_expired(),
+            # 区域信息（供 WebUI 区分国内版/国际版账号）
+            "domain": auth.get("domain") or config.domain,
+            "region": region.id,
+            "region_label": region.label,
+            # $wbEncrypted 加密登录态（WorkBuddy 5.6.0+）：非空表示该账号当前不可用
+            "auth_encrypted": bool(encrypted),
+            "auth_encrypted_fields": encrypted,
         }

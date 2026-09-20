@@ -17,6 +17,17 @@ export interface AccountInfo {
   checkin_today?: boolean
   /** 账号来源：project=项目 auths/（上传/扫码），local=本机 CodeBuddy 目录 */
   source?: 'project' | 'local' | 'unknown'
+  /** 账号所属域名（取自 auth 文件里的 auth.domain），区域判定的唯一来源 */
+  domain?: string
+  /** 区域 id：cn=国内版 / global=国际版 */
+  region?: 'cn' | 'global'
+  /** 区域显示名（"国内版" / "国际版"），由后端给出，避免前端重复维护映射 */
+  region_label?: string
+  /**
+   * $wbEncrypted 加密登录态的字段名列表（如 ["accessToken","refreshToken"]）。
+   * 非空表示该账号当前**不可用**——桌面端 5.6.0+ 加密了凭据，本机解不开。
+   */
+  auth_encrypted_fields?: string[]
 }
 
 export interface Settings {
@@ -44,6 +55,29 @@ export interface Settings {
   alert_expiry_days?: string
   /** 模型别名映射原文（每行一条：别名=真实模型） */
   model_aliases?: string
+
+  // ---- 区域与网络 ----
+  // 这三项以前只能改环境变量，现在可在 WebUI 设置；DB 值优先于环境变量，
+  // 留空表示"回落环境变量 / 自动判定"。
+  /** 账号池区域分布（只读，由后端按账号统计） */
+  regions?: RegionCount[]
+  /** BACKEND：留空 = 按账号 auth.domain 自动选区域（推荐） */
+  backend?: string
+  /** PROXY：留空 = 直连 */
+  proxy?: string
+  /** WORKBUDDY_EXE：留空 = 按平台默认位置探测官方客户端 */
+  workbuddy_exe?: string
+  /** 环境变量里已有的值（只读提示，避免用户误以为"没配置"） */
+  env_backend?: string
+  env_proxy?: string
+  env_workbuddy_exe?: string
+}
+
+/** 账号池的区域分布（设置页展示用） */
+export interface RegionCount {
+  id: string
+  label: string
+  count: number
 }
 
 export interface ModelReasoning {
@@ -81,6 +115,11 @@ export interface ModelInfo {
   top_p?: number
   vendor?: string
   description?: string
+  /**
+   * 可用区域（**基于当前账号池**拉到的目录，不是模型本身的归属）：
+   * ["cn"] / ["global"] / ["cn","global"]；空数组 = 未知（目录里没这个模型，或还没拉到）。
+   */
+  regions?: string[]
   /** AA 评测数据（可选） */
   benchmark?: AABenchmark
 }

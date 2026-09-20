@@ -68,6 +68,7 @@ Workbuddy2API/
 │   │   ├── sse.py            # SSE 增量解析/Chat 行清洗/流式心跳（pump+队列）
 │   │   └── errors.py         # 错误响应构造（safe_err/json_error/err_anthropic/conv_usage）
 │   ├── upstream.py           # 上游转发：白名单构造 body、SSE 流、非流式聚合、共享 AsyncClient
+│   ├── region.py             # 区域适配：国内版/国际版的 host、模型目录路径、Origin 差异表
 │   ├── pool.py               # 账号池：加权随机选号（快到期优先 + 额度/成功率/闲置/优先级因子）、冷却
 │   ├── db.py                 # SQLite 层：4 张表 CRUD、版本化迁移框架、用量统计聚合
 │   ├── scheduler.py          # asyncio 后台循环（每 60s）：签到/保活/模型刷新/AA 刷新/每日清理
@@ -103,7 +104,7 @@ Workbuddy2API/
 # 一切命令在 Workbuddy2API/ 目录下执行；Python 一律用 venv 解释器
 cd N:\代码\workbuddy2Api\Workbuddy2API
 
-# 跑测试（unittest，不是 pytest；56 个必须全绿）
+# 跑测试（unittest，不是 pytest；182 个必须全绿）
 .\.venv\Scripts\python.exe -m unittest discover -s tests
 
 # 本地起服务（开发调试用）
@@ -128,7 +129,7 @@ docker compose up -d --build --force-recreate
 3. **请求路径禁止同步网络请求**：`/v1/*` 和 `/admin/overview`、`/admin/models` 等高频端点只读缓存（`*_cached()`），上游数据一律由 scheduler 预热或专用 refresh 端点触发。历史教训：曾因请求路径同步拉上游导致概览页 6 秒才开。
 4. **async 路由里禁止阻塞调用**：同步 httpx.Client、大文件 IO、重 CPU 一律 `await asyncio.to_thread(...)`。（`def` 同步路由 FastAPI 自动放线程池，不受此限。）
 5. **DB 结构改动必须走迁移框架**：`db.py` 里 `SCHEMA_VERSION +1` + `_MIGRATIONS` 追加幂等迁移函数，禁止直接改 CREATE TABLE 期望生效。启动时版本升级前会自动备份旧库到 `data/backups/`（保留 5 份）；索引统一由 `_ensure_indexes` 在迁移补列后创建——不要把 CREATE INDEX 写回建表脚本（极老库缺列会直接打不开）。
-6. **settings 表有白名单**：`db.save_settings` 只接受 `DEFAULT_SETTINGS` 里的 key；加新配置项要同步改 `DEFAULT_SETTINGS`、`admin_get_settings`、`admin_save_settings` 三处。
+6. **settings 表有白名单**：`db.save_settings` 只接受 `DEFAULT_SETTINGS` 里的 key；加新配置项要同步改 `DEFAULT_SETTINGS`、`admin_get_settings`、`admin_save_settings` 三处。**漏登记会被静默丢弃**（`save_settings` 不报错、值就是不入库）——`keepalive_enabled` 就踩过这个坑：WebUI 保存"每日 token 保活"开关后值没落库，界面永远显示"开启"、实际改不动。新增设置项务必补一条 `TestSettingsWhitelist` 用例。
 7. **错误信息面向用户**：HTTPException 的 message 用中文说清楚"发生了什么 + 用户该做什么"。
 8. **新逻辑按域落位，不回堆 app.py**：路由进 `routes/<域>.py`（register(app, ctx) 签名），
    与路由解耦的可复用逻辑进 `gateway/`（函数首参 GatewayContext）；新文件里的
@@ -145,6 +146,18 @@ docker compose up -d --build --force-recreate
 - **冷却分档**（`_cooldown_for`）：429→300s，401/403→1800s，5xx→120s，其余 60s。调数值可以，删机制不行。
 - **鉴权双轨**：API Key 只存 sha256（`apps` 表）用于校验；`key_enc` 存可逆加密（`_crypto.py`）仅用于 WebUI「查看 Key」功能。主密钥 `data/.secret_key` 丢了则所有 Key 不可还原。
 - **admin 鉴权**：`_security` 中间件 = Host 头回环白名单（防 DNS rebinding）+（可选）ADMIN_TOKEN。无 token 时仅回环可访问管理端（已兼容 Docker 端口映射场景）。**不要放宽**。
+- **区域必须成对走对**（`region.py`）：国内版 = `copilot.tencent.com` + `/console/enterprises/personal/models` + Origin `www.codebuddy.cn`；国际版 = `www.workbuddy.ai` + `/v2/enterprises/personal/models` + Origin `www.workbuddy.ai`。三者**不可交叉混用**——国际版打 console 路径会落到 OIDC 页面（302/500 HTML）。区域唯一来源是 auth 文件里的 `auth.domain`，不要引入第二套判定。新增任何出站请求都要用 `region.*(domain)` 取 host/路径，不要直接写死或直接用 `config.backend`（要用 `config.backend_effective`——它才包含 WebUI 里设的覆盖值；`BACKEND` 只是全局覆盖逃生口，默认为空）。
+- **脱敏按区域开关**（`apply_desensitize`）：反审核零宽空格只在国内版账号上施加，国际版没有内容审核、注入只会降低 system prompt 保真度。脱敏必须放在**选号之后**（`open_upstream` 里），不能放回 `enhance_body`——那里账号还未知。
+- **模型 → 区域必须匹配**（混池核心）：两个区域的模型集**大部分不重叠**（实测国际版 18 个 / 国内版 16 个，交集仅 5 个），跨区域用区域专属模型上游会 400（`code=11102 service info not found`）。因此：`models.py` 按区域**分别拉取再合并**并记录 `_model_regions`（模型 → 可用区域集合），`acquire_account` 用 `model_regions()` 把候选账号收敛到正确区域。`regions_for()` 返回**空集表示未知**，此时不要限制区域（否则别名/新模型会直接不可用）；`pool.pick(regions=...)` 在指定区域内无账号时也会**退回不过滤**。
+- **区域判定用后缀匹配，不用子串包含**（`region.host_of` + `_match_suffix`）：`workbuddy.evil.com` 这类仿冒域绝不能被判成国际版。判定前先把 domain 归一化成裸 host（去 scheme / 端口 / 路径 / 大小写），因为不同客户端落盘格式不统一。未知域名一律回落国内版（保持老部署行为）。
+- **加密登录态必须显式报错，不能静默**（`atrest.py` + `credentials.py`）：WorkBuddy 桌面端 5.6.0+ 把 `accessToken`/`refreshToken`/昵称/手机号加密成 `{"$wbEncrypted":1,"envelope":"..."}` 信封。此时 `accessToken` 是 dict——直接拼 `Bearer {dict}` 会发出必然 401 的请求，而读不到 `expiresAt` 又会被误判成「token 过期」进而刷新，症状是「莫名登录失效」，排查成本极高。所以：`_ensure_decrypted()` 在取 token 前拦截，解不开就抛 `EncryptedAuthError`；`_build_headers_from` 里再兜一道（token 非 str 即抛）。**加密文件绝不回写**（`_refresh` 里 `_file_encrypted` 短路）——写回明文可能让官方客户端认不出自己的登录态。
+- **onlyReasoning 模型不提供 off 档**（`models.reasoning_efforts`）：这类模型（`auto`、部分 DeepSeek 档位）上游只产思维链，关掉思考是语义冲突。即使目录同时写了 `canDisableThinking: true` 也不放开——**目录字段优先级低于 onlyReasoning 这个更强的语义约束**。客户端仍请求 `off`/`none` 时，降级逻辑会抬到该模型最低支持档。
+- **测试临时目录必须落在系统临时目录**（`tempfile.mkdtemp()`，不要 `dir=tests/_tmp`）：仓库可能位于网络盘，而**网络盘没有回收站**，删除会退化成失败的 `SHFileOperationW`，实测单次 `rmtree` 要 11~36 秒——整套测试会从 1.2 秒涨到 139 秒。测试不该依赖仓库所在盘符，也不该往仓库里写垃圾。
+- **11128 判的是「第一条消息」，不是「有没有 system」**（`reasoning.ensure_leading_system`）：判据必须是 `msgs[0].role == "system"`，**不能**写成 `any(role == system)`——客户端发 `[user, system]` 这种把 system 放后面的顺序时，「存在即不补」会让上游照样 400（对齐参考实现 Buddy2api v2.1.13 的 issue #75 修复）。补的是**空** system，对两个区域都无害。
+- **非流式聚合必须拿到明确完成标记，不伪造 `stop`**（`upstream.collect_upstream`）：实测上游正常完成时**一定**同时发 `finish_reason` 与 `[DONE]`。所以「既无 `[DONE]` 也无 `finish_reason`」或「有 `[DONE]` 但始终没有 `finish_reason`」都判为异常流并返回 502。**不要**退回 `finish_reason or "stop"`——那会把截断的半截回答伪装成正常完成，客户端的重试/降级策略永不触发，观测上也看不出上游出过问题。有 `tool_calls` 却缺 `finish_reason` 时补 `"tool_calls"`（比 `"stop"` 准确）；明确的 `finish_reason` 之后直接 EOF 仍接受。
+- **出站 HTTP 客户端一律走 `net.py`**（`net.client()` / `net.async_client()`）：不要在新代码里直接写 `httpx.Client(...)`。默认 `trust_env=False` 是刻意的——httpx 会读 `HTTP_PROXY`/`ALL_PROXY` 等环境变量，Docker/CI 里这些值经常无效或指向内网，会让本该直连的请求解析出坏代理（症状是「莫名全部超时」）。需要代理时用 `PROXY`（环境变量或 WebUI 设置）**显式**指定，而不是放开 `trust_env` 去赌环境变量干不干净。
+- **模型目录 ≠ 模型可用性**（`models.regions_for` 的边界）：`_model_regions` 记录的是「该模型**出现在哪些区域的目录里**」，**不是**「它在哪些区域能调用」。2026-09-20 真实双账号实测：`hy3-x` / `deepseek-v4-pro` 只在国内版目录、国际版调用确实 400 `11102 service info not found`（区域路由的必要性成立）；但 `auto`（只在国内版目录）与 `deep-model`（只在国际版目录）在**另一区域同样能正常调用**。因此前端**只能**把它当提示/筛选条件，**绝不能**据此把模型置灰或禁用——那会错误地劝退能用的模型。要判断"能不能用"只能实际发一次请求。
+- **部署级配置可在 WebUI 覆盖，DB 值优先于环境变量**（`config.OVERRIDABLE` = `backend` / `proxy` / `workbuddy_exe`）：取值一律走 `config.backend_effective` / `proxy_effective` / `workbuddy_exe_effective`，**不要**直接读 `config.backend` 等原始字段（那只是环境变量默认值，不含 WebUI 设置）。空字符串严格等于"未设置"→ 回落环境变量，这样"在界面上清空"的语义单一、不会出现"空值覆盖了环境变量"的歧义。载入点在 `app.py:create_app`（必须在建账号池之前，区域判定依赖 BACKEND）与 `admin_save_settings` 末尾（保存后立刻重载，无需重启）。
 
 ---
 
@@ -179,7 +192,7 @@ docker compose up -d --build --force-recreate
 
 ## 10. 改完之后的自检清单
 
-1. `.\.venv\Scripts\python.exe -m unittest discover -s tests` → **56 个全绿**（现有基线，不允许变红）。
+1. `.\.venv\Scripts\python.exe -m unittest discover -s tests` → **170 个全绿**（现有基线，不允许变红）。
 2. 改了 `.py` → 重启 uvicorn；改了前端 → `pnpm build` + 强刷浏览器。
 3. WebUI 六页人工过一遍：概览（卡片/趋势图/最近记录）、账号（列表/签到/设置弹窗/扫码）、模型（列表/AA 指标）、用量、应用（Key 查看）、使用记录（筛选/详情/CSV 导出）。
 4. 冒烟一条真实请求：`POST /v1/chat/completions`（带某应用 Key），确认使用记录页出现新条目、tokens/积分正常。
@@ -190,9 +203,29 @@ docker compose up -d --build --force-recreate
 
 ## 11. 当前状态速览（2026-09 快照）
 
-- 版本 0.4.1；56 个测试全绿；本地 8787 端口跑 uvicorn（Docker 部署需用户重建镜像）。
+- 版本 0.4.1；182 个测试全绿；本地 8787 端口跑 uvicorn（Docker 部署需用户重建镜像）。
 - `CODE_REVIEW_TODO.md` 的 P0×4 / P1×4 / P2×11 已全部修复完成（每条带实现备注）；P3×10 打磨项仍开放，可做可跳过。后续问题登记在它后面，按优先级做。
 - 已吸收参考项目更新：developer 角色归一（防上游 11128）、DeepSeek thinking 注入与多轮 reasoning_content 回填、deepseek-v4.1-flash 档位（均见 `reasoning.py`）。
 - 第二轮吸收（2026-09-14，Sliverkiss #28/#31/#165 等）：限流文案识别 + 6004/11140「将在…重置」墙钟精确冷却（`gateway/errors.py` + `cooldown_for_error`）；DeepSeek 回填门控对齐官方 thinkingEnabled||hasTrace；非流式聚合空流哨兵 502 + sawDone 截断丢残缺 tool_calls（`upstream.py`）；会话粘性路由（`gateway/session.py`，多账号保 prompt cache）；auths 目录热加载（scheduler 指纹 + app.py `_reload_auths`）。
 - 已上线新功能批次：积分预警 webhook（settings: alert_*）、账号 disabled_reason、记录内容搜索（usage_recent search）、流式心跳（`_with_keepalive`）、每周备份、签到失败重试、模型别名（settings: model_aliases）。
 - 上游模型 15 个（动态拉取），AA 评测 11 个有数据；账号 1 个（支持多账号，见 `pool.py`）。
+- **新增区域适配（2026-09-20）**：支持 WorkBuddy 国际版，国内版/国际版可混池。差异集中在 `region.py`；host 按账号 `auth.domain` 自动选（`BACKEND` 留空即可）。改动覆盖 chat 转发、token 刷新、模型目录、额度/签到、扫码登录（`--region` / `/admin/oauth/start?region=`）、脱敏按区域开关、无 system 时补空 system（防国际版 11128）、**模型→区域路由**（`/v1/models` 输出两区域并集，选号按模型收敛区域）。国内版路径行为与改动前逐字一致。测试 74 → 122（新增 `tests/test_region.py`）。
+  - 实测结论（真实账号）：国际版 chat / 模型目录（18 个）/ 额度（350）全部打通；国际版**硬校验** `code=11128 first message is not system prompt`，没有空 system 兜底会被直接拒绝；`auto` 两区域都支持；`gpt-5.4` 是 `onlyReasoning` 纯思考模型（小 max_tokens 会导致 content 为空，属正常）。
+  - 顺带修复 `tests/test_core.py::test_migrate_old_schema` 的幂等性缺陷（清理代码在 `try` 内、而失败语句在 `try` 之前，残留 `old_schema.db` 会让该测试永久报错并污染后续整轮运行）；两个测试模块补 `setUpModule()` 清理 `_tmp/*.db*`。
+- **第三轮吸收参考项目更新（2026-09-20）**：拉取 `ReferenceProject/` 中 3 个有更新的上游（Buddy2api v2.1.5→v2.1.13、cli2api v0.3.7→v0.6.4、workbuddy-account-hub v0.5.35→v0.6.7），吸收以下能力（测试 122 → **170**，全绿约 1.3 秒）：
+  - **`$wbEncrypted` 加密登录态支持**（新增 `workbuddy_one/atrest.py`）：检测 + 官方 exe 解密 + 明确报错 + 加密文件不回写。来源 workbuddy-account-hub v0.6.6/v0.6.7。这是**前向兼容**项：当前本机 auth 文件仍是明文（CodeBuddy 扩展落盘），但桌面端 5.6.0+ 会加密。解密脚本逐行取自参考实现（AAD 拼装顺序**不要凭记忆改动**），跑在官方 exe 的 node 模式里，密钥不落盘。`WORKBUDDY_EXE` 可显式指定客户端路径。
+  - **区域判定加固**：`detect_region` 由子串包含改为**规范化 host + 后缀匹配**（来源 Buddy2api `fingerprint.py`），堵掉 `workbuddy.evil.com` 误判。
+  - **容量字段多拼写兼容**（来源 Buddy2api `model_capacity.py`）：`max_input_tokens`/`context_window`/`context_length` 等别名都认，只取正整数；`max_tokens` 与 `max_completion_tokens` **都**按模型上限裁剪。
+  - **onlyReasoning 锁定**（来源 cli2api 的设计规则）：`reasoning_efforts` 不再给 onlyReasoning 模型追加 `off`；`none` 与 `off` 同义归到 0 档。
+  - **测试临时目录改用系统临时目录**：修掉 N: 网络盘无回收站导致 `rmtree` 单次耗时 11~36 秒的问题，整套测试 **139 秒 → 1.2 秒**；`tests/_tmp/` 已不再被任何测试使用（目录已删除，`.gitignore` 条目保留无害）。
+  - **11128 首条判定修正**：`ensure_leading_system` 由「消息里存在 system 就不补」改为「第一条不是 system 就补」（来源 Buddy2api v2.1.13 issue #75）。原实现遇到 `[user, system]` 会漏补、仍被上游 400。
+  - **非流式聚合完成标记校验**：不再 `finish_reason or "stop"` 伪造完成；无 `[DONE]` 且无 `finish_reason` → 502（来源 Buddy2api v2.1.11 `078be89`）。已用真实账号实测：`glm-5.2`→`stop`、`auto`→`length`，无误判。
+  - **出站代理支持 + 客户端构造收敛**（新增 `workbuddy_one/net.py`）：11 处散落的 `httpx.Client(trust_env=False)` 收敛为 `net.client()` / `net.async_client()`；新增 `PROXY` 环境变量（默认空=直连）。来源 cli2api `b69c60f`。此前项目**完全没有代理能力**（`trust_env=False` 写死）。
+  - 未采纳：cli2api 的 `deepseek-v4.1-flash → deep-model` 硬编码别名 bug（本项目无此别名，是用户自定义的 `model_aliases`）；Buddy2api 的 WorkBuddy 目录只读化、多 provider（Qoder/Devin/Trae）架构（与本项目单 provider 定位不符）；Buddy2api 的 `_BUILTIN_ALIASES`（把 `gpt-4o`/`claude-sonnet-4` 自动映射到 WorkBuddy 模型——属"魔法映射"，与本项目"不展示带错误元数据的过时清单"的诚实取向冲突，且用户已有可配置别名）；Buddy2api 的流失败分类码（`upstream_http`/`parse_error` 等，属观测增强，价值低于本轮其他项，留作后续）。
+- **第四轮：区域的操作可见性（2026-09-20）**：区域判定后端早就全自动，但**前端一处都没接**，导致国际版在 WebUI 里"加不进来也看不出来"。本轮把判定结果显性化（测试 170 → **182**）：
+  - **账号页加「区域」列**：国内版（蓝）/ 国际版（紫）标签，悬浮显示原始 domain。数据来自 `pool.all_accounts()` 早已返回的 `region` / `region_label` / `domain`，此前前端类型里根本没有这几个字段。
+  - **加密登录态显性化**：`auth_encrypted_fields` 非空时状态列显示「登录态已加密」（排在冷却之前——冷却会自愈、加密不会），并在列表顶部给出整体告警与解决办法。此前这种账号会被误显示成「token 过期」，用户会反复点"刷新额度"却永远无效。
+  - **扫码登录加区域选择**（**P0 关键**）：此前 `api.oauthStart()` 不传 `region` → 永远打国内版控制面，**国际版账号在 WebUI 里根本加不进来**。现在弹窗顶部可选国内版/国际版（默认国内版），并把 `start` 返回的 `region` 回传给 `status`（两次调用必须打同一控制面）。
+  - **模型页标区域 + 软筛选**：`/admin/models` 每条补 `regions`，另返回 `pool_regions`（账号池实际拥有的区域）。卡片显示「双区域 / 仅国内版目录 / 仅国际版目录」角标，不在账号目录内的加「账号目录外」提示 + 工具栏「只看账号目录内的模型」复选框。**刻意不做置灰/禁用**（理由见第 6 节「模型目录 ≠ 模型可用性」）。
+  - **设置页加「区域与网络」卡片**：展示账号池区域分布；`BACKEND` / `PROXY` / `WORKBUDDY_EXE` 从纯环境变量提升为可覆盖项（DB 优先于 env，保存后立刻重载生效）。此前用户完全不知道这三个开关存在。弹窗标题由「自动签到设置」改为「设置」——它早就装下了定时任务/预警/别名/AA Key，旧名字名不副实。
+  - **顺带修复**：`keepalive_enabled` 漏登记在 `DEFAULT_SETTINGS` 白名单里，导致 WebUI 保存"每日 token 保活"开关被 `save_settings` **静默丢弃**（界面永远显示"开启"、实际改不动）。补 `TestSettingsWhitelist` 用例守住。

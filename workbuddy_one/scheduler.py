@@ -11,9 +11,8 @@ import time
 from datetime import datetime
 from pathlib import Path
 
-import httpx
 
-from . import billing
+from . import billing, net
 from .pool import AccountPool
 
 logger = logging.getLogger("workbuddy_one.scheduler")
@@ -365,7 +364,7 @@ class Scheduler:
                 payload = {"msg_type": "text", "content": {"text": f"{title}\n{body}"}}
             else:  # Bark 与通用 JSON webhook 均接受 {"title","body"}
                 payload = {"title": title, "body": body}
-            async with httpx.AsyncClient(timeout=10, trust_env=False) as client:
+            async with net.async_client(timeout=10) as client:
                 resp = await client.post(url, json=payload)
             if resp.status_code >= 400:
                 logger.warning("webhook 推送失败 HTTP %d: %s", resp.status_code, resp.text[:200])

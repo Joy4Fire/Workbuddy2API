@@ -12,6 +12,8 @@ A self-built implementation that combines the strengths of several existing Work
 
 - 🔌 **Three protocols** — OpenAI Chat (`/v1/chat/completions`), OpenAI Responses (`/v1/responses`), Anthropic Messages (`/v1/messages`), unified and forwarded to Tencent `/v2/chat/completions`
 - 🔐 **Dual auth** — reads local auth files (desktop CodeBuddy dir + project `auths/`) + browser QR/OAuth login, multi-account management
+- 🌏 **CN / Global dual region** — routed per account from the `domain` field in its auth file (CN `copilot.tencent.com` / Global `www.workbuddy.ai`); host, catalog path and Origin switch together, and accounts from both regions can share one pool. **The region is visible everywhere**: account list shows it, QR login lets you pick it, the model page tags catalog membership and can filter to "in my accounts' catalogs only", and Settings shows the region breakdown
+- 🔓 **Encrypted auth support** — desktop 5.6.0+ stores tokens as `$wbEncrypted` envelopes; the gateway detects them and decrypts via the official client (`WORKBUDDY_EXE` to point at it), failing with a clear error instead of a silent "logged out", and **never writes back** the original auth file
 - 🔄 **Multi-account rotation** — rotation, credit-aware, cooldown, failover; resists hotspots and bans
 - ⏰ **Auto check-in** — daily scheduled credit check-in (auto check-in on login, deduplicated per day)
 - 🗂 **Dynamic model catalog** — pulls available models from upstream daily (configurable refresh), falls back to a static table; `/v1/models` exposes OpenAI standard fields (`vision`/`modalities`, etc.)
@@ -85,7 +87,10 @@ Set via environment variables, or copy as `.env`:
 | `ADMIN_TOKEN` | empty | Auth token for admin API / WebUI. Empty = loopback-only |
 | `AUTH_DIR` | auto | Local auth file dir (auto-detected when empty) |
 | `DB_PATH` | `data/workbuddy.db` | SQLite database file |
-| `BACKEND` | `https://copilot.tencent.com` | Tencent backend |
+| `BACKEND` | empty (auto) | Upstream host. Empty = pick region from each account's `auth.domain`; set = force every account onto one host |
+| `DOMAIN` | `www.codebuddy.cn` | Fallback domain when an auth file has no `domain` (also decides the default region = China) |
+| `WORKBUDDY_EXE` | auto-detect | Path to the official client, used only to decrypt `$wbEncrypted` auth |
+| `PROXY` | empty (direct) | Outbound proxy (`http://` / `socks5://`). `HTTP_PROXY`-style env vars are deliberately ignored; set this explicitly if you need a proxy |
 | `USAGE_RETENTION_DAYS` | `90` | Usage log retention days |
 | `CHECKIN_HOURS` | `9,21` | Daily auto check-in hours |
 | `CREDIT_REFRESH_MIN` | `30` | Credit refresh interval (minutes) |
@@ -93,6 +98,11 @@ Set via environment variables, or copy as `.env`:
 | `KEEPALIVE_HOUR` | `22` | Daily token keep-alive hour |
 | `DESENSITIZE` | `1` | Anti-review desensitization (zero-width spaces + template compaction) |
 | `RATELIMIT` | `1` | Per-account rate limiting anti-ban |
+
+> `BACKEND` / `WORKBUDDY_EXE` / `PROXY` can also be set in the WebUI under
+> "Accounts → Settings → Region & network". **DB values win over environment variables**
+> (leaving the field blank = fall back to the env var / auto-detection). Changes apply
+> immediately, no restart needed.
 | `RATELIMIT_INTERVAL` | `1.5` | Min interval between requests (seconds) |
 
 ## Protocol Support

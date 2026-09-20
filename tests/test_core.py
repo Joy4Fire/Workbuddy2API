@@ -4,12 +4,34 @@
 """
 import asyncio
 import os
+import shutil
 import sys
 import tempfile
 import unittest
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
+# 测试库统一落在**系统临时目录**：仓库可能位于网络盘，而网络盘没有回收站，
+# 删除会退化成失败的 SHFileOperationW（实测单次 10~36 秒）。测试不该被仓库盘符拖垮。
+_TMP = Path(tempfile.mkdtemp(prefix="wb_core_"))
+
+
+def setUpModule():
+    """清掉上一轮残留的测试库。
+
+    本模块多个用例在共享的 _TMP 下复用**固定文件名**（test.db、old_schema.db 等），
+    只在各自 finally 里清理。一旦某轮运行被中断或某个用例在 try 之外抛错，残留文件
+    就会让后续整轮运行读到上次的数据而失败（非幂等，且会越滚越多）。模块级先清一遍，
+    保证每轮从干净状态开始。
+    """
+    if _TMP.is_dir():
+        for f in list(_TMP.glob("*.db*")):
+            f.unlink(missing_ok=True)
+
+
+def tearDownModule():
+    shutil.rmtree(_TMP, True)
 
 
 class TestReasoning(unittest.TestCase):
@@ -221,10 +243,11 @@ class TestEmptyStreamSentinel(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(cm.exception.status_code, 502)
 
     async def test_truncated_tool_calls_dropped_on_eof(self):
+        """finish_reason 已给、只是没发 [DONE]（合法收尾）：仍要丢弃残缺 tool_calls。"""
         from workbuddy_one.upstream import collect_upstream
         lines = [
             'data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"c1","function":{"name":"f","arguments":"{\\"a\\":"}}]}}]}',
-            'data: {"choices":[{"delta":{"content":"部分"}}]}',
+            'data: {"choices":[{"delta":{"content":"部分"},"finish_reason":"tool_calls"}]}',
         ]
         with self._mock_stream(lines):
             result = await collect_upstream({}, {"model": "m"})
@@ -232,11 +255,72 @@ class TestEmptyStreamSentinel(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(msg["content"], "部分")
         self.assertNotIn("tool_calls", msg)  # 残缺 tool_call 已丢弃
 
+    async def test_truncation_without_completion_marker_raises(self):
+        """既无 [DONE] 也无 finish_reason → 502，绝不伪造 stop。
+
+        这是本次对齐参考实现的关键行为：截断的半截回答如果被标成 "stop"，
+        客户端的重试/降级策略永不触发，观测上也看不出上游出过问题。
+        """
+        from workbuddy_one.upstream import collect_upstream, UpstreamError
+        lines = ['data: {"choices":[{"delta":{"content":"只有半句"}}]}']
+        with self._mock_stream(lines):
+            with self.assertRaises(UpstreamError) as cm:
+                await collect_upstream({}, {"model": "m"})
+        self.assertEqual(cm.exception.status_code, 502)
+
+    async def test_done_without_finish_reason_raises(self):
+        """发了 [DONE] 却始终没有 finish_reason：同样属异常流，不猜。"""
+        from workbuddy_one.upstream import collect_upstream, UpstreamError
+        lines = [
+            'data: {"choices":[{"delta":{"content":"正文"}}]}',
+            "data: [DONE]",
+        ]
+        with self._mock_stream(lines):
+            with self.assertRaises(UpstreamError) as cm:
+                await collect_upstream({}, {"model": "m"})
+        self.assertEqual(cm.exception.status_code, 502)
+
+    async def test_finish_reason_without_done_is_accepted(self):
+        """明确的 finish_reason 之后直接 EOF（无 [DONE]）仍算完成。"""
+        from workbuddy_one.upstream import collect_upstream
+        lines = [
+            'data: {"choices":[{"delta":{"content":"完整回答"}}]}',
+            'data: {"choices":[{"delta":{},"finish_reason":"stop"}]}',
+        ]
+        with self._mock_stream(lines):
+            result = await collect_upstream({}, {"model": "m"})
+        self.assertEqual(result["choices"][0]["finish_reason"], "stop")
+        self.assertEqual(result["choices"][0]["message"]["content"], "完整回答")
+
+    async def test_finish_reason_preserved(self):
+        """上游给的 finish_reason 必须原样透传，不能被改写。"""
+        from workbuddy_one.upstream import collect_upstream
+        lines = [
+            'data: {"choices":[{"delta":{"content":"被截断"}}]}',
+            'data: {"choices":[{"delta":{},"finish_reason":"length"}]}',
+            "data: [DONE]",
+        ]
+        with self._mock_stream(lines):
+            result = await collect_upstream({}, {"model": "m"})
+        self.assertEqual(result["choices"][0]["finish_reason"], "length")
+
+    async def test_tool_calls_without_finish_reason_gets_tool_calls(self):
+        """有 tool_calls 却没给 finish_reason：补 "tool_calls" 而非 "stop"。"""
+        from workbuddy_one.upstream import collect_upstream
+        lines = [
+            'data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"c1","function":{"name":"f","arguments":"{\\"x\\":1}"}}]}}]}',
+            "data: [DONE]",
+        ]
+        with self._mock_stream(lines):
+            result = await collect_upstream({}, {"model": "m"})
+        self.assertEqual(result["choices"][0]["finish_reason"], "tool_calls")
+
     async def test_complete_stream_untouched(self):
         from workbuddy_one.upstream import collect_upstream
         lines = [
             'data: {"choices":[{"delta":{"content":"你好"}}]}',
             'data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"c1","function":{"name":"f","arguments":"{\\"x\\":1}"}}]}}]}',
+            'data: {"choices":[{"delta":{},"finish_reason":"tool_calls"}]}',
             "data: [DONE]",
         ]
         with self._mock_stream(lines):
@@ -244,6 +328,59 @@ class TestEmptyStreamSentinel(unittest.IsolatedAsyncioTestCase):
         msg = result["choices"][0]["message"]
         self.assertEqual(msg["content"], "你好")
         self.assertEqual(len(msg["tool_calls"]), 1)
+        self.assertEqual(result["choices"][0]["finish_reason"], "tool_calls")
+
+
+class TestNetProxy(unittest.TestCase):
+    """出站客户端工厂：默认直连（trust_env=False），显式配置才走代理。"""
+
+    def test_default_is_direct(self):
+        """不配 PROXY 时必须保持 trust_env=False。
+
+        httpx 默认读 HTTP_PROXY/ALL_PROXY 环境变量，Docker/CI 里这些值常常无效，
+        会让本该直连的请求解析出坏代理——所以默认绝不能放开 trust_env。
+        """
+        from unittest.mock import patch
+        from workbuddy_one import net
+        from workbuddy_one.config import config
+        with patch.object(config, "proxy", ""):
+            kw = net.client_kwargs()
+        self.assertEqual(kw, {"trust_env": False})
+        self.assertNotIn("proxy", kw)
+
+    def test_explicit_proxy_is_applied(self):
+        from unittest.mock import patch
+        from workbuddy_one import net
+        from workbuddy_one.config import config
+        with patch.object(config, "proxy", "http://127.0.0.1:7890"):
+            kw = net.client_kwargs(timeout=15)
+        self.assertEqual(kw["proxy"], "http://127.0.0.1:7890")
+        self.assertFalse(kw["trust_env"])
+        self.assertEqual(kw["timeout"], 15)
+
+    def test_extra_overrides_defaults(self):
+        from unittest.mock import patch
+        from workbuddy_one import net
+        from workbuddy_one.config import config
+        with patch.object(config, "proxy", ""):
+            kw = net.client_kwargs(trust_env=True)
+        self.assertTrue(kw["trust_env"])
+
+    def test_factories_return_httpx_clients(self):
+        import httpx
+        from unittest.mock import patch
+        from workbuddy_one import net
+        from workbuddy_one.config import config
+        with patch.object(config, "proxy", ""):
+            c = net.client(timeout=5)
+            a = net.async_client(timeout=5)
+        try:
+            self.assertIsInstance(c, httpx.Client)
+            self.assertIsInstance(a, httpx.AsyncClient)
+        finally:
+            c.close()
+            import asyncio
+            asyncio.run(a.aclose())
 
 
 class TestSessionSticky(unittest.TestCase):
@@ -431,7 +568,7 @@ class TestPool(unittest.TestCase):
 class TestDB(unittest.TestCase):
     def test_log_and_summary(self):
         from workbuddy_one.db import Database
-        tmp = Path(__file__).resolve().parent / "_tmp"
+        tmp = _TMP
         tmp.mkdir(exist_ok=True)
         db = Database(str(tmp / "test.db"))
         try:
@@ -455,7 +592,7 @@ class TestDB(unittest.TestCase):
         """旧版本库升级时自动备份到 <db目录>/backups；升级后再次打开不重复备份。"""
         import sqlite3
         from workbuddy_one.db import Database, SCHEMA_VERSION
-        tmp = Path(__file__).resolve().parent / "_tmp"
+        tmp = _TMP
         tmp.mkdir(exist_ok=True)
         old = tmp / "old_backup_test.db"
         backups_dir = tmp / "backups"
@@ -499,7 +636,7 @@ class TestDB(unittest.TestCase):
     def test_fresh_db_no_backup(self):
         """全新空库首次初始化不算"升级"，不产生迁移备份。"""
         from workbuddy_one.db import Database
-        tmp = Path(__file__).resolve().parent / "_tmp"
+        tmp = _TMP
         tmp.mkdir(exist_ok=True)
         fresh = tmp / "fresh_backup_test.db"
         backups_dir = tmp / "backups"
@@ -518,9 +655,14 @@ class TestDB(unittest.TestCase):
         """旧 schema 库（缺列/缺 apps 表）打开后应升级到当前版本且保留数据。"""
         import sqlite3
         from workbuddy_one.db import Database, SCHEMA_VERSION
-        tmp = Path(__file__).resolve().parent / "_tmp"
+        tmp = _TMP
         tmp.mkdir(exist_ok=True)
         old = str(tmp / "old_schema.db")
+        # 必须先清理上一轮残留：本测试在 try 之前就要 CREATE TABLE，残留文件还在会直接
+        # 报 "table accounts already exists"，而那时还没进入 try，finally 的清理不会执行，
+        # 于是这个测试会永久失败且永远无法自清理（同文件其它测试都有这一步，此处原先漏了）。
+        for f in list(tmp.glob("old_schema.db*")) + list((tmp / "backups").glob("old_schema.db.pre-migrate-*")):
+            f.unlink(missing_ok=True)
         # 建一个「旧版」库：accounts 无 last_checkin_date、usage_logs 无内容列、无 apps 表
         c = sqlite3.connect(old)
         c.executescript("""
@@ -567,7 +709,7 @@ class TestDB(unittest.TestCase):
         """当前空库 + 发现旧库时，自动合并 accounts/settings/usage_logs 数据。"""
         import sqlite3
         from workbuddy_one.db import Database
-        tmp = Path(__file__).resolve().parent / "_tmp"
+        tmp = _TMP
         tmp.mkdir(exist_ok=True)
         legacy = str(tmp / "legacy.db")
         target = str(tmp / "target.db")
@@ -627,7 +769,7 @@ class TestAppHelpers(unittest.TestCase):
 class TestUsageSearch(unittest.TestCase):
     def test_search_filters_and_escapes(self):
         from workbuddy_one.db import Database
-        tmp = Path(__file__).resolve().parent / "_tmp"
+        tmp = _TMP
         tmp.mkdir(exist_ok=True)
         db = Database(str(tmp / "search_test.db"))
         try:
@@ -654,7 +796,7 @@ class TestUsageSearch(unittest.TestCase):
 class TestDisabledReason(unittest.TestCase):
     def test_persist_and_clear(self):
         from workbuddy_one.db import Database
-        tmp = Path(__file__).resolve().parent / "_tmp"
+        tmp = _TMP
         tmp.mkdir(exist_ok=True)
         db = Database(str(tmp / "reason_test.db"))
         try:

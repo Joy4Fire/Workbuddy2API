@@ -18,8 +18,8 @@ import logging
 import threading
 import time
 
-import httpx
 
+from . import net
 from .config import config
 
 logger = logging.getLogger("workbuddy_one.benchmarks")
@@ -97,7 +97,7 @@ class AABenchmarks:
             logger.info("未配置 AA API key，跳过评测拉取")
             return None
         try:
-            with httpx.Client(timeout=REQUEST_TIMEOUT, trust_env=False) as client:
+            with net.client(timeout=REQUEST_TIMEOUT) as client:
                 resp = client.get(AA_ENDPOINT, headers={"x-api-key": key})
                 if resp.status_code != 200:
                     logger.warning("AA api status %d", resp.status_code)

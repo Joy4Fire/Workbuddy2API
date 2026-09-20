@@ -27,6 +27,9 @@ def create_app() -> FastAPI:
     app = FastAPI(title="Workbuddy2API", version="0.4.1",
                   docs_url=None, redoc_url=None, openapi_url=None)
     db = Database(config.db_path)
+    # 载入 WebUI 里设置过的"区域与网络"覆盖项（BACKEND / PROXY / WORKBUDDY_EXE）。
+    # 必须在建账号池之前：区域判定依赖 BACKEND，模型目录拉取依赖 PROXY。
+    config.load_overrides(db.get_settings())
 
     # 加载本地 auth 文件，注册账号
     managers: dict[str, CredentialManager] = {}
@@ -39,7 +42,10 @@ def create_app() -> FastAPI:
                 db.upsert_account({"path": str(f)}, summary)
                 managers[summary["uid"]] = mgr
         except Exception as e:  # noqa: BLE001
-            print(f"[warn] 加载 auth 文件失败 {f}: {e}")
+            # 必须走 logger 而不是 print：print 到重定向的 stdout 是**块缓冲**的，
+            # 启动期的告警会一直卡在缓冲区里（进程退出才 flush），
+            # 表现为"某个账号莫名其妙没加载"却查不到任何原因。
+            logger.warning("加载 auth 文件失败 %s: %s", f, e)
 
     pool = AccountPool(managers)
     # 从 DB 恢复上次额度的最近值：避免进程重启后额度盲区（冷启动即可按额度排除已耗尽账号）
@@ -88,6 +94,9 @@ def create_app() -> FastAPI:
                     managers[uid] = mgr  # 刷新 mgr（token 可能已被文件更新）
             except Exception as e:  # noqa: BLE001
                 logger.warning("热加载 auth 文件失败 %s: %s", f, e)
+        # 同步 /health 的 auth_files 计数（启动时统计的旧值会误导观测）
+        from .credentials import find_auth_files as _faf
+        ctx.auth_files_count = len(_faf())
         if registered:
             logger.info("热加载完成：新增 %d 个账号", registered)
 

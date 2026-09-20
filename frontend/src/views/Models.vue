@@ -13,11 +13,17 @@ const refreshing = ref(false)
 const aaRefreshing = ref(false)
 const aaConfigured = ref(false)
 const aaLoading = ref(false)
+// 账号池当前实际拥有的区域（如 ["cn"] / ["cn","global"]）：用于判断模型是否在账号目录内
+const poolRegions = ref<string[]>([])
+// 只看"当前账号目录内"的模型（默认关闭：目录不是可用性的充分条件，别替用户做决定）
+const onlyInCatalog = ref(false)
 
 const filtered = computed(() => {
+  let list = models.value
+  if (onlyInCatalog.value) list = list.filter(inCatalogOfPool)
   const q = search.value.trim().toLowerCase()
-  if (!q) return models.value
-  return models.value.filter(
+  if (!q) return list
+  return list.filter(
     (m) =>
       m.id.toLowerCase().includes(q) ||
       (m.name || '').toLowerCase().includes(q),
@@ -28,8 +34,41 @@ const stats = computed(() => {
   const hasAA = models.value.filter((m) => m.benchmark).length
   const multimodal = models.value.filter((m) => m.modality === 'multimodal').length
   const tool = models.value.filter((m) => m.supportsToolCall).length
-  return { hasAA, multimodal, tool }
+  const inCatalog = models.value.filter(inCatalogOfPool).length
+  return { hasAA, multimodal, tool, inCatalog }
 })
+
+// 模型是否出现在**当前账号池**的某个区域目录里。
+//
+// ⚠️ 目录 ≠ 可用性。实测（2026-09-20，真实双账号）：
+//   - hy3-x / deepseek-v4-pro 只在国内版目录，国际版调用确实 11102 service info not found；
+//   - 但 auto（只在国内版目录）与 deep-model（只在国际版目录）**两个区域都能正常调用**。
+// 所以这里只用来做提示与筛选，**绝不**据此把模型置灰或禁用——那会错误地劝退能用的模型。
+function inCatalogOfPool(m: ModelInfo): boolean {
+  const r = m.regions || []
+  if (!r.length || !poolRegions.value.length) return true  // 未知一律视为可用
+  return r.some((x) => poolRegions.value.includes(x))
+}
+
+function regionNames(regions?: string[]): string {
+  return (regions || []).map((r) => (r === 'global' ? '国际版' : '国内版')).join(' / ')
+}
+
+function regionTag(m: ModelInfo): { text: string; color: string } | null {
+  const r = m.regions || []
+  if (!r.length) return null
+  const hasCn = r.includes('cn')
+  const hasGlobal = r.includes('global')
+  if (hasCn && hasGlobal) return { text: '双区域', color: 'green' }
+  if (hasGlobal) return { text: '仅国际版目录', color: 'purple' }
+  return { text: '仅国内版目录', color: 'blue' }
+}
+
+function regionTip(m: ModelInfo): string {
+  return `该模型出现在 ${regionNames(m.regions) || '未知'} 的模型目录中。`
+    + '目录只表示上游把它列出来了，不代表严格限制：'
+    + '多数区域专属模型跨区域调用会返回 11102，但也有例外（如 auto 在只出现在国内版目录时，国际版同样可调用）。'
+}
 
 async function load() {
   loading.value = true
@@ -37,6 +76,7 @@ async function load() {
     const res = await api.models()
     models.value = res.models
     source.value = res.source === 'static' ? 'static' : 'dynamic'
+    poolRegions.value = res.pool_regions || []
     loadAA()
   } finally {
     loading.value = false
@@ -139,12 +179,19 @@ onMounted(load)
       <a-tag class="src-tag" :class="source === 'dynamic' ? 'src-dyn' : 'src-static'">
         {{ source === 'dynamic' ? '动态（来自上游）' : '静态兜底' }}
       </a-tag>
+      <a-tag class="src-tag pool-region-tag">
+        账号区域：{{ regionNames(poolRegions) || '未知' }}
+      </a-tag>
+      <a-checkbox v-model:checked="onlyInCatalog" class="only-catalog">
+        只看账号目录内的模型
+      </a-checkbox>
       <span class="count">共 {{ filtered.length }} 个模型</span>
     </div>
 
     <!-- 概览指标条 -->
     <div class="metric-strip">
       <div class="metric-chip"><span class="m-num">{{ models.length }}</span><span class="m-label">模型</span></div>
+      <div class="metric-chip"><span class="m-num">{{ stats.inCatalog }}</span><span class="m-label">账号目录内</span></div>
       <div class="metric-chip"><span class="m-num">{{ stats.multimodal }}</span><span class="m-label">多模态</span></div>
       <div class="metric-chip"><span class="m-num">{{ stats.tool }}</span><span class="m-label">支持工具</span></div>
       <div class="metric-chip">
@@ -158,7 +205,7 @@ onMounted(load)
         <p class="empty-desc">需要先在「账号」页配置账号（扫码登录或上传 auth 文件），配置后点上方「刷新模型」从上游拉取真实模型目录。</p>
       </div>
       <div v-else class="card-grid">
-        <div v-for="m in filtered" :key="m.id" class="model-card" :class="m.modality">
+        <div v-for="m in filtered" :key="m.id" class="model-card" :class="[m.modality, { offcatalog: !inCatalogOfPool(m) }]">
           <div class="card-head">
             <div class="card-title-row">
               <span class="model-name">{{ fmtName(m) }}</span>
@@ -171,6 +218,15 @@ onMounted(load)
 
           <!-- 能力标签 -->
           <div class="tag-row">
+            <a-tooltip v-if="regionTag(m)" :title="regionTip(m)">
+              <a-tag :color="regionTag(m)!.color">{{ regionTag(m)!.text }}</a-tag>
+            </a-tooltip>
+            <a-tooltip
+              v-if="!inCatalogOfPool(m)"
+              title="该模型不在当前账号池拉到的任何区域目录里，调用大概率返回 11102 service info not found。可以换个模型，或到「账号」页添加对应区域的账号；个别模型（如 auto）跨区域仍可用，想试也无妨。"
+            >
+              <a-tag class="offcatalog-tag">账号目录外</a-tag>
+            </a-tooltip>
             <a-tag v-if="reasoningTag(m)" :color="reasoningTag(m)!.color">{{ reasoningTag(m)!.text }}</a-tag>
             <a-tag v-if="m.supportsToolCall" color="gold"><ToolOutlined style="margin-right: 4px" />工具调用</a-tag>
             <a-tag v-for="e in reasoningEfforts(m)" :key="e" color="purple" class="effort-tag">{{ e }}</a-tag>
@@ -209,7 +265,7 @@ onMounted(load)
       show-icon
       style="margin-top: 16px"
       message="未配置 Artificial Analysis 评测"
-      description="在「账号 → 自动签到设置」中填入 AA API Key 后，将在此展示各模型的权威评测数据（智能/编码/数学指数）。"
+      description="在「账号 → 设置」中填入 AA API Key 后，将在此展示各模型的权威评测数据（智能/编码/数学指数）。"
     />
   </div>
 </template>
@@ -222,6 +278,13 @@ onMounted(load)
 .src-tag { margin-left: 4px; }
 .src-dyn { background: rgba(99,179,237,0.16) !important; color: #7cc0f5 !important; border-color: rgba(99,179,237,0.4) !important; }
 .src-static { background: rgba(245,158,11,0.16) !important; color: #fbbf24 !important; border-color: rgba(245,158,11,0.4) !important; }
+.pool-region-tag { background: rgba(148,163,184,0.14) !important; border-color: rgba(148,163,184,0.35) !important; color: #cbd5e1 !important; }
+.only-catalog { color: #9aa5bd; font-size: 13px; }
+.offcatalog-tag { background: rgba(245,158,11,0.16) !important; border-color: rgba(245,158,11,0.4) !important; color: #fbbf24 !important; }
+/* 不在账号目录内的模型：只轻微降低存在感，**不**灰置禁用——实测目录 ≠ 可用性
+   （auto / deep-model 在另一区域照样能调用），置灰会错误地劝退能用的模型。 */
+.model-card.offcatalog { opacity: 0.78; }
+.model-card.offcatalog:hover { opacity: 1; }
 .count { color: #8a94a6; font-size: 13px; margin-left: auto; }
 
 .metric-strip {

@@ -10,8 +10,9 @@ import re
 
 logger = logging.getLogger("workbuddy_one.reasoning")
 
-# effort 档位从低到高
-_EFFORT_RANK = {"off": 0, "minimal": 1, "low": 2, "medium": 3, "high": 4, "xhigh": 5, "max": 6}
+# effort 档位从低到高。none 与 off 同义（OpenAI 系客户端多用 none，
+# Anthropic 系用 off），都归到 0 档，避免 "none" 因不在表里被原样透传给上游。
+_EFFORT_RANK = {"none": 0, "off": 0, "minimal": 1, "low": 2, "medium": 3, "high": 4, "xhigh": 5, "max": 6}
 
 # 已知模型的 reasoning 支持档位（尽力而为；未知模型透传）。
 # 运行时以模型目录的动态表为准，这里只是目录冷启动时的兜底。
@@ -108,6 +109,7 @@ def sanitize_body(body: dict, efforts: dict[str, list[str]] | None = None) -> di
     - tool_choice 归一化（对象 → string）
     - reasoning_effort 按模型档位降级
     - developer 角色归一为 system（上游 role 白名单校验，防 11128）
+    - 无任何 system 消息时补一条空 system（国际版硬校验 11128，见 ensure_leading_system）
     - DeepSeek 思维链开关注入 + 多轮 reasoning_content 回填
 
     efforts: 可选的动态思考强度表（来自模型目录），优先于内置 KNOWN_EFFORTS。
@@ -115,6 +117,7 @@ def sanitize_body(body: dict, efforts: dict[str, list[str]] | None = None) -> di
     body = normalize_tool_choice(body)
     body = normalize_reasoning_effort(body, efforts=efforts)
     body = normalize_roles(body)
+    body = ensure_leading_system(body)
     body = inject_thinking(body)
     body = backfill_reasoning_content(body)
     return body
@@ -174,6 +177,32 @@ def normalize_roles(body: dict) -> dict:
     for m in msgs:
         if isinstance(m, dict) and m.get("role") == "developer":
             m["role"] = "system"
+    return body
+
+
+def ensure_leading_system(body: dict) -> dict:
+    """第一条消息不是 system 时，在最前面补一条空 system。
+
+    上游 code=11128「first message is not system prompt」校验的是**第一条消息**，
+    而不是「消息列表里是否存在 system」。所以判断依据必须是 ``msgs[0].role``，
+    不能写成 ``any(role == system)``——客户端若发 ``[user, system]`` 这种把 system
+    放在后面的顺序，「存在即不补」会让上游照样 400。参考实现 Buddy2api v2.1.13
+    的同类修复（issue #75）用的也是首条判定。
+
+    补一条**空** system 对两个区域都无害：国内版宽松，国际版是硬校验（实测无 system
+    时直接拒绝）。只在首条不是 system 时才补——带正常 system 开头的请求（Claude Code、
+    Codex CLI、Cherry Studio 等客户端都会带）零改动。
+
+    这是与 normalize_roles 里「不合并、不重排、不删除任何消息」约定唯一的例外，
+    范围刻意压到最小：只往头部插一条，不动其余任何消息。
+    """
+    msgs = body.get("messages")
+    if not isinstance(msgs, list) or not msgs:
+        return body
+    first = msgs[0]
+    if isinstance(first, dict) and first.get("role") == "system":
+        return body
+    body["messages"] = [{"role": "system", "content": ""}] + msgs
     return body
 
 

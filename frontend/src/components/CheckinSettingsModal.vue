@@ -1,9 +1,9 @@
 <script setup lang="ts">
-// 自动签到设置弹窗：表单状态自包含，打开时从后端加载，保存成功后关闭。
+// 设置弹窗（定时任务 / 预警 / 别名 / AA Key / 区域与网络）：表单状态自包含，打开时从后端加载，保存成功后关闭。
 import { ref, watch } from 'vue'
 import { message } from 'ant-design-vue'
 import { api } from '@/api/client'
-import type { Settings } from '@/types'
+import type { RegionCount, Settings } from '@/types'
 
 const props = defineProps<{ open: boolean }>()
 const emit = defineEmits<{ (e: 'update:open', v: boolean): void }>()
@@ -28,6 +28,16 @@ const alertExpiryDays = ref(3)
 // 模型别名映射（textarea 原文）
 const modelAliases = ref('')
 const checkinErr = ref('')
+// ---- 区域与网络 ----
+// DB 值（输入框）与环境变量值分开保存：输入框留空时，下方提示"当前用的是环境变量 XXX"，
+// 避免用户误以为"没配置"而重复填写。
+const poolRegions = ref<RegionCount[]>([])
+const backend = ref('')
+const proxy = ref('')
+const workbuddyExe = ref('')
+const envBackend = ref('')
+const envProxy = ref('')
+const envWorkbuddyExe = ref('')
 
 watch(() => props.open, (open) => { if (open) load() })
 
@@ -50,6 +60,13 @@ async function load() {
     alertThreshold.value = parseInt(res.alert_threshold_percent as any, 10) || 10
     alertExpiryDays.value = parseInt(res.alert_expiry_days as any, 10) || 3
     modelAliases.value = res.model_aliases || ''
+    poolRegions.value = res.regions || []
+    backend.value = res.backend || ''
+    proxy.value = res.proxy || ''
+    workbuddyExe.value = res.workbuddy_exe || ''
+    envBackend.value = res.env_backend || ''
+    envProxy.value = res.env_proxy || ''
+    envWorkbuddyExe.value = res.env_workbuddy_exe || ''
   } catch { /* 拦截器已提示 */ }
 }
 
@@ -88,6 +105,9 @@ async function saveSettings() {
     alert_threshold_percent: String(alertThreshold.value),
     alert_expiry_days: String(alertExpiryDays.value),
     model_aliases: modelAliases.value,
+    backend: backend.value.trim(),
+    proxy: proxy.value.trim(),
+    workbuddy_exe: workbuddyExe.value.trim(),
   }
   if (aaKey.value) {
     payload.aa_api_key = aaKey.value.trim()
@@ -108,7 +128,7 @@ async function saveSettings() {
 <template>
   <a-modal
     :open="props.open"
-    title="自动签到设置"
+    title="设置"
     :confirm-loading="settingsSaving"
     ok-text="保存"
     cancel-text="取消"
@@ -116,6 +136,50 @@ async function saveSettings() {
     @cancel="emit('update:open', false)"
   >
     <a-form layout="vertical">
+      <a-divider orientation="left" style="margin-top: 0">区域与网络</a-divider>
+      <a-form-item label="账号池区域分布">
+        <a-space wrap>
+          <a-tag v-for="r in poolRegions" :key="r.id" :color="r.id === 'global' ? 'purple' : 'blue'">
+            {{ r.label }} {{ r.count }} 个
+          </a-tag>
+          <span v-if="!poolRegions.length" style="color: #999; font-size: 13px">暂无账号</span>
+        </a-space>
+        <div style="color: #999; font-size: 12px; margin-top: 4px">
+          区域由每个账号 auth 文件里的 domain 自动判定，无需手动指定。两个区域的模型集大部分不重叠，请求会自动路由到对应区域的账号。
+        </div>
+      </a-form-item>
+      <a-form-item label="BACKEND（强制上游 host，高级）">
+        <a-input
+          v-model:value="backend"
+          allow-clear
+          :placeholder="envBackend ? `环境变量当前为 ${envBackend}（留空即用它）` : '留空 = 按账号区域自动选择（推荐）'"
+        />
+        <div style="color: #999; font-size: 12px; margin-top: 4px">
+          <span style="color: #d97706">留空即可，这是推荐配置。</span>填写后会对<b>所有</b>账号生效，强制它们打同一个上游 host——仅单区域自建部署才需要；国内外混池时填了会让另一区域的账号全部不可用。
+        </div>
+      </a-form-item>
+      <a-form-item label="PROXY（出站代理，高级）">
+        <a-input
+          v-model:value="proxy"
+          allow-clear
+          :placeholder="envProxy ? `环境变量当前为 ${envProxy}（留空即用它）` : '留空 = 直连（推荐）'"
+        />
+        <div style="color: #999; font-size: 12px; margin-top: 4px">
+          仅当上游必须走代理才能访问时填写，支持 http:// 与 socks5://。默认直连，且<b>不会</b>读取系统的 HTTP_PROXY 环境变量——Docker/内网里那些值经常无效，会把本该直连的请求带偏。
+        </div>
+      </a-form-item>
+      <a-form-item label="WORKBUDDY_EXE（官方客户端路径，高级）">
+        <a-input
+          v-model:value="workbuddyExe"
+          allow-clear
+          :placeholder="envWorkbuddyExe ? `环境变量当前为 ${envWorkbuddyExe}（留空即用它）` : '留空 = 按平台默认位置探测'"
+        />
+        <div style="color: #999; font-size: 12px; margin-top: 4px">
+          仅用于解密 WorkBuddy 桌面端 5.6.0+ 的加密登录态。留空时会自动探测常见安装路径（如 %LOCALAPPDATA%\Programs\WorkBuddy\WorkBuddy.exe），本机没装官方客户端时才需要手动填。
+        </div>
+      </a-form-item>
+
+      <a-divider orientation="left">定时任务</a-divider>
       <a-form-item
         label="每日自动签到时间（小时，逗号分隔，0-23）"
         :validate-status="checkinErr ? 'error' : ''"

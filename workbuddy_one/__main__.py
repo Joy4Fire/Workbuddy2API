@@ -17,12 +17,15 @@ def main():
                         help="通过浏览器 OAuth 登录 WorkBuddy，登录后落盘为 auth 文件")
     parser.add_argument("--no-browser", action="store_true",
                         help="登录时不自动打开浏览器（打印授权 URL 手动打开）")
+    parser.add_argument("--region", choices=("cn", "global"), default="cn",
+                        help="登录哪个版本：cn=国内版（默认），global=国际版")
     args = parser.parse_args()
 
     if args.login:
         from .oauth import oauth_login
         from .config import config as cfg
-        oauth_login(open_browser=not args.no_browser, output_dir=cfg.auth_dir_path or None)
+        oauth_login(open_browser=not args.no_browser, output_dir=cfg.auth_dir_path or None,
+                    region_id=args.region)
         return
 
     app = create_app()

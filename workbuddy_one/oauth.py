@@ -7,6 +7,10 @@
   4. 轮询 GET /v2/plugin/login/account?state=... → 拿 uid/nickname/enterpriseId
 
 登录成功后把凭据落盘为 auth 文件，实现"一次 OAuth，之后走读文件"。
+
+区域（region_id）：登录必须打对区域的控制面——国内版 copilot.tencent.com、
+国际版 www.workbuddy.ai，两者返回的 authUrl 域名不同，走错就拿不到可用凭据。
+缺省国内版，保持既有调用方行为不变。
 """
 from __future__ import annotations
 
@@ -18,7 +22,7 @@ from pathlib import Path
 
 import httpx
 
-from .config import config
+from . import net, region
 from .credentials import PROJECT_AUTHS_DIR
 
 # 无鉴权标记头（模拟官方插件）
@@ -34,8 +38,15 @@ class OAuthError(Exception):
     pass
 
 
-def _request(client: httpx.Client, method: str, path: str, *, headers=None, body=None) -> dict:
-    url = f"{config.backend}{path}"
+def _base_for(region_id: str | None) -> str:
+    """OAuth 控制面 host：按选定区域取，未知/缺省回落国内版。"""
+    r = region.REGIONS.get((region_id or "").strip().lower()) or region.CN
+    return region.chat_base(r.default_domain)
+
+
+def _request(client: httpx.Client, method: str, path: str, *, headers=None, body=None,
+             base: str | None = None) -> dict:
+    url = f"{base or _base_for(None)}{path}"
     resp = client.request(method, url, headers=headers, json=body if body is not None else {})
     if resp.status_code >= 400:
         raise OAuthError(f"HTTP {resp.status_code}: {resp.text[:200]}")
@@ -59,14 +70,18 @@ def _unwrap(data: dict) -> dict:
 
 
 def oauth_login(*, open_browser: bool = True, timeout: int = 300,
-                output_dir: Path | None = None) -> dict:
-    """执行浏览器 OAuth 登录，返回 {auth, account}，并落盘为 auth 文件。"""
-    with httpx.Client(timeout=15, trust_env=False) as client:
+                output_dir: Path | None = None, region_id: str | None = None) -> dict:
+    """执行浏览器 OAuth 登录，返回 {auth, account}，并落盘为 auth 文件。
+
+    region_id: "cn"（缺省）或 "global"，决定打哪个区域的控制面。
+    """
+    base = _base_for(region_id)
+    with net.client(timeout=15) as client:
         # 1. 获取 state + authUrl
         state_payload = _unwrap(_request(
             client, "POST",
             f"/v2/plugin/auth/state?platform={urllib.parse.quote('CLI')}",
-            headers=_NO_AUTH, body={},
+            headers=_NO_AUTH, body={}, base=base,
         ))
         auth_url = state_payload.get("authUrl")
         state = state_payload.get("state")
@@ -86,7 +101,7 @@ def oauth_login(*, open_browser: bool = True, timeout: int = 300,
                 t = _unwrap(_request(
                     client, "GET",
                     f"/v2/plugin/auth/token?state={urllib.parse.quote(str(state))}",
-                    headers=_NO_AUTH,
+                    headers=_NO_AUTH, base=base,
                 ))
             except OAuthError as e:
                 if "HTTP 4" in str(e) or "后端错误 4" in str(e) or "后端错误 401" in str(e) or "后端错误 403" in str(e):
@@ -116,6 +131,7 @@ def oauth_login(*, open_browser: bool = True, timeout: int = 300,
                         "X-No-Enterprise-Id": "true",
                         "X-No-Department-Info": "true",
                     },
+                    base=base,
                 ))
             except OAuthError as e:
                 if "HTTP 4" in str(e) or "后端错误 4" in str(e) or "后端错误 401" in str(e) or "后端错误 403" in str(e):
@@ -139,34 +155,40 @@ def oauth_login(*, open_browser: bool = True, timeout: int = 300,
         return session
 
 
-def oauth_begin() -> dict:
-    """发起 OAuth 登录，仅获取 {state, authUrl}（不阻塞、不轮询）。供前端二维码使用。"""
-    with httpx.Client(timeout=15, trust_env=False) as client:
+def oauth_begin(region_id: str | None = None) -> dict:
+    """发起 OAuth 登录，仅获取 {state, authUrl}（不阻塞、不轮询）。供前端二维码使用。
+
+    返回里带上 region，前端轮询时原样回传，避免两次请求打到不同区域。
+    """
+    base = _base_for(region_id)
+    with net.client(timeout=15) as client:
         state_payload = _unwrap(_request(
             client, "POST",
             f"/v2/plugin/auth/state?platform={urllib.parse.quote('CLI')}",
-            headers=_NO_AUTH, body={},
+            headers=_NO_AUTH, body={}, base=base,
         ))
     auth_url = state_payload.get("authUrl")
     state = state_payload.get("state")
     if not auth_url or not state:
         raise OAuthError(f"登录状态响应缺少 authUrl/state: {state_payload!r}")
-    return {"state": str(state), "authUrl": auth_url}
+    r = region.REGIONS.get((region_id or "").strip().lower()) or region.CN
+    return {"state": str(state), "authUrl": auth_url, "region": r.id}
 
 
-def oauth_poll(state: str) -> dict:
+def oauth_poll(state: str, region_id: str | None = None) -> dict:
     """轮询一次 OAuth 登录结果。
 
     返回 {"status": "pending" | "ready", "auth":..., "account":...}。
     status=ready 时 auth/account 已就绪，可直接落盘。
     """
+    base = _base_for(region_id)
     state_q = urllib.parse.quote(str(state))
-    with httpx.Client(timeout=15, trust_env=False) as client:
+    with net.client(timeout=15) as client:
         # 尝试取 token
         try:
             t = _unwrap(_request(
                 client, "GET", f"/v2/plugin/auth/token?state={state_q}",
-                headers=_NO_AUTH,
+                headers=_NO_AUTH, base=base,
             ))
         except OAuthError:
             return {"status": "pending"}
@@ -184,6 +206,7 @@ def oauth_poll(state: str) -> dict:
                     "X-No-Enterprise-Id": "true",
                     "X-No-Department-Info": "true",
                 },
+                base=base,
             ))
         except OAuthError:
             return {"status": "pending"}

@@ -10,7 +10,7 @@ logger = logging.getLogger("workbuddy_one.routes.models_admin")
 
 
 def register(app: FastAPI, ctx) -> None:
-    models, benchmarks = ctx.models, ctx.benchmarks
+    models, benchmarks, pool = ctx.models, ctx.benchmarks, ctx.pool
 
     @app.get("/admin/models")
     def admin_models():
@@ -34,8 +34,18 @@ def register(app: FastAPI, ctx) -> None:
                         e["benchmark"] = bb
                 except Exception:  # noqa: BLE001
                     pass
+            # 可用区域：**基于当前账号池**拉到的目录，不是"模型本身的归属"。
+            # 空列表 = 未知（目录里没这个模型 / 还没拉到），前端据此不做灰置，
+            # 免得把别名或新模型误判成不可用。
+            try:
+                e["regions"] = sorted(models.regions_for(e["id"]))
+            except Exception:  # noqa: BLE001
+                e["regions"] = []
+        # 账号池当前实际拥有的区域：前端用它判断"某模型现在能不能用"
+        pool_regions = sorted({a["region"] for a in pool.all_accounts() if a.get("region")})
         return {"models": entries, "source": source,
-                "aa_configured": benchmarks.configured()}
+                "aa_configured": benchmarks.configured(),
+                "pool_regions": pool_regions}
 
     @app.get("/admin/models/benchmarks")
     def admin_benchmarks():

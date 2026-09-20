@@ -434,12 +434,19 @@ class Database:
         "model_ttl_min": "60",         # 模型缓存 TTL（分钟，推理端点惰性刷新间隔）
         "aa_refresh_hour": "7",        # 每日自动刷新 AA 评测数据的小时（0-23）
         "keepalive_hour": "22",        # 每日 token 保活小时（0-23）
+        # 保活开关。历史上漏登记在白名单里，导致 WebUI 保存该开关时被
+        # save_settings 静默丢弃（界面永远显示"开启"、实际改不动）。
+        "keepalive_enabled": "1",
         "aa_api_key": "",              # Artificial Analysis API key（评测数据，空则不启用）
         "alert_enabled": "0",          # 积分预警开关（webhook 推送）
         "alert_webhook_url": "",       # 预警 webhook 地址（Bark/企微/飞书自动识别）
         "alert_threshold_percent": "10",  # 余额占比低于该值触发预警
         "alert_expiry_days": "3",      # 积分 N 天内到期触发预警
         "model_aliases": "",           # 模型别名映射，每行一条：别名=真实模型
+        # ---- 区域与网络（DB 值优先于同名环境变量；空=回落环境变量/自动） ----
+        "backend": "",                 # 强制所有账号打同一 host（仅单区域部署用）
+        "proxy": "",                   # 出站代理（http:// / socks5://），空=直连
+        "workbuddy_exe": "",           # 官方客户端路径，用于解密 $wbEncrypted 登录态
     }
 
     def get_settings(self) -> dict:

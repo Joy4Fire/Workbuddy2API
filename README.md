@@ -12,6 +12,8 @@
 
 - 🔌 **三协议** — OpenAI Chat（`/v1/chat/completions`）、OpenAI Responses（`/v1/responses`）、Anthropic Messages（`/v1/messages`），统一转换后发往腾讯 `/v2/chat/completions`
 - 🔐 **双认证** — 读本地 auth 文件（桌面 CodeBuddy 目录 + 项目 `auths/`）+ 浏览器扫码/OAuth 登录，多账号管理
+- 🌏 **国内版 / 国际版双区域** — 按每个账号 auth 文件里的 `domain` 自动路由（国内版 `copilot.tencent.com` / 国际版 `www.workbuddy.ai`），host、模型目录路径、Origin 三者成对切换，两版账号可混池；**区域全程可见**：账号列表标区域、扫码登录可选区域、模型页标目录归属并支持「只看账号目录内的模型」筛选、设置页展示区域分布
+- 🔓 **加密登录态兼容** — 桌面端 5.6.0+ 会把 token 加密成 `$wbEncrypted` 信封落盘；网关能识别并借官方客户端解密（`WORKBUDDY_EXE` 可指定路径），解不开时给出明确报错而不是静默「登录失效」；**绝不回写**原 auth 文件
 - 🔄 **多账号轮换** — 加权轮换（额度/到期/成功率/闲置多因子）、冷却、429/5xx 自动换号重试，防热点防封号
 - ⏰ **自动签到** — 每日定时签到领积分（错过时点自动补签；登录即自动签到一次，当日不重复）
 - 🧠 **思维链适配** — DeepSeek 自动注入 `thinking` 开关、多轮 `reasoning_content` 回填；`developer` 角色自动归一为 `system`（防上游 11128）
@@ -82,7 +84,13 @@ clone 后按以下步骤开始使用：
 | `ADMIN_TOKEN` | 空 | 管理接口/WebUI 鉴权 Token。为空仅允许本机回环访问 |
 | `AUTH_DIR` | 自动 | 本地 auth 文件目录（留空自动探测） |
 | `DB_PATH` | `data/workbuddy.db` | SQLite 数据库文件 |
-| `BACKEND` | `https://copilot.tencent.com` | 腾讯后端 |
+| `BACKEND` | 空（自动） | 上游 host。留空按账号 `auth.domain` 自动选区域；填了则对所有账号强制生效 |
+| `DOMAIN` | `www.codebuddy.cn` | auth 文件缺失 `domain` 时的兜底域名（决定默认区域=国内版） |
+| `WORKBUDDY_EXE` | 自动探测 | 官方客户端可执行文件路径，仅用于解密 `$wbEncrypted` 加密登录态 |
+| `PROXY` | 空（直连） | 出站代理（`http://` / `socks5://`）。刻意不读 `HTTP_PROXY` 等环境变量，需代理时显式填 |
+
+> `BACKEND` / `WORKBUDDY_EXE` / `PROXY` 三项也可以在 WebUI 的「账号 → 设置 → 区域与网络」里直接填，
+> **DB 里的值优先于环境变量**（界面上留空 = 用环境变量 / 自动判定）。改完即时生效，无需重启。
 | `USAGE_RETENTION_DAYS` | `90` | 使用记录保留天数 |
 | `CHECKIN_HOURS` | `9,21` | 每日自动签到小时 |
 | `CREDIT_REFRESH_MIN` | `30` | 额度刷新间隔（分钟） |

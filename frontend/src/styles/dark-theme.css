@@ -152,6 +152,20 @@ body .ant-select-dropdown .ant-select-selection-placeholder { color: #8a94a6 !im
 .ant-modal .ant-modal-body { color: #e6edf7 !important; }
 .ant-modal .ant-form-item-label > label { color: #cdd6e8 !important; }
 
+/* 弹窗内分隔线。antd 默认：线 rgba(5,5,5,0.06) 在深色底上几乎不可见、
+   文字 rgba(0,0,0,0.88) 是深色——不覆盖会「黑字黑底看不见」（历史事故同类）。
+   设置弹窗用带文字的分隔线分组，漏了这条整组标题就消失了。 */
+.ant-modal .ant-divider,
+.page-content .ant-divider {
+  border-color: rgba(255,255,255,0.12) !important;
+  border-block-start-color: rgba(255,255,255,0.12) !important;
+  color: #cdd6e8 !important;
+}
+.ant-modal .ant-divider .ant-divider-inner-text,
+.page-content .ant-divider .ant-divider-inner-text {
+  color: #cdd6e8 !important;
+}
+
 /* 弹窗内输入类控件 */
 .ant-modal .ant-input,
 .ant-modal .ant-input-affix-wrapper,
@@ -253,6 +267,23 @@ body .ant-select-item-group { color: #7d8aa5 !important; }
 }
 .page-content .ant-radio-group .ant-radio-button-wrapper:first-child { border-radius: 8px 0 0 8px; }
 .page-content .ant-radio-group .ant-radio-button-wrapper:last-child { border-radius: 0 8px 8px 0; }
+
+/* 弹窗内分段控件：弹窗 portal 到 body 下，上面的 .page-content 前缀管不到它，
+   不补这段扫码登录的「国内版/国际版」切换会露 antd 默认白底（同类事故见文件头注释）。 */
+.ant-modal .ant-radio-group .ant-radio-button-wrapper {
+  background: #121a30 !important;
+  border-color: rgba(99,179,237,0.25) !important;
+  color: #8a94a6 !important;
+}
+.ant-modal .ant-radio-group .ant-radio-button-wrapper:hover { color: #7cc0f5 !important; }
+.ant-modal .ant-radio-group .ant-radio-button-wrapper-checked {
+  background: linear-gradient(135deg, rgba(99,102,241,0.55), rgba(139,92,246,0.55)) !important;
+  border-color: #818cf8 !important;
+  color: #fff !important;
+}
+.ant-modal .ant-radio-group .ant-radio-button-wrapper:not(:first-child)::before {
+  background: rgba(99,179,237,0.25) !important;
+}
 
 /* popover / popconfirm（portal 到 body 下，需同结构 + !important 覆盖白底） */
 .ant-popover .ant-popover-inner {

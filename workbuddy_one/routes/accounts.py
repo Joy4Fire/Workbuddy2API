@@ -150,18 +150,25 @@ def register(app: FastAPI, ctx) -> None:
         return {"ok": True, "account": info}
 
     @app.post("/admin/oauth/start")
-    def admin_oauth_start():
-        """发起扫码登录，返回 {state, authUrl} 用于前端展示二维码。"""
+    def admin_oauth_start(region: str | None = None):
+        """发起扫码登录，返回 {state, authUrl, region} 用于前端展示二维码。
+
+        region 可选 "cn" / "global"（缺省 cn）：国际版账号必须打到国际站控制面，
+        否则拿到的 authUrl 域名不对、登录回来的凭据不可用。
+        """
         try:
-            return {"ok": True, **oauth_begin()}
+            return {"ok": True, **oauth_begin(region_id=region)}
         except OAuthError as e:
             raise HTTPException(status_code=502, detail={"error": {"message": str(e)}})
 
     @app.get("/admin/oauth/status")
-    async def admin_oauth_status(state: str):
-        """轮询扫码登录状态；ready 时自动落盘并注册账号。"""
+    async def admin_oauth_status(state: str, region: str | None = None):
+        """轮询扫码登录状态；ready 时自动落盘并注册账号。
+
+        region 必须与 /admin/oauth/start 时一致（前端回传 start 返回的 region）。
+        """
         # oauth_poll 内含同步网络请求，放线程池避免阻塞事件循环
-        result = await asyncio.to_thread(oauth_poll, state)
+        result = await asyncio.to_thread(oauth_poll, state, region)
         if result.get("status") == "expired":
             # state 失效等不可恢复错误：明确告知前端，避免二维码永远转圈
             return {"status": "expired"}
