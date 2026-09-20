@@ -80,6 +80,11 @@ class Config:
     # ALL_PROXY 等环境变量，Docker/CI 里这些值经常无效或指向内网，会让本该直连的
     # 请求解析出坏代理（历史踩坑，见 net.py）。需要走代理时在这里显式填。
     proxy: str = field(default_factory=lambda: _get("PROXY", "").strip())
+    # 出站客户端身份 UA 的逃生口。留空 = 按账号区域自动用官方客户端身份
+    # （国内版 CLI / 国际版桌面端，见 region.py）。上游会从 UA 里解析客户端版本，
+    # 填一个它认不出的值会被 400 code=12403 拒绝（`/v3/config` 等路径），
+    # 所以这里只用于"官方 UA 被临时封了"这种救急场景，默认不要动。
+    user_agent: str = field(default_factory=lambda: _get("USER_AGENT", "").strip())
 
     # WebUI 里设置过的覆盖值（来自 DB 的 settings 表）。空 = 回落上面的环境变量。
     # 之所以用独立 dict 而不是直接改上面那几个字段，是为了让"环境变量给的默认值"和

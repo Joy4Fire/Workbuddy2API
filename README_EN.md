@@ -91,6 +91,7 @@ Set via environment variables, or copy as `.env`:
 | `DOMAIN` | `www.codebuddy.cn` | Fallback domain when an auth file has no `domain` (also decides the default region = China) |
 | `WORKBUDDY_EXE` | auto-detect | Path to the official client, used only to decrypt `$wbEncrypted` auth |
 | `PROXY` | empty (direct) | Outbound proxy (`http://` / `socks5://`). `HTTP_PROXY`-style env vars are deliberately ignored; set this explicitly if you need a proxy |
+| `USER_AGENT` | empty (per region) | Outbound client identity UA. Empty = CLI identity for China, desktop identity for Global (the upstream parses a client version out of the UA, and **the UA changes which model catalog you get**). Only set this if the official UA is ever blocked |
 | `USAGE_RETENTION_DAYS` | `90` | Usage log retention days |
 | `CHECKIN_HOURS` | `9,21` | Daily auto check-in hours |
 | `CREDIT_REFRESH_MIN` | `30` | Credit refresh interval (minutes) |

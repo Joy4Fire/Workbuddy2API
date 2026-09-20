@@ -104,7 +104,7 @@ Workbuddy2API/
 # 一切命令在 Workbuddy2API/ 目录下执行；Python 一律用 venv 解释器
 cd N:\代码\workbuddy2Api\Workbuddy2API
 
-# 跑测试（unittest，不是 pytest；182 个必须全绿）
+# 跑测试（unittest，不是 pytest；201 个必须全绿）
 .\.venv\Scripts\python.exe -m unittest discover -s tests
 
 # 本地起服务（开发调试用）
@@ -156,6 +156,7 @@ docker compose up -d --build --force-recreate
 - **11128 判的是「第一条消息」，不是「有没有 system」**（`reasoning.ensure_leading_system`）：判据必须是 `msgs[0].role == "system"`，**不能**写成 `any(role == system)`——客户端发 `[user, system]` 这种把 system 放后面的顺序时，「存在即不补」会让上游照样 400（对齐参考实现 Buddy2api v2.1.13 的 issue #75 修复）。补的是**空** system，对两个区域都无害。
 - **非流式聚合必须拿到明确完成标记，不伪造 `stop`**（`upstream.collect_upstream`）：实测上游正常完成时**一定**同时发 `finish_reason` 与 `[DONE]`。所以「既无 `[DONE]` 也无 `finish_reason`」或「有 `[DONE]` 但始终没有 `finish_reason`」都判为异常流并返回 502。**不要**退回 `finish_reason or "stop"`——那会把截断的半截回答伪装成正常完成，客户端的重试/降级策略永不触发，观测上也看不出上游出过问题。有 `tool_calls` 却缺 `finish_reason` 时补 `"tool_calls"`（比 `"stop"` 准确）；明确的 `finish_reason` 之后直接 EOF 仍接受。
 - **出站 HTTP 客户端一律走 `net.py`**（`net.client()` / `net.async_client()`）：不要在新代码里直接写 `httpx.Client(...)`。默认 `trust_env=False` 是刻意的——httpx 会读 `HTTP_PROXY`/`ALL_PROXY` 等环境变量，Docker/CI 里这些值经常无效或指向内网，会让本该直连的请求解析出坏代理（症状是「莫名全部超时」）。需要代理时用 `PROXY`（环境变量或 WebUI 设置）**显式**指定，而不是放开 `trust_env` 去赌环境变量干不干净。
+- **出站必须声称自己是官方客户端，且身份按区域选**（`identity.py` + `region.client_user_agent`）：上游会**从 User-Agent 里解析客户端版本号**，解析不出直接拒绝（`400 code=12403 check ua, get coding copilot version error`）——曾经自报 `Workbuddy2API/0.4`，结果 `/v3/config` 整条路径不可用。而且 UA 不是"礼貌标识"而是**会改变功能结果的路由参数**：2026-09-20 实测同一账号打 `/v3/config`，国际版桌面端身份（`WorkBuddy/5.4.2`）给 21 个 cli 白名单模型，CLI 身份只有 20 个；国内版反过来，桌面端身份的 cli 白名单**为空**（所以国内版必须用 CLI 身份）。聊天链路另需每请求一个新的 `X-Request-ID`（→ 响应头 `x-request-id`）与 `X-Conversation-Message-ID`（→ SSE 里的消息 `id`），否则上游会自己编一个（控制台里表现为「使用端 -」的匿名流量）。**刻意不发** `X-Conversation-ID` / `X-Session-ID` / `X-Conversation-Request-ID`：实测单独发送无任何可观察效果，而 `X-Conversation-ID` 很可能是上游 prompt cache 的归属键，每请求随机有打散缓存、白烧额度的风险（详见 `identity.py` 模块注释）。逃生口：`USER_AGENT` 环境变量可整体覆盖 UA。
 - **模型目录 ≠ 模型可用性**（`models.regions_for` 的边界）：`_model_regions` 记录的是「该模型**出现在哪些区域的目录里**」，**不是**「它在哪些区域能调用」。2026-09-20 真实双账号实测：`hy3-x` / `deepseek-v4-pro` 只在国内版目录、国际版调用确实 400 `11102 service info not found`（区域路由的必要性成立）；但 `auto`（只在国内版目录）与 `deep-model`（只在国际版目录）在**另一区域同样能正常调用**。因此前端**只能**把它当提示/筛选条件，**绝不能**据此把模型置灰或禁用——那会错误地劝退能用的模型。要判断"能不能用"只能实际发一次请求。
 - **部署级配置可在 WebUI 覆盖，DB 值优先于环境变量**（`config.OVERRIDABLE` = `backend` / `proxy` / `workbuddy_exe`）：取值一律走 `config.backend_effective` / `proxy_effective` / `workbuddy_exe_effective`，**不要**直接读 `config.backend` 等原始字段（那只是环境变量默认值，不含 WebUI 设置）。空字符串严格等于"未设置"→ 回落环境变量，这样"在界面上清空"的语义单一、不会出现"空值覆盖了环境变量"的歧义。载入点在 `app.py:create_app`（必须在建账号池之前，区域判定依赖 BACKEND）与 `admin_save_settings` 末尾（保存后立刻重载，无需重启）。
 
@@ -192,7 +193,7 @@ docker compose up -d --build --force-recreate
 
 ## 10. 改完之后的自检清单
 
-1. `.\.venv\Scripts\python.exe -m unittest discover -s tests` → **170 个全绿**（现有基线，不允许变红）。
+1. `.\.venv\Scripts\python.exe -m unittest discover -s tests` → **201 个全绿**（现有基线，不允许变红）。
 2. 改了 `.py` → 重启 uvicorn；改了前端 → `pnpm build` + 强刷浏览器。
 3. WebUI 六页人工过一遍：概览（卡片/趋势图/最近记录）、账号（列表/签到/设置弹窗/扫码）、模型（列表/AA 指标）、用量、应用（Key 查看）、使用记录（筛选/详情/CSV 导出）。
 4. 冒烟一条真实请求：`POST /v1/chat/completions`（带某应用 Key），确认使用记录页出现新条目、tokens/积分正常。
@@ -203,7 +204,7 @@ docker compose up -d --build --force-recreate
 
 ## 11. 当前状态速览（2026-09 快照）
 
-- 版本 0.4.1；182 个测试全绿；本地 8787 端口跑 uvicorn（Docker 部署需用户重建镜像）。
+- 版本 0.4.1；201 个测试全绿；本地 8787 端口跑 uvicorn（Docker 部署需用户重建镜像）。
 - `CODE_REVIEW_TODO.md` 的 P0×4 / P1×4 / P2×11 已全部修复完成（每条带实现备注）；P3×10 打磨项仍开放，可做可跳过。后续问题登记在它后面，按优先级做。
 - 已吸收参考项目更新：developer 角色归一（防上游 11128）、DeepSeek thinking 注入与多轮 reasoning_content 回填、deepseek-v4.1-flash 档位（均见 `reasoning.py`）。
 - 第二轮吸收（2026-09-14，Sliverkiss #28/#31/#165 等）：限流文案识别 + 6004/11140「将在…重置」墙钟精确冷却（`gateway/errors.py` + `cooldown_for_error`）；DeepSeek 回填门控对齐官方 thinkingEnabled||hasTrace；非流式聚合空流哨兵 502 + sawDone 截断丢残缺 tool_calls（`upstream.py`）；会话粘性路由（`gateway/session.py`，多账号保 prompt cache）；auths 目录热加载（scheduler 指纹 + app.py `_reload_auths`）。
@@ -229,3 +230,9 @@ docker compose up -d --build --force-recreate
   - **模型页标区域 + 软筛选**：`/admin/models` 每条补 `regions`，另返回 `pool_regions`（账号池实际拥有的区域）。卡片显示「双区域 / 仅国内版目录 / 仅国际版目录」角标，不在账号目录内的加「账号目录外」提示 + 工具栏「只看账号目录内的模型」复选框。**刻意不做置灰/禁用**（理由见第 6 节「模型目录 ≠ 模型可用性」）。
   - **设置页加「区域与网络」卡片**：展示账号池区域分布；`BACKEND` / `PROXY` / `WORKBUDDY_EXE` 从纯环境变量提升为可覆盖项（DB 优先于 env，保存后立刻重载生效）。此前用户完全不知道这三个开关存在。弹窗标题由「自动签到设置」改为「设置」——它早就装下了定时任务/预警/别名/AA Key，旧名字名不副实。
   - **顺带修复**：`keepalive_enabled` 漏登记在 `DEFAULT_SETTINGS` 白名单里，导致 WebUI 保存"每日 token 保活"开关被 `save_settings` **静默丢弃**（界面永远显示"开启"、实际改不动）。补 `TestSettingsWhitelist` 用例守住。
+- **第五轮：出站身份（使用端）—— 2026-09-20**（测试 182 → **201**）。起因是用户在官方控制台看到"我们发的请求使用端显示 `-`、请求 id 和 WorkBuddy 自己发的不一样"，怀疑国际版需要把使用端标成 WorkBuddy。实测结论：
+  - **我们此前自报网关名 `Workbuddy2API/0.4`，会被上游硬拒**：`/v3/config` 返回 `400 code=12403 check ua, get coding copilot version error`（上游从 UA 解析客户端版本号，解析不出即拒）。改为按区域使用官方身份后该路径恢复 200。新增 `workbuddy_one/identity.py` 统一出站身份，UA 常量按区域放在 `region.client_user_agent`（差异仍集中在 `region.py`）。
+  - **UA 会改变模型目录**（这是"标记使用端"真正的功能意义，不只是标识）：同一账号打 `/v3/config`，国际版桌面端身份 21 个 cli 白名单模型 vs CLI 身份 20 个（多 `deepseek-v4.1-flash-sg` / `hy4-preview-f`）；国内版反之，桌面端身份的 cli 白名单**为空**，必须用 CLI 身份。**我们当前使用的插件目录路径（`/v2/...` / `/console/...`）实测对 UA 完全不敏感**（换三种 UA 集合完全一致），所以本轮没有改变现有模型清单。
+  - **id 差异的根因是"我们没带 id"**：逐头实测——`X-Request-ID` → 响应头 `x-request-id` 原样回显；`X-Conversation-Message-ID` → SSE 里的消息 `id` 原样回显；`X-Conversation-ID` / `X-Session-ID` / `X-Conversation-Request-ID` 单独发送**无任何可观察效果**。不带时上游自己编（消息 id 形如 `cmb-<uuid1>`，控制台里请求 id 形如 `crb-<uuid1>`、使用端显示 `-`）。已补前两个，**刻意不发**后三个（`X-Conversation-ID` 很可能是 prompt cache 归属键，每请求随机有打散缓存的风险，未实测清楚前不引入）。
+  - **发现但未采纳（待决策）**：`/v3/config` 才是官方 IDE 模型下拉的真实来源，比我们现用的插件目录更全——国际版多出 `deepseek-v4.1-flash`（正是用户桌面端 agent 实际在用的模型）、`deepseek-v4.1-flash-sg`、`gpt-6-astra`、`hy4-preview-f`、`kimi-k2.8-preview`，少 `gpt-5.3-codex` / `hy4-preview`；国内版多 `minimax-m2.7`、少 `auto`（`models.py` 已有 auto 回填，不会真丢）。切换属于会改变用户可见模型清单的独立改动，需要先确认口径（建议取两路径并集而非替换）。
+  - 副作用提示：流式响应此前透传上游 id（`cmb-<uuid>`），现在变成我们提供的 32 位 hex（非流式路径本就自造 `chatcmpl-workbuddy`，未受影响）。

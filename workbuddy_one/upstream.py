@@ -16,7 +16,7 @@ from typing import AsyncIterator
 
 import httpx
 
-from . import net, region
+from . import identity, net, region
 from .config import config
 
 logger = logging.getLogger("workbuddy_one.upstream")
@@ -77,6 +77,11 @@ def _chat_url(headers) -> str:
 async def stream_upstream(headers: dict, body: dict) -> AsyncIterator[str]:
     """透传上游 SSE 流，逐行 yield 原始 data 行（含 [DONE]）。"""
     url = _chat_url(headers)
+    # 聊天链路补身份头 + 每请求一个的 request id：上游据此把请求归属到某个
+    # 「使用端」。不带的话上游会替我们编一个 id（控制台里显示成「使用端 -」、
+    # 请求 id 是上游合成的），出问题无从对账。详见 identity.py。
+    headers = dict(headers)
+    headers.update(identity.chat_headers(_domain_from_headers(headers)))
     client = _get_client()
     async with client.stream("POST", url, headers=headers, json=body) as resp:
         if resp.status_code != 200:

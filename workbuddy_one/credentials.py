@@ -14,7 +14,7 @@ import time
 from pathlib import Path
 
 
-from . import atrest, net
+from . import atrest, identity, net
 from .config import config
 from .region import Region, chat_base, detect_region
 
@@ -146,16 +146,15 @@ class CredentialManager:
         if not isinstance(token, str):
             # 加密信封（或任何非字符串）：绝不能拼进 Authorization 头
             raise atrest.encrypted_auth_error(self.path)
-        h = {
+        h = identity.identity_headers(domain)
+        h.update({
             "Content-Type": "application/json",
-            "Accept": "application/json",
             "Authorization": f"Bearer {token}",
             "X-User-Id": account.get("uid", ""),
             "X-Enterprise-Id": account.get("enterpriseId", ""),
             "X-Tenant-Id": account.get("enterpriseId", ""),
             "X-Domain": domain,
-            "User-Agent": "Workbuddy2API/0.4",
-        }
+        })
         return h
 
     def _refresh(self):
