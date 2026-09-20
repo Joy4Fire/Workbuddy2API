@@ -29,6 +29,19 @@ const loading = ref(false)
 
 const healthyCount = computed(() => data.value.accounts.filter((a) => a.healthy).length)
 
+// 区域分布：账号的 region 由后端从 auth 文件的 auth.domain 自动判定，这里只做展示。
+// 刻意不提供"切换当前版本"的全局开关——区域必须跟着账号走（同一进程里国内版和
+// 国际版账号是共存的），加开关只会让用户以为要二选一。
+const regionStats = computed(() => {
+  const accs = data.value.accounts ?? []
+  const out: { id: string; label: string; color: string; count: number }[] = []
+  const cn = accs.filter((a) => a.region === 'cn').length
+  const global = accs.filter((a) => a.region === 'global').length
+  if (cn) out.push({ id: 'cn', label: '国内版', color: 'blue', count: cn })
+  if (global) out.push({ id: 'global', label: '国际版', color: 'purple', count: global })
+  return out
+})
+
 // 积分预警横幅（后端按阈值计算：余额不足/积分即将到期）
 const alerts = computed(() => data.value.alerts ?? [])
 
@@ -212,6 +225,13 @@ onUnmounted(() => {
         </div>
       </div>
 
+      <!-- 区域分布：紧跟账号健康卡，作为它的补充说明 -->
+      <div v-if="regionStats.length" class="region-bar">
+        <span class="region-bar-title">账号区域分布</span>
+        <a-tag v-for="r in regionStats" :key="r.id" :color="r.color">{{ r.label }} {{ r.count }} 个</a-tag>
+        <span class="region-bar-note">区域按账号自动判定，国内版与国际版可同时在线，无需手动切换</span>
+      </div>
+
       <!-- 趋势折线图（k3 建议概览页补趋势） -->
       <div class="panel" style="margin-top: 16px">
         <div class="panel-title">请求趋势（近 24 小时）</div>
@@ -293,6 +313,17 @@ onUnmounted(() => {
 .stat-info { display: flex; flex-direction: column; }
 .stat-title { font-size: 12px; color: #8a94a6; }
 .stat-value { font-size: 22px; font-weight: 700; line-height: 1.2; color: #e6edf7; }
+
+/* 区域分布：一行细条，不额外占一屏高度 */
+.region-bar {
+  display: flex; align-items: center; gap: 10px; flex-wrap: wrap;
+  margin-top: 12px; padding: 10px 16px;
+  border-radius: 12px;
+  background: linear-gradient(150deg, #1b2038 0%, #232a4a 100%);
+  border: 1px solid rgba(99, 179, 237, 0.15);
+}
+.region-bar-title { font-size: 12px; color: #8a94a6; letter-spacing: 1px; }
+.region-bar-note { font-size: 12px; color: #6b7688; margin-left: auto; }
 
 .panel {
   background: linear-gradient(150deg, #1b2038 0%, #232a4a 100%);
