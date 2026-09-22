@@ -8,7 +8,7 @@
 > **新增功能批次（2026-09-13，非 review 项）**：积分预警 webhook（Bark/企微/飞书自动识别 + 6h 去重 + 概览横幅）、账号禁用原因（schema v4 disabled_reason）、使用记录内容搜索、流式心跳（`: keepalive`，pump+队列实现防客户端超时）、每周自动全量备份（≥7 天触发，保留 4 份）、签到失败重试（2h×3 次）、模型别名映射（settings.model_aliases，/v1/models 别名条目 + 请求归一）。
 > 实现与方案的偏差已标注在对应条目内。
 >
-> **状态（2026-09-22）：本清单 #1~#32 全部完成；#33 为同日重建容器时新发现、尚未修复的待办。** 458 个测试全绿。
+> **状态（2026-09-22）：本清单 #1~#33 全部完成，无遗留项。** 462 个测试全绿。
 > 最后收口的是 #29（记录页模型筛选分组，原条目自己判定"可接受"，但 `apps`/`apps_history`
 > 已有现成先例，照抄成本极低）与 #31/#32（2026-09-22 新增：跨月判定恒真的真 bug，
 > 以及把"补签卡保护哪条连登"这一环查清——原注释标着"未验证"，实测结论与当时的担忧相反）。
@@ -23,28 +23,34 @@
 
 ---
 
-## P4 — 待办（2026-09-22 重建容器时新发现，**未修复**）
+## P4 — 本轮新增（2026-09-22 重建容器时发现）
 
-### 33. ⬜ 未修复 —— 启动被上游预热**无上限阻塞**，容器重建后可能 `unhealthy` 数分钟
+### 33. ✅ 已完成（2026-09-22）—— 启动被上游预热**无上限阻塞**，容器重建后可能 `unhealthy` 数分钟
 
-- **位置**：`workbuddy_one/scheduler.py` `start()`（约 line 110-130）。
-- **现象**（2026-09-22 重建容器时亲历，非推断）：`docker-compose up -d --build --force-recreate` 后
+- **位置**：`workbuddy_one/scheduler.py` `start()`。
+- **现象**（重建容器时亲历，非推断）：`docker-compose up -d --build --force-recreate` 后
   uvicorn 打印到 `Waiting for application startup.` 就停住，**容器内 8787 是 `Connection refused`**，
   宿主机 curl 得到 `Empty reply from server`，`docker ps` 显示 `unhealthy`；约 **105 秒后**才出现
   `Application startup complete.`。
 - **根因**：`start()` 里 `await self.refresh_credits()` / `await asyncio.to_thread(self.models.refresh)` /
   `await asyncio.to_thread(self.benchmarks.refresh)` 都是**串行 await 且没有超时**。当天上游网络抖动，
-  `benchmarks.refresh` 打 AA 时报 `SSLEOFError(8, UNEXPECTED_EOF_WHILE_READING)` 才返回——
-  日志：`22:24:04 WARNING workbuddy_one.benchmarks: AA fetch error: [SSL: UNEXPECTED_EOF_WHILE_READING]`，
-  紧接着才是 `Application startup complete.`。**uvicorn 在 lifespan 启动完成前不监听端口**，
-  所以上游慢 = 整个 WebUI 不可用（不是降级，是彻底打不开），并且会被 healthcheck 判为 unhealthy。
-- **为什么值得修**：这正是 2026-09-22 那次「PyPI TLS 抖动」的同一个网络问题。启动可用性
-  不该依赖外部站点可达性——预热是**优化**（"页面首开即有数据"），不该成为**可用性前提**。
-- **候选修法**（需权衡，故未擅自实施）：给每个预热步骤包 `asyncio.wait_for(..., timeout=N)`，
-  或把预热整体改成 `asyncio.create_task()` 后台跑（`_task` 已经在 `start()` 开头就创建了，
-  预热本来也不是"必须先完成"才能对外服务）。注意保持"预热失败不影响启动"的现有语义
-  （现在每一步都已各自 `try/except`，缺的只是**时间上限**）。
-- **验收**：断网（或把 `AA` 地址指向黑洞）后重建容器，`/health` 应在数秒内可访问。
+  `benchmarks.refresh` 打 AA 时报 `SSLEOFError(8, UNEXPECTED_EOF_WHILE_READING)` 才返回。
+  **uvicorn 在 lifespan 的 startup 阶段不监听端口**，所以上游慢 = 整个 WebUI 不可用
+  （不是降级，是彻底打不开），并且会被 healthcheck 判为 unhealthy。
+- **修法**（已实施）：把预热抽成 `_warmup()`，用
+  `asyncio.wait_for(asyncio.shield(self._warmup_task), timeout=_WARMUP_BUDGET_SECONDS)` 套**总预算 30 秒**。
+  - **`shield` 是必需的**：`wait_for` 默认会取消被等的协程，那样超时后剩下的预热步骤就不跑了，
+    "预热在后台继续"会变成谎话。shield 让超时只放弃**等待**。
+  - **30 秒的依据**：正常网络下 2 账号的额度+签到状态刷新约 18 秒、模型目录有缓存时几乎瞬时 →
+    30 秒足够完整跑完，**正常情况行为与改动前完全一致**，只有上游异常时才提前放行。
+  - `add_done_callback(_log_warmup_failure)`：超时放行后任务没人 await，若之后才抛异常，
+    asyncio 只会打一句 "Task exception was never retrieved"；显式记日志并说清不影响服务。
+    `stop()` 也取消它。
+- **验收**：4 条用例（`tests/test_policy.py::TestStartupWarmupBudget`）+ **变异验证**：
+  **去掉 `shield` → "超时后后台继续"那条立刻变红**；**预算改成 `0.0` → "真值预算"那条变红**。
+- **可复用的教训**：① 排查"服务起不来"先分清**容器内 vs 宿主机**——宿主机 `Empty reply`
+  （端口代理已接）+ 容器内 `Connection refused`（uvicorn 还没 bind）= 应用还没启动完，不是网络故障。
+  ② **任何在 lifespan 里 `await` 的外部调用，都等于把服务可用性押在外部站点上**，必须给时间上限。
 
 ---
 
@@ -52,7 +58,7 @@
 
 | 事项 | 命令 / 说明 |
 |---|---|
-| 后端测试 | 在 `Workbuddy2API/` 目录执行 `.venv\Scripts\python.exe -m unittest discover -s tests`（当前 **458** 个用例全绿，改完必须保持全绿；权威基线以 `AGENTS.md` 第 10 节为准） |
+| 后端测试 | 在 `Workbuddy2API/` 目录执行 `.venv\Scripts\python.exe -m unittest discover -s tests`（当前 **462** 个用例全绿，改完必须保持全绿；权威基线以 `AGENTS.md` 第 10 节为准） |
 | 前端构建 | `cd frontend && pnpm build`（改任何 .vue/.ts 后必须重新 build，否则 WebUI 不更新） |
 | 本地起服务 | `.venv\Scripts\python.exe -m uvicorn workbuddy_one.app:create_app --factory --host 127.0.0.1 --port 8787`（改任何 .py 后必须重启进程） |
 | Docker 重建 | `docker-compose up -d --build --force-recreate`（**独立可执行文件**；`docker compose` 带空格的子命令在本机不可用。宿主机 data/、auths/ 是挂载卷，不受影响） |

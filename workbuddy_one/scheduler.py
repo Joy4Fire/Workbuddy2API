@@ -59,6 +59,33 @@ def _parse_hour(s: str, default: int) -> int:
     return default
 
 
+# 启动预热的**总时间预算**（秒）。
+#
+# 为什么必须有上限：uvicorn 在 lifespan 的 startup 阶段**不监听端口**，所以"预热慢"
+# 会直接变成"整个 WebUI 打不开"——不是降级，是彻底不可用，容器还会被判 unhealthy。
+# 2026-09-22 重建容器时实测：AA 评测那次 `SSLEOFError` 把启动拖了 **105 秒**。
+# 预热是"页面首开即有数据"的**优化**，不该成为**可用性前提**。
+#
+# 取 30 秒的依据：正常网络下 2 账号的额度+签到状态刷新约 18 秒、模型目录有缓存时几乎
+# 瞬时，30 秒足够完整跑完 —— 即**正常情况行为与加这个上限之前完全一致**，只有上游
+# 异常时才会提前放行。`tests/test_policy.py::TestStartupWarmupBudget` 钉住它。
+_WARMUP_BUDGET_SECONDS = 30.0
+
+
+def _log_warmup_failure(task: "asyncio.Task") -> None:
+    """预热任务若在**放行之后**才失败，把异常取出来记日志。
+
+    不加这个回调的话，超时放行后 `_warmup_task` 就没人 await 了，一旦它抛异常，
+    asyncio 只会在垃圾回收时打一句 "Task exception was never retrieved" —— 既看不出
+    是哪一步失败，也看不出"服务其实没事"。这里显式记下来，并说清不影响服务。
+    """
+    if task.cancelled():
+        return
+    exc = task.exception()
+    if exc is not None:
+        logger.warning("启动预热在放行之后失败（不影响对外服务）：%s", exc)
+
+
 class Scheduler:
     def __init__(self, pool: AccountPool, *, db=None, models=None, benchmarks=None, credit_interval_min: int = 30,
                  usage_retention_days: int = 90):
@@ -91,6 +118,9 @@ class Scheduler:
         self._last_aa_refresh_date: str | None = None
         self._last_cleanup_date: str | None = None
         self._task: asyncio.Task | None = None
+        # 启动预热任务（见 start()）。单独留引用有两个原因：别被 GC 掉，
+        # 以及 stop() 时要能取消它。
+        self._warmup_task: asyncio.Task | None = None
         self._running = False
         # 连续保活失败计数（uid → 次数）：避免偶发网络抖动一次就永久禁用账号
         self._keepalive_fails: dict[str, int] = {}
@@ -110,6 +140,29 @@ class Scheduler:
     async def start(self):
         self._running = True
         self._task = asyncio.create_task(self._run())
+        # 预热（额度 / 模型目录 / AA 评测 / 存量瘦身）带**总预算**：正常网络下会完整跑完
+        # （行为与加预算之前一致），上游异常时最多等 _WARMUP_BUDGET_SECONDS 就放行，
+        # 让 WebUI 先可用。
+        #
+        # `shield` 是这里的关键：不加它，`wait_for` 一超时就会**取消** `_warmup`，
+        # 后面的步骤就真的不跑了 —— 那样日志里那句"后台继续"就是假的。
+        # shield 让超时只放弃"等待"，_warmup 仍在后台跑完，缓存照样会填上。
+        self._warmup_task = asyncio.create_task(self._warmup())
+        self._warmup_task.add_done_callback(_log_warmup_failure)
+        try:
+            await asyncio.wait_for(asyncio.shield(self._warmup_task),
+                                   timeout=_WARMUP_BUDGET_SECONDS)
+        except asyncio.TimeoutError:
+            logger.warning(
+                "启动预热超过 %.0f 秒仍未完成：先放行对外服务，预热在后台继续"
+                "（页面上的额度/模型数据可能稍后才出现）", _WARMUP_BUDGET_SECONDS)
+
+    async def _warmup(self):
+        """启动预热：额度 + 模型目录 + AA 评测 + 存量瘦身。
+
+        顺序、异常处理与原先内联在 `start()` 里的版本完全一致 —— 抽出来只是为了
+        给它套一个时间上限（见 `_WARMUP_BUDGET_SECONDS`）。
+        """
         # 启动时：刷新额度 + 模型目录 + AA 评测（全部预热，页面首开即有数据）
         await self.refresh_credits()
         if self.models:
@@ -133,6 +186,10 @@ class Scheduler:
         self._running = False
         if self._task:
             self._task.cancel()
+        # 预热还在后台跑的话也取消掉（`to_thread` 里的同步工作无法真正中断，
+        # 但至少不再等它、也不会留下悬挂的 task）
+        if self._warmup_task:
+            self._warmup_task.cancel()
 
     def _setting(self, key: str, default: str) -> str:
         if self.db:

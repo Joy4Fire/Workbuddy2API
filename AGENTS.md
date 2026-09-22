@@ -96,7 +96,7 @@ Workbuddy2API/
 │   ├── src/styles/           # base.css（布局）+ dark-theme.css（antd 深色覆盖，见 §7 前端要点）
 │   ├── src/types/index.ts    # 后端 /admin/* 响应的 TS 类型（改接口记得同步）
 │   └── dist/                 # 构建产物（跟踪进 git；由后端 app.py 直接伺服；改动前端后必须重新 build，见 §4）
-├── tests/                    # unittest 测试（458 个用例；test_policy.py 是错误处置/账号池治理）
+├── tests/                    # unittest 测试（462 个用例；test_policy.py 是错误处置/账号池治理）
 ├── docs/                     # 设计与评估文档（吸收评估、db 迁移、区域 UX、FIX_PLAN）
 ├── scripts/migrate_db.py     # 独立迁移脚本（--check 只查版本）
 ├── data/                     # 运行时数据：workbuddy.db、attachments/、.secret_key   ←机密，见 §8
@@ -117,7 +117,7 @@ Workbuddy2API/
 # 一切命令在 Workbuddy2API/ 目录下执行；Python 一律用 venv 解释器
 cd N:\代码\workbuddy2Api\Workbuddy2API
 
-# 跑测试（unittest，不是 pytest；458 个必须全绿）
+# 跑测试（unittest，不是 pytest；462 个必须全绿）
 .\.venv\Scripts\python.exe -m unittest discover -s tests
 
 # 本地起服务（开发调试用）
@@ -312,7 +312,7 @@ docker-compose up -d --build --force-recreate
 
 ## 10. 改完之后的自检清单
 
-1. `.\.venv\Scripts\python.exe -m unittest discover -s tests` → **458 个全绿**（现有基线，不允许变红）。
+1. `.\.venv\Scripts\python.exe -m unittest discover -s tests` → **462 个全绿**（现有基线，不允许变红）。
    顺带自查一遍有没有 `ResourceWarning: unclosed database`——测试里开了 `Database` 不关连接会在 GC 时报，
    在 Windows 上还可能让随后的 `unlink` 偶发失败。用 `addCleanup(db._conn.close)` 兜住
    （`tests/test_policy.py` 的 `_open_db()` 就是干这个的）。
@@ -327,7 +327,7 @@ docker-compose up -d --build --force-recreate
 
 ## 11. 当前状态速览（2026-09 快照）
 
-- 版本 **0.5.0**（唯一真源 = `workbuddy_one/__init__.py`，别在别处写死）；458 个测试全绿；本地 8787 端口跑 uvicorn（Docker 部署见第 9 节的 `docker-compose` 用法）。
+- 版本 **0.5.0**（唯一真源 = `workbuddy_one/__init__.py`，别在别处写死）；462 个测试全绿；本地 8787 端口跑 uvicorn（Docker 部署见第 9 节的 `docker-compose` 用法）。
 - `CODE_REVIEW_TODO.md` 的 **P0×4 / P1×4 / P2×11 / P3×13（#20~#32）已全部完成，无遗留项**（每条带实现备注）。
   后续新问题登记在它后面，按优先级做。其中 #24 的**原诊断被实测推翻**（`KNOWN_EFFORTS` 不是冷启动兜底
   而是当前生效的主策略），#29 由"可接受"改判为值得做（照抄 `apps`/`apps_history` 的现成分组先例）。
@@ -990,5 +990,42 @@ if not fetched:
   **可复用的教训**：**同一份信息存在多处副本，就一定会有副本漂移，而且漂移了不会报错。**
   （本项目已第二次栽在这上面：第一次是 `DEFAULT_SETTINGS` 白名单与消费端键名，
   这次是版本号。）能收敛就收敛；收敛不了（如 npm 的 package.json）就用**一条断言钉住**。
+
+- **第十八轮：给启动预热加时间上限 —— 上游慢不该让 WebUI 打不开 —— 2026-09-22**（测试 458 → **462**）。
+
+  **起因**：第十七轮重建容器时亲历（不是推测）——`docker-compose up -d --build` 之后
+  uvicorn 打印到 `Waiting for application startup.` 就停住，**容器内 8787 是
+  `Connection refused`**、宿主机 curl 得到 `Empty reply from server`、
+  `docker ps` 显示 `unhealthy`，**约 105 秒后**才出现 `Application startup complete.`。
+
+  **根因**：`scheduler.start()` 里的预热步骤（额度刷新 / 模型目录 / AA 评测 / 存量瘦身）
+  都是**串行 `await` 且没有任何超时**。当天上游网络抖动，`benchmarks.refresh` 打 AA 时报
+  `SSLEOFError(8, UNEXPECTED_EOF_WHILE_READING)` 才返回。
+  **关键机理：uvicorn 在 lifespan 的 startup 阶段不监听端口** ——
+  所以"预热慢"不是降级，是**整个 WebUI 彻底打不开**，并且会被 healthcheck 判为 unhealthy。
+
+  **改动**：`start()` 把预热抽成 `_warmup()`，用 `asyncio.wait_for(asyncio.shield(...),
+  timeout=_WARMUP_BUDGET_SECONDS)` 套一个**总预算 30 秒**。两个要点：
+  - **`shield` 不能省**。`wait_for` 默认会**取消**被等的协程，那样超时后剩下的预热步骤
+    就真的不跑了 —— 日志里那句"预热在后台继续"会变成谎话。shield 让超时只放弃"等待"。
+  - **30 秒的依据**：正常网络下 2 账号的额度+签到状态刷新约 18 秒、模型目录有缓存时几乎瞬时，
+    30 秒足够完整跑完 → **正常情况行为与改动前完全一致**，只有上游异常时才提前放行。
+  - `add_done_callback(_log_warmup_failure)`：超时放行后 `_warmup_task` 没人 await，
+    若它之后才抛异常，asyncio 只会打一句 "Task exception was never retrieved"。
+    显式取出来记日志，并说清不影响服务。`stop()` 也会取消它。
+
+  **4 条新用例**（`TestStartupWarmupBudget`），并**做了变异验证**（确认用例真能抓住回归）：
+  - 预热挂住 → `start()` 必须按时返回 + 有告警（预算 patch 成 0.2 秒）
+  - **超时后预热仍在后台跑完** —— 专门钉 `shield`：**去掉 shield 这条立刻变红**（实测）
+  - **用真值预算**跑一条：快的预热必须被 await 完 —— 防"预算被写成 0"时上面全绿、
+    但"页面首开即有数据"静默失效（**把常量改成 0.0 实测这条会红**）
+  - 预算本身必须 `> 0` 且 `<= 60`
+
+  **可复用的教训**：
+  1. **"服务起不来"要先分清「容器内」还是「宿主机」**：宿主机 curl 得到 `Empty reply`
+     （Docker 端口代理已接）、容器内是 `Connection refused`（uvicorn 还没 bind）——
+     两者同时出现就是"应用还没启动完"，不是网络故障。
+  2. **任何在 lifespan 里 `await` 的外部调用，都等于把"服务可用性"押在外部站点上。**
+     预热是优化，必须给它时间上限（或干脆后台跑）。
 
 

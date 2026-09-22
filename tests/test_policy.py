@@ -7,6 +7,7 @@
   3. `Retry-After` 头族解析。
   4. 账号池的 (账号,模型) 冷却、连败降权、在途并发、停用双状态位。
   5. DB v6 / v7 迁移、`model_blocks` 与 `model_costs` 的持久化与**删号级联**。
+  6. 启动预热的时间上限（`scheduler._WARMUP_BUDGET_SECONDS`）—— 上游慢不该让 WebUI 打不开。
 
 临时文件一律放系统临时目录（tempfile.mkdtemp()）：仓库可能在网络盘上，
 而网络盘没有回收站，删除会退化成失败的 SHFileOperationW，单次 rmtree 实测 11~36 秒。
@@ -2672,6 +2673,107 @@ class TestVersionSingleSource(unittest.TestCase):
         self.assertEqual(db._user_version(), SCHEMA_VERSION)
         self.assertEqual(db.migrated_from, 5,
                          "旧库升级后没记下来源版本 → 用户看不到「数据已升级」")
+
+
+class TestStartupWarmupBudget(unittest.IsolatedAsyncioTestCase):
+    """启动预热必须有时间上限（`CODE_REVIEW_TODO.md` #33）。
+
+    背景：uvicorn 在 lifespan 的 startup 阶段**不监听端口**，所以"预热慢"会直接
+    变成"整个 WebUI 打不开"——不是降级，是彻底不可用，容器还会被判 unhealthy。
+    2026-09-22 重建容器时实测被 AA 评测的 SSL 失败拖了 **105 秒**。
+    预热是"页面首开即有数据"的优化，不该是可用性前提。
+    """
+
+    async def _start_with(self, warmup, budget=None):
+        """跑一次 start()，返回 (耗时秒, 告警文本列表, scheduler)。
+
+        用**自定义 handler** 而不是 `assertLogs`：这几条用例里有的会告警、有的不该告警，
+        `assertLogs` 在没有日志时会直接失败，套不上。
+        """
+        import logging
+        from unittest import mock
+        from workbuddy_one import scheduler as S
+        from workbuddy_one.pool import AccountPool
+
+        pool = AccountPool({})
+        pool.add_account("u1", None)
+        sched = S.Scheduler(pool, db=None)
+        # `_run` 的后台循环会真的去打上游；本用例只关心 start() 有没有被预热拖住
+        sched._run = mock.AsyncMock()
+        sched._warmup = warmup
+
+        warnings: list[str] = []
+        handler = logging.Handler()
+        handler.emit = lambda r: warnings.append(r.getMessage())
+        log = logging.getLogger("workbuddy_one.scheduler")
+        log.addHandler(handler)
+        self.addCleanup(log.removeHandler, handler)
+
+        patches = []
+        if budget is not None:
+            patches.append(mock.patch.object(S, "_WARMUP_BUDGET_SECONDS", budget))
+        for p in patches:
+            p.start()
+        self.addCleanup(lambda: [p.stop() for p in patches])
+
+        # 交给清理阶段停：超时那条用例要在**测试体内**等后台预热跑完，
+        # 提前 stop() 会把预热取消掉，用例就假失败了。
+        self.addAsyncCleanup(sched.stop)
+        t0 = time.monotonic()
+        await sched.start()
+        return time.monotonic() - t0, warnings, sched
+
+    async def test_hanging_warmup_does_not_block_startup(self):
+        """上游卡住时 start() 必须按时返回，而不是一直等下去。"""
+        import asyncio
+
+        async def hang():
+            await asyncio.Event().wait()   # 永不返回：模拟上游挂住
+
+        elapsed, warnings, _ = await self._start_with(hang, budget=0.2)
+        self.assertLess(elapsed, 2.0, "预热超时后 start() 仍被拖住")
+        self.assertTrue(any("启动预热超过" in m for m in warnings),
+                        f"超时没有告警，用户不会知道预热没跑完：{warnings}")
+
+    async def test_timed_out_warmup_keeps_running_in_background(self):
+        """超时只放弃「等待」——预热本身必须继续跑完。
+
+        这条用例专门钉 `asyncio.shield`：`asyncio.wait_for` 默认会**取消**被等的协程，
+        少了 shield，日志里那句"预热在后台继续"就是谎话（说了、没做）。
+        """
+        import asyncio
+
+        done = asyncio.Event()
+
+        async def slow():
+            await asyncio.sleep(0.35)
+            done.set()
+
+        await self._start_with(slow, budget=0.1)
+        # 不超时本身就是断言；超时会抛 TimeoutError 让用例红。
+        await asyncio.wait_for(done.wait(), timeout=3.0)
+
+    async def test_real_budget_lets_a_normal_warmup_finish(self):
+        """用**真值**预算跑：正常的（快的）预热必须被 await 完，不能提前放行。
+
+        防的是"把常量改坏"：预算若被写成 0 或负数，上面两条用例照样全绿，
+        但"页面首开即有数据"这个既有语义会**静默失效**。
+        """
+        ran = []
+
+        async def quick():
+            ran.append(True)
+
+        await self._start_with(quick)          # 不传 budget → 用模块里的真值
+        self.assertEqual(ran, [True],
+                         "快预热没被 await 完 → 首开页面会没有数据（既有语义被破坏）")
+
+    def test_budget_is_a_sane_positive_bound(self):
+        """预算本身要合理：必须 > 0，也不能大到"打不开"持续到分钟级。"""
+        from workbuddy_one import scheduler as S
+        self.assertGreater(S._WARMUP_BUDGET_SECONDS, 0)
+        self.assertLessEqual(S._WARMUP_BUDGET_SECONDS, 60.0,
+                             "预算过大 → 上游异常时 WebUI 仍会长时间打不开")
 
 
 if __name__ == "__main__":
