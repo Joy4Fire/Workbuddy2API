@@ -19,6 +19,7 @@ const router = createRouter({
     { path: '/usage', component: () => import('./views/Usage.vue'), meta: { title: '用量' } },
     { path: '/records', component: () => import('./views/Records.vue'), meta: { title: '使用记录' } },
     { path: '/apps', component: () => import('./views/Apps.vue'), meta: { title: '应用' } },
+    { path: '/settings', component: () => import('./views/Settings.vue'), meta: { title: '设置' } },
   ],
 })
 

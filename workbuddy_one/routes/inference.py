@@ -118,8 +118,12 @@ def register(app: FastAPI, ctx) -> None:
                 if session_key:
                     ctx.session_router.bind(session_key, account.uid)
             except UpstreamError as e:
+                # open_upstream 内部已按错误分类表罚过号（含禁用/模型级冷却），
+                # 这里只记账，**不能**再 update_pool——重复施加会把已经设好的
+                # 冷却用 cooldown_for_error 的返回值覆盖掉（对 CLIENT 类是 0，
+                # 等于把刚设的冷却清掉）。
                 log_usage("chat", model_name, account, t0, "error", f"HTTP {e.status_code}", input_content=input_text,
-                          cooldown=inference.cooldown_for_error(e.status_code, e.raw))
+                          update_pool=False)
                 raise HTTPException(status_code=e.status_code, detail=safe_err(e.raw, e.status_code))
             except httpx.HTTPError as e:
                 log_usage("chat", model_name, account, t0, "error", str(e), input_content=input_text,
@@ -167,8 +171,11 @@ def register(app: FastAPI, ctx) -> None:
                               reasoning_content="".join(_reason_parts), update_pool=False)
                     raise
                 except UpstreamError as e:
-                    log_usage("chat", model_name, account, t0, "error", f"HTTP {e.status_code}", input_content=input_text,
-                              cooldown=inference.cooldown_for_error(e.status_code, e.raw))
+                    # 流中途断开：这里**不在** open_upstream 的处置范围内，要走
+                    # penalize 施加分类表策略（含禁用/模型级冷却），记账侧只落库。
+                    act = inference.penalize(ctx, account, e.status_code, e.raw, e.headers, model_name)
+                    log_usage("chat", model_name, account, t0, "error", f"HTTP {e.status_code}",
+                              input_content=input_text, cooldown=act.cooldown, update_pool=False)
                     yield f'data: {json_error(e.status_code, str(e.raw.decode("utf-8", "replace")))}\n\n'.encode()
                     yield b"data: [DONE]\n\n"
                 except Exception as e:  # noqa: BLE001
@@ -182,7 +189,13 @@ def register(app: FastAPI, ctx) -> None:
         try:
             if config.ratelimit:
                 await inference.limiter(ctx, account.uid).wait_if_needed()
-            collected = await collect_upstream(headers, body)
+            # 非流式：没有"连接建立 → 长流"的切分，整段都是阻塞的，所以在途名额
+            # 覆盖整个 collect（比流式路径更严，但方向一致：别让同一账号同时挨多个请求）
+            ctx.pool.acquire_slot(account.uid)
+            try:
+                collected = await collect_upstream(headers, body)
+            finally:
+                ctx.pool.release_slot(account.uid)
             _msg = (collected.get("choices") or [{}])[0].get("message", {})
             # 工具调用摘要并入输出记录（非流式 agent 回复常只有 tool_calls）
             _tc_summary = "".join(
@@ -194,8 +207,10 @@ def register(app: FastAPI, ctx) -> None:
                        reasoning_content=_msg.get("reasoning_content") or "")
             return JSONResponse(content=collected)
         except UpstreamError as e:
-            log_usage("chat", model_name, account, t0, "error", f"HTTP {e.status_code}", input_content=input_text,
-                      cooldown=inference.cooldown_for_error(e.status_code, e.raw))
+            # 直连 collect_upstream，没走 open_upstream 的处置链 → 这里补上
+            act = inference.penalize(ctx, account, e.status_code, e.raw, e.headers, model_name)
+            log_usage("chat", model_name, account, t0, "error", f"HTTP {e.status_code}",
+                      input_content=input_text, cooldown=act.cooldown, update_pool=False)
             raise HTTPException(status_code=e.status_code, detail=safe_err(e.raw, e.status_code))
         except httpx.HTTPError as e:
             log_usage("chat", model_name, account, t0, "error", str(e), input_content=input_text,
@@ -232,8 +247,9 @@ def register(app: FastAPI, ctx) -> None:
             if session_key:
                 ctx.session_router.bind(session_key, account.uid)
         except UpstreamError as e:
-            log_usage("anthropic", model_name, account, t0, "error", f"HTTP {e.status_code}", input_content=input_text,
-                      cooldown=inference.cooldown_for_error(e.status_code, e.raw))
+            # open_upstream 已罚过号 → 只记账（同 chat 流式路径的注释）
+            log_usage("anthropic", model_name, account, t0, "error", f"HTTP {e.status_code}",
+                      input_content=input_text, update_pool=False)
             raise HTTPException(status_code=e.status_code, detail=safe_err(e.raw, e.status_code))
         except httpx.HTTPError as e:
             log_usage("anthropic", model_name, account, t0, "error", str(e), input_content=input_text,
@@ -276,8 +292,10 @@ def register(app: FastAPI, ctx) -> None:
                 errored["flag"] = True
                 errored["status"] = e.status_code
                 errored["msg"] = str(e.raw.decode("utf-8", "replace"))
-                log_usage("anthropic", model_name, account, t0, "error", f"HTTP {e.status_code}", input_content=input_text,
-                          cooldown=inference.cooldown_for_error(e.status_code, e.raw))
+                # 流中途断开：不在 open_upstream 处置范围内 → 走分类表补罚
+                act = inference.penalize(ctx, account, e.status_code, e.raw, e.headers, model_name)
+                log_usage("anthropic", model_name, account, t0, "error", f"HTTP {e.status_code}",
+                          input_content=input_text, cooldown=act.cooldown, update_pool=False)
                 yield err_anthropic(e.status_code, errored["msg"]).encode()
             except Exception as e:  # noqa: BLE001
                 errored["flag"] = True
@@ -327,8 +345,9 @@ def register(app: FastAPI, ctx) -> None:
             if session_key:
                 ctx.session_router.bind(session_key, account.uid)
         except UpstreamError as e:
-            log_usage("responses", model_name, account, t0, "error", f"HTTP {e.status_code}", input_content=input_text,
-                      cooldown=inference.cooldown_for_error(e.status_code, e.raw))
+            # open_upstream 已罚过号 → 只记账（同 chat 流式路径的注释）
+            log_usage("responses", model_name, account, t0, "error", f"HTTP {e.status_code}",
+                      input_content=input_text, update_pool=False)
             raise HTTPException(status_code=e.status_code, detail=safe_err(e.raw, e.status_code))
         except httpx.HTTPError as e:
             log_usage("responses", model_name, account, t0, "error", str(e), input_content=input_text,
@@ -370,8 +389,10 @@ def register(app: FastAPI, ctx) -> None:
                 errored["flag"] = True
                 errored["status"] = e.status_code
                 errored["msg"] = str(e.raw.decode("utf-8", "replace"))
-                log_usage("responses", model_name, account, t0, "error", f"HTTP {e.status_code}", input_content=input_text,
-                          cooldown=inference.cooldown_for_error(e.status_code, e.raw))
+                # 流中途断开：不在 open_upstream 处置范围内 → 走分类表补罚
+                act = inference.penalize(ctx, account, e.status_code, e.raw, e.headers, model_name)
+                log_usage("responses", model_name, account, t0, "error", f"HTTP {e.status_code}",
+                          input_content=input_text, cooldown=act.cooldown, update_pool=False)
                 yield f'data: {json_error(e.status_code, errored["msg"])}\n\n'.encode()
                 yield b"data: [DONE]\n\n"
             except Exception as e:  # noqa: BLE001

@@ -12,7 +12,8 @@
     python scripts/migrate_db.py --check        # 只查看版本，不做迁移
 
 行为：
-  - 版本低于最新 → 先自动备份到 data/backups/（保留 5 份）再逐级迁移，数据保留
+  - 版本低于最新 → 先自动备份（**库文件同级的 `backups/`**，默认即 `data/backups/`，
+    保留 5 份）再逐级迁移，数据保留
   - 已是最新版本 → 原样退出（幂等，无副作用）
   - 全新空库   → 建表到最新版本（不产生迁移备份）
 """
@@ -58,7 +59,8 @@ def main() -> int:
         print("[✓] 已是最新版本，无需迁移")
         return 0
 
-    print(f"[i] 开始迁移 v{current} → v{SCHEMA_VERSION}（迁移前自动备份到 data/backups/）...")
+    print(f"[i] 开始迁移 v{current} → v{SCHEMA_VERSION}"
+          f"（迁移前自动备份到 {db_path.parent / 'backups'}）...")
     db = Database(str(db_path))  # __init__ 内：备份 → 建表 → 逐级迁移 → 索引
     try:
         final = db._conn.execute("PRAGMA user_version").fetchone()[0]

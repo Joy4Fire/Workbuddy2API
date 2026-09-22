@@ -70,6 +70,44 @@ function regionTip(m: ModelInfo): string {
     + '多数区域专属模型跨区域调用会返回 11102，但也有例外（如 auto 在只出现在国内版目录时，国际版同样可调用）。'
 }
 
+// ---- 成本系数（上游标称倍率）----
+//
+// 上游对同一个模型**按区域可能给不同的成本系数**（实测 hy4-preview：
+// 国内版 x0.29 / 国际版 x0.00），而后端合并只按 reasoning 信息量挑赢家、
+// `credits` 不参与比较 —— 所以 `credits` 只是"恰好赢了的那个区域"的值。
+// `credits_by_region` 才是全貌：**两区域值不同时并列显示**，相同时保持单值，
+// 免得把本来一致的东西拆成两行制造噪音。
+const CREDIT_REGION_ORDER: Record<string, number> = { 国内: 0, 国际: 1 }
+
+function creditParts(m: ModelInfo): { label: string; value: number }[] {
+  const by = m.credits_by_region || {}
+  const parts = Object.entries(by)
+    .filter(([, v]) => v !== null && v !== undefined)
+    .map(([rid, v]) => ({ label: rid === 'global' ? '国际' : '国内', value: v as number }))
+    // 国内在前：顺序必须稳定，否则每次刷新两个值会互换位置，看起来像"价格变了"
+    .sort((a, b) => (CREDIT_REGION_ORDER[a.label] ?? 9) - (CREDIT_REGION_ORDER[b.label] ?? 9))
+  if (new Set(parts.map((p) => p.value)).size > 1) return parts
+  const single = m.credits
+  if (single === undefined || single === null) return []
+  return [{ label: '', value: single }]
+}
+
+function creditText(m: ModelInfo): string {
+  const parts = creditParts(m)
+  if (!parts.length) return '-'
+  return parts.map((p) => (p.label ? `${p.label} x${p.value.toFixed(2)}` : `x${p.value.toFixed(2)}`)).join(' / ')
+}
+
+function creditTip(m: ModelInfo): string {
+  const parts = creditParts(m)
+  if (parts.length > 1) {
+    return `上游对同一模型按区域给了不同成本系数：${parts.map((p) => `${p.label}版 x${p.value.toFixed(2)}`).join('，')}。`
+      + '实际消耗取决于请求落到哪个区域的账号——想看"实际烧了多少积分"请到「用量」页的实测积分单价。'
+  }
+  if (!parts.length) return '上游目录没有给这个模型的成本系数。'
+  return '上游标称的成本系数（倍率），不是实际消耗。实际烧多少积分见「用量」页的实测积分单价。'
+}
+
 async function load() {
   loading.value = true
   try {
@@ -234,7 +272,12 @@ onMounted(load)
 
           <!-- 指标区 -->
           <div class="metric-grid">
-            <div class="mi"><span class="mi-k">成本</span><span class="mi-v">{{ m.credits !== undefined && m.credits !== null ? `x${m.credits.toFixed(2)}` : '-' }}</span></div>
+            <div class="mi">
+              <span class="mi-k">成本</span>
+              <a-tooltip :title="creditTip(m)">
+                <span class="mi-v" :class="{ split: creditParts(m).length > 1 }">{{ creditText(m) }}</span>
+              </a-tooltip>
+            </div>
             <div class="mi"><span class="mi-k">上下文</span><span class="mi-v">{{ fmtTokens(m.context_length) }}</span></div>
             <div class="mi"><span class="mi-k">最大输出</span><span class="mi-v">{{ fmtTokens(m.max_output_tokens) }}</span></div>
             <div class="mi"><span class="mi-k">温度</span><span class="mi-v">{{ m.temperature !== undefined ? m.temperature : '-' }}</span></div>
@@ -352,6 +395,8 @@ onMounted(load)
 .mi { display: flex; justify-content: space-between; align-items: center; min-width: 0; }
 .mi-k { font-size: 12px; color: #8a94a6; flex-shrink: 0; }
 .mi-v { font-size: 14px; font-weight: 600; color: #63b3ed; padding-left: 8px; white-space: nowrap; }
+/* 两区域不同价时并列显示，允许换行（否则 nowrap 会撑破 1fr 的格子） */
+.mi-v.split { font-size: 12px; white-space: normal; text-align: right; line-height: 1.35; }
 
 .desc { font-size: 12px; color: #9aa5bd; line-height: 1.5; margin-bottom: 10px; }
 

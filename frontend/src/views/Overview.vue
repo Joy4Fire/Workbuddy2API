@@ -264,7 +264,7 @@ onUnmounted(() => {
           <a-table-column title="积分" data-index="credits" key="credits" align="right" :width="70">
             <template #default="{ record }">
               <span v-if="record.credits" style="color: #fbbf24">{{ record.credits.toFixed(2) }}</span>
-              <span v-else style="color: #555">-</span>
+              <span v-else style="color: #7d8aa5">-</span>
             </template>
           </a-table-column>
           <a-table-column title="状态" data-index="status" key="status" align="left" :width="80">
@@ -323,7 +323,7 @@ onUnmounted(() => {
   border: 1px solid rgba(99, 179, 237, 0.15);
 }
 .region-bar-title { font-size: 12px; color: #8a94a6; letter-spacing: 1px; }
-.region-bar-note { font-size: 12px; color: #6b7688; margin-left: auto; }
+.region-bar-note { font-size: 12px; color: #7d8aa5; margin-left: auto; }
 
 .panel {
   background: linear-gradient(150deg, #1b2038 0%, #232a4a 100%);

@@ -258,6 +258,40 @@ class ModelRegistry:
             out.append((entry, (mid, _extract_reasoning(m))))
         return out or None
 
+    def _entries_by_region(self) -> dict[str, list[tuple[dict, dict]]]:
+        """把当前缓存按**区域**切开，供某个区域拉取失败时按区域兜底沿用。
+
+        为什么要按区域切：两个区域的模型集大部分不重叠（实测国际版 18 / 国内版 16，
+        交集仅 5），所以"某个区域这次没拉到"**不能**退化成"整个目录少了 13 个模型"。
+        返回形状与 `_fetch_one` 一致（`[(entry, (mid, reasoning_cfg))]`），
+        好让兜底数据走完全相同的合并路径。
+        """
+        with self._lock:
+            models = [dict(m) for m in (self._models or [])]
+            reasoning = {k: dict(v) for k, v in self._reasoning.items()}
+            regions = {k: set(v) for k, v in self._model_regions.items()}
+        out: dict[str, list[tuple[dict, dict]]] = {}
+        for m in models:
+            mid = m.get("id")
+            for rid in regions.get(mid, set()):
+                cfg = reasoning.get(mid)
+                if not isinstance(cfg, dict):
+                    cfg = m.get("reasoning") if isinstance(m.get("reasoning"), dict) else {}
+                # `entry["reasoning"]` 与 `meta[1]` 在真实数据里是**两个 dict**，
+                # 兜底数据也要保持这个形状，否则"只改了一处"的 bug 会被掩盖。
+                e = dict(m)
+                e["reasoning"] = dict(cfg)
+                # `credits` 是**合并后**的（赢家区域的值），直接用会让"该区域的成本系数"
+                # 在兜底路径上被算成赢家的值。有分区域明细就还原成该区域自己的值。
+                _by = m.get("credits_by_region")
+                if isinstance(_by, dict) and rid in _by:
+                    e["credits"] = _by[rid]
+                # 明细表本身丢掉：合并阶段会按"这次真正拿到的区域"重新攒一份，
+                # 留着旧表会让"某区域这次没给成本系数"被旧值掩盖。
+                e.pop("credits_by_region", None)
+                out.setdefault(rid, []).append((e, (mid, dict(cfg))))
+        return out
+
     def _fetch_from_upstream(self) -> tuple[list, dict[str, set[str]]] | None:
         """按区域各取一个健康账号拉取目录，合并成并集。
 
@@ -266,24 +300,103 @@ class ModelRegistry:
         路由到没有 A 的区域，上游返回 400（code=11102 service info not found）。
 
         返回 (模型条目列表, {模型 id: 可用区域 id 集合})；后者供选号时按模型过滤账号。
+
+        条目上除 `credits`（成本系数，赢家区域的值）外还会挂 `credits_by_region`
+        （`{区域 id: 成本系数}`，只含真的给了值的区域）——上游对同一模型**按区域
+        可能给不同价**，而合并只按 reasoning 信息量挑赢家，不记明细就只剩一个值。
+
+        **某个区域拉取失败时沿用该区域的上一份条目**（2026-09-22 实测的必要性）：
+        国际版账号一次瞬时 TLS 失败（`[SSL: UNEXPECTED_EOF_WHILE_READING]`）就会让
+        13 个国际版专属模型从 `/v1/models` 里静默消失，而且这份"半份目录"会被当成
+        **成功结果**缓存下来（`_fetched_at` 被刷新、负缓存被清），最长要等 24 小时后的
+        定时刷新才可能恢复。模型清单是用户可见的东西，不能因为一次网络抖动就少一半。
+        （反过来：一个区域都没成功时仍然返回 None，让 `refresh()` 走"失败保留旧缓存 +
+        负缓存"的老路——否则兜底数据会伪装成一次成功刷新，上游长期挂掉时我们既不告警
+        也不再重试。）
         """
         by_region: dict[str, list] = {}
         for acc in self.pool.accounts:
             by_region.setdefault(acc.region_id, []).append(acc)
 
+        prev_by_region = self._entries_by_region()
+
         merged: dict[str, tuple[dict, dict]] = {}
         model_regions: dict[str, set[str]] = {}
+        # 模型 id → {区域 id: 成本系数}。**上游按区域给的成本系数可能不同**
+        # （2026-09-22 实测 hy4-preview：国内版 x0.29 / 国际版 x0.00），
+        # 而下面的合并只按 reasoning 信息量挑赢家、`credits` 根本不参与比较
+        # → 落败区域的值会被静默丢掉。这里单独记一份，让界面能如实显示
+        # "同一模型在两个区域不同价"，而不是只看到恰好赢了的那个。
+        credits_by_region: dict[str, dict[str, float]] = {}
+        fresh: set[str] = set()
+        stale: set[str] = set()
         for rid in sorted(by_region):
             acc = self.pool.pick(regions={rid})
-            if acc is None:
-                continue
-            fetched = self._fetch_one(acc)
-            if not fetched:
-                continue
+            fetched = self._fetch_one(acc) if acc is not None else None
+            if not fetched and acc is not None:
+                # 每区域**最多重试一次**。一次瞬时 TLS 失败
+                # （`[SSL: UNEXPECTED_EOF_WHILE_READING]`，实测在容器冷启动时出现过）
+                # 重试通常就过了；而冷启动时 `prev_by_region` 是空的、**没有东西可兜底**，
+                # 重试是唯一的补救机会。上限为 1 是刻意的：区域级失败多伴随后续刷新，
+                # 再多的重试只是把上游失败拖慢本进程，没有额外收益。
+                time.sleep(0.3)
+                fetched = self._fetch_one(acc)
+            if fetched:
+                fresh.add(rid)
+            else:
+                # 该区域这次没拉到（账号全在冷却 / 网络失败 / 目录为空）：沿用上次的条目
+                fetched = prev_by_region.get(rid) or []
+                if fetched:
+                    stale.add(rid)
             for entry, meta in fetched:
                 mid = entry["id"]
                 model_regions.setdefault(mid, set()).add(rid)
-                merged.setdefault(mid, (entry, meta))
+                # 成本系数按区域各记一份（None = 该区域没给，不是 0）
+                _c = entry.get("credits")
+                if _c is not None:
+                    credits_by_region.setdefault(mid, {})[rid] = _c
+                prev = merged.get(mid)
+                # 两区域对同一个模型的 reasoning 元数据**可能不一致**，而
+                # `sorted(by_region)` 让 cn 排在 global 前面，原来的 `setdefault`
+                # 等于"国内版永远赢"。实测（2026-09-21）这会丢数据：
+                #   glm-5.2 国际版给 supportedEfforts=[high,xhigh]，
+                #           国内版只给 effort=medium（无 supportedEfforts）；
+                #   hy3     国际版给 [low,high]，国内版只有 effort=high。
+                # 丢掉的后果不是"少显示一行"，而是 reasoning_efforts() 返回 None
+                # → 一路回落到 reasoning.KNOWN_EFFORTS 的**静态猜测表**。
+                # 所以改成"信息更全的赢"，只在严格更全时才替换——同档仍然先到先得，
+                # 保持既有行为不变。
+                #
+                # 但 `onlyReasoning` **不跟着这条规则走**：它与"信息量"是方向相反的
+                # 诉求（一个要最大、一个要保守），实测两者真的会打架（见
+                # `_merge_only_reasoning`）。所以它单独按保守 OR 合并，两个分支都要处理。
+                if prev is None:
+                    merged[mid] = (entry, meta)
+                elif _reasoning_rank(entry) > _reasoning_rank(prev[0]):
+                    _merge_only_reasoning((entry, meta), prev)
+                    merged[mid] = (entry, meta)
+                else:
+                    _merge_only_reasoning(prev, (entry, meta))
+
+        if not fresh:
+            # 一个区域都没成功：交给 refresh() 走"失败保留旧缓存 + 负缓存"的老路。
+            # 不能用兜底数据伪装成一次成功刷新——那会清掉 _last_fail，上游长期挂掉时
+            # 我们既不记负缓存、也不再重试，还会一直对外发一份越来越旧的目录。
+            return None
+        if stale:
+            logger.warning("模型目录：区域 %s 本次未拉到，沿用上次缓存（避免整片模型消失）",
+                           sorted(stale))
+
+        # 把"按区域"的成本系数挂回合并后的条目。
+        # `credits` 本身保持原语义（赢家区域的值），只在赢家**没给**时才用别的区域补上——
+        # 显示一个真实存在的价格比显示 "-" 有用，而 None 表示"该区域没给"、不是 0。
+        for mid, (entry, _meta) in merged.items():
+            by = credits_by_region.get(mid)
+            if not by:
+                continue
+            entry["credits_by_region"] = by
+            if entry.get("credits") is None:
+                entry["credits"] = by[sorted(by)[0]]
 
         if not merged:
             return None
@@ -351,6 +464,72 @@ def _capacity(row: dict) -> tuple[int, int]:
     return ctx, out
 
 
+def _reasoning_dicts(pair: tuple) -> list[dict]:
+    """取出一个合并单元 `(entry, meta)` 里所有的 reasoning 配置 dict。
+
+    同一个模型的 reasoning 配置在 `entry["reasoning"]`（供 /v1/models 输出）与
+    `meta[1]`（供 `ModelRegistry._reasoning` 查表）里**各存了一份**，改一处必须改两处。
+    """
+    entry, meta = pair
+    out: list[dict] = []
+    cfg = entry.get("reasoning") if isinstance(entry, dict) else None
+    if isinstance(cfg, dict):
+        out.append(cfg)
+    if isinstance(meta, tuple) and len(meta) > 1 and isinstance(meta[1], dict):
+        out.append(meta[1])
+    return out
+
+
+def _merge_only_reasoning(keep: tuple, drop: tuple) -> None:
+    """把落选区域里的 `onlyReasoning=True` 并进保留的那一份（**保守 OR**）。
+
+    为什么不跟着 `_reasoning_rank` 的"信息更全的赢"一起走：这两个字段的诉求
+    **方向相反**——
+      - `supportedEfforts` 描述"有哪些档位可用"，信息越多越好（取最大）；
+      - `onlyReasoning` 描述"思考关不掉"这个**能力限制**，宁可多报不可漏报（保守）。
+
+    实测（2026-09-22）两者真的会打架：`glm-5.2` 国内版 `onlyReasoning=true`、
+    国际版 `false`（且带 `canDisableThinking: true` / `supportedEfforts=[high,xhigh]`），
+    国际版档位信息更全 → 整条 entry 归国际版 → `off` 被放了出来。
+    但用真实请求实测，**两个区域给 glm-5.2 发 `reasoning_effort: "off"` 都返回 200
+    且照样产出思维链**（`reasoning_tokens` 分别 103 / 203；反而不带该参数时是 0）——
+    国际版目录那句 `onlyReasoning: false` 并不被模型服务端兑现。
+    `/v3/config`（官方 IDE 模型下拉的真实来源）也给出同一组区域矛盾，说明这不是
+    我们解析的问题，是上游自己按区域给了不同答案。
+
+    所以按保守方向合并：**只要有一个区域说关不掉，就认定关不掉**。
+    代价是可能少放一个其实可用的 `off`；收益是不会把"关不掉"谎报成"能关掉"
+    （后者会让客户端显示一个假的"不思考"开关，用户选了却照样出思维链）。
+    """
+    if not any(c.get("onlyReasoning") for c in _reasoning_dicts(drop)):
+        return
+    for c in _reasoning_dicts(keep):
+        c["onlyReasoning"] = True
+
+
+def _reasoning_rank(entry: dict) -> int:
+    """reasoning 元数据的"信息量"打分，供跨区域合并时择优（越大越可信）。
+
+    3 = 带 supportedEfforts（上游明确列出了支持的档位，可直接用于裁剪）
+    2 = 只带 defaultEffort / effort（只说明默认档，不足以裁剪，见 _extract_reasoning）
+    1 = 什么都没有（只有 supportsReasoning / onlyReasoning 这类开关）
+
+    只做**严格大于**比较：同分时保留先到的那个，跨区域合并的既有行为不变。
+
+    ⚠️ 本函数**只决定 `supportedEfforts` / `defaultEffort` / `effort` 的归属**，
+    不决定 `onlyReasoning`——后者按保守 OR 单独合并，见 `_merge_only_reasoning`。
+    两个字段的诉求方向相反，用一个分数一起决定会互相污染。
+    """
+    cfg = entry.get("reasoning")
+    if not isinstance(cfg, dict):
+        return 1
+    if cfg.get("supportedEfforts"):
+        return 3
+    if cfg.get("defaultEffort") or cfg.get("effort"):
+        return 2
+    return 1
+
+
 def _extract_reasoning(m: dict) -> dict:
     """从上游模型对象提取 reasoning/思考配置（动态获取）。"""
     r = m.get("reasoning") or {}
@@ -365,6 +544,16 @@ def _extract_reasoning(m: dict) -> dict:
             cfg["defaultEffort"] = r["defaultEffort"]
         if r.get("supportedEfforts"):
             cfg["supportedEfforts"] = list(r["supportedEfforts"])
+        # `effort`：国内版目录用它代替 defaultEffort（2026-09-21 实测两区域共 18 个模型
+        # 带这个字段，且**从不与 supportedEfforts 同时出现**）。
+        #
+        # 语义是"该模型默认跑在哪个档"，**不是**"只支持这一档"——实测给报
+        # effort=high 的 auto 发 reasoning_effort=low，上游照样 200（glm-5.2 同理，
+        # 它自称只支持 [high, xhigh] 但接受 low）。所以这里只**记录**它，
+        # 不喂给 reasoning_efforts() 参与档位裁剪：当成约束会把客户端的合法选择
+        # 无谓地改写掉。
+        if r.get("effort") and not r.get("defaultEffort"):
+            cfg["effort"] = r["effort"]
     return cfg
 
 

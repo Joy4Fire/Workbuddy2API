@@ -48,8 +48,10 @@ def _parse_int_list(s: str) -> tuple[int, ...]:
 
 
 # 允许在 WebUI 里覆盖的配置项（DB 值优先于环境变量）。
-# 这三项都是"部署形态"级别的开关，以前只能改环境变量，用户根本不知道它们存在。
-OVERRIDABLE = ("backend", "proxy", "workbuddy_exe")
+# 前两项是"部署形态"级别的开关（代理/后端/客户端路径），以前只能改环境变量；
+# 后两项是在途并发上限——上游风控档位会变，用户需要不改环境变量就能调。
+OVERRIDABLE = ("backend", "proxy", "workbuddy_exe",
+               "max_in_flight", "max_in_flight_global")
 
 
 @dataclass
@@ -85,6 +87,26 @@ class Config:
     # 填一个它认不出的值会被 400 code=12403 拒绝（`/v3/config` 等路径），
     # 所以这里只用于"官方 UA 被临时封了"这种救急场景，默认不要动。
     user_agent: str = field(default_factory=lambda: _get("USER_AGENT", "").strip())
+    # ---- 单账号在途并发上限（P1-1）----
+    # 上游按「同一账号同时打到它的连接数」做风控；一个客户端并发打过来时，
+    # 所有请求会被选号器分到同一个健康账号上，瞬间形成并发尖峰 → WAF 403 / 429。
+    # 只覆盖"建立连接 → 首字节到达"这段窗口（见 pool.acquire_slot 的注释）。
+    # 0 = 不限制。
+    max_in_flight: int = field(default_factory=lambda: int(_get("MAX_IN_FLIGHT", "3")))
+    # 国际版单独更低：global 域的风控档位更严（实测同一账号 global 侧更易触发
+    # 403/11140），所以给它更小的并发窗口。
+    max_in_flight_global: int = field(default_factory=lambda: int(_get("MAX_IN_FLIGHT_GLOBAL", "2")))
+    # ---- 连败降权（P1-2）----
+    # 无权威分类的失败（未知 4xx / 传输层）连续这么多次 → 账号临时出池
+    # fail_degrade_seconds 秒。带权威分类的错误不喂这个计数（各有精确恢复时刻）。
+    fail_streak_threshold: int = field(default_factory=lambda: int(_get("FAIL_STREAK_THRESHOLD", "5")))
+    fail_degrade_seconds: float = field(default_factory=lambda: float(_get("FAIL_DEGRADE_SECONDS", "600")))
+    # 日志级别（DEBUG/INFO/WARNING/ERROR/CRITICAL，或纯数字）。默认 WARNING = 既有行为。
+    # 为什么需要它：项目里 30 处 logger.info 在默认配置下**永远不会输出**（根 logger
+    # 默认 WARNING，且全项目没有 basicConfig/setLevel），排查时没有任何开关。
+    # 排查"档位为什么被降级""max_tokens 为什么被裁剪"这类问题时设 LOG_LEVEL=INFO。
+    # 只作用于 workbuddy_one 命名空间，不碰 uvicorn 自己的 logger，见 logsetup.py。
+    log_level: str = field(default_factory=lambda: _get("LOG_LEVEL", "WARNING"))
 
     # WebUI 里设置过的覆盖值（来自 DB 的 settings 表）。空 = 回落上面的环境变量。
     # 之所以用独立 dict 而不是直接改上面那几个字段，是为了让"环境变量给的默认值"和
@@ -122,6 +144,26 @@ class Config:
     def workbuddy_exe_effective(self) -> str:
         """实际生效的 WORKBUDDY_EXE：DB 覆盖 > 环境变量 > 空（=按平台默认位置探测）。"""
         return self._overrides.get("workbuddy_exe") or self.workbuddy_exe
+
+    def _int_override(self, key: str, fallback: int) -> int:
+        """取整数型覆盖项；空/非法一律回落环境变量值（不抛，配置坏不该让进程起不来）。"""
+        raw = self._overrides.get(key)
+        if not raw:
+            return fallback
+        try:
+            return max(0, int(raw))
+        except (TypeError, ValueError):
+            return fallback
+
+    @property
+    def max_in_flight_effective(self) -> int:
+        """实际生效的单账号在途并发上限（0 = 不限制）。"""
+        return self._int_override("max_in_flight", self.max_in_flight)
+
+    @property
+    def max_in_flight_global_effective(self) -> int:
+        """实际生效的国际版在途并发上限（国际版风控更严，单独一档）。"""
+        return self._int_override("max_in_flight_global", self.max_in_flight_global)
 
     @property
     def auth_dir_path(self) -> Path | None:

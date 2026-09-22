@@ -3,6 +3,8 @@ from __future__ import annotations
 
 from fastapi import FastAPI, HTTPException
 
+from ..pool import COST_TTL
+
 
 def register(app: FastAPI, ctx) -> None:
     db = ctx.db
@@ -10,6 +12,20 @@ def register(app: FastAPI, ctx) -> None:
     @app.get("/admin/usage/summary")
     def admin_usage_summary():
         return db.usage_summary()
+
+    @app.get("/admin/usage/costs")
+    def admin_usage_costs():
+        """实测积分单价台账（每 1k token 消耗多少积分），供「用量」页展示。
+
+        与模型目录里的 `credits` 是两回事：`credits` 是**上游标称的成本系数（倍率）**，
+        这里是**我们自己按真实请求算出来的** `积分 / token × 1000`（EMA 平滑，
+        `samples` 是累计样本数）。所以它才是"这个模型实际烧多少额度"的答案。
+
+        只读内存里的台账，不碰网络；`ttl_seconds` 告诉前端这个窗口有多长
+        （超过窗口的观测会被丢弃——过期价格比没有价格更误导）。
+        注意台账是 **(账号, 模型)** 维度，`region` 用于区分国内版/国际版账号。
+        """
+        return {"costs": ctx.pool.cost_table(), "ttl_seconds": COST_TTL}
 
     @app.get("/admin/usage/timeseries")
     def admin_usage_timeseries(granularity: str = "hour", points: int = 24, model: str | None = None):

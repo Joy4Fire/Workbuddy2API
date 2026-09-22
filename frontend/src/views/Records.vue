@@ -27,11 +27,12 @@ const searchText = ref('')
 const filterOptions = ref<{
   protocols: string[]
   models: string[]
+  models_history: string[]
   apps: string[]
   apps_history: string[]
   has_unnamed?: boolean
   statuses: string[]
-}>({ protocols: [], models: [], apps: [], apps_history: [], statuses: [] })
+}>({ protocols: [], models: [], models_history: [], apps: [], apps_history: [], statuses: [] })
 
 const detailVisible = ref(false)
 const lightRecord = ref<UsageRecord | null>(null)
@@ -174,7 +175,13 @@ onMounted(async () => {
         <a-select-option v-for="p in filterOptions.protocols" :key="p" :value="p">{{ p }}</a-select-option>
       </a-select>
       <a-select v-model:value="filters.model" placeholder="全部模型" allow-clear show-search style="width: 180px" @change="onFilterChange">
-        <a-select-option v-for="m in filterOptions.models" :key="m" :value="m">{{ m }}</a-select-option>
+        <!-- 最近用过的排前面；下架/退役模型只存在于更早的记录里，单独分组免得下拉拉得太长 -->
+        <a-select-opt-group v-if="filterOptions.models.length" label="最近 7 天用过">
+          <a-select-option v-for="m in filterOptions.models" :key="m" :value="m">{{ m }}</a-select-option>
+        </a-select-opt-group>
+        <a-select-opt-group v-if="filterOptions.models_history.length" label="更早用过（含已下架）">
+          <a-select-option v-for="m in filterOptions.models_history" :key="m" :value="m">{{ m }}</a-select-option>
+        </a-select-opt-group>
       </a-select>
       <a-select v-model:value="filters.app_name" placeholder="全部应用" allow-clear style="width: 150px" @change="onFilterChange">
         <!-- 只列现存应用（与应用页一致）；已删除应用的历史记录名单独分组，避免对不上 -->
@@ -216,20 +223,30 @@ onMounted(async () => {
           <template #default="{ record }">{{ fmtTime(record.ts) }}</template>
         </a-table-column>
         <a-table-column title="协议" data-index="protocol" key="protocol" :width="70" />
-        <a-table-column title="模型" data-index="model" key="model" :width="150" ellipsis />
+        <!-- 这里原来挂了裸 `ellipsis`，但它是空字符串、恒为假——a-table-column
+             组件未声明 props，Vue 不会做布尔转换，属性被静默忽略。模型 id 需要
+             完整可见（如 deepseek-v4.1-flash-sg），所以让它自然换行、不截断；
+             真需要截断必须写 :ellipsis="true"。 -->
+        <a-table-column title="模型" data-index="model" key="model" :width="150" />
         <a-table-column title="应用" key="app" :width="100">
           <template #default="{ record }">
             <a-tag v-if="record.app_name" color="purple" style="max-width: 100%; overflow: hidden; text-overflow: ellipsis">{{ record.app_name }}</a-tag>
-            <span v-else style="color: #5b6476">-</span>
+            <span v-else style="color: #7d8aa5">-</span>
           </template>
         </a-table-column>
-        <a-table-column title="Tokens" key="tokens" :width="110" align="right">
-          <template #default="{ record }">{{ record.input_tokens || 0 }}/{{ record.output_tokens || 0 }}</template>
+        <!-- 表头必须写明「入/出」：导出 CSV 的表头是「输入Tokens / 输出Tokens」，
+             而表格里原来只写 Tokens，看到 12/1 无从判断哪个是哪个 -->
+        <a-table-column title="Tokens 入/出" key="tokens" :width="110" align="right">
+          <template #default="{ record }">
+            <a-tooltip :title="`输入 ${record.input_tokens || 0} / 输出 ${record.output_tokens || 0}`">
+              {{ record.input_tokens || 0 }}/{{ record.output_tokens || 0 }}
+            </a-tooltip>
+          </template>
         </a-table-column>
         <a-table-column title="积分" key="credits" :width="70" align="right">
           <template #default="{ record }">
             <span v-if="record.credits">{{ record.credits.toFixed(2) }}</span>
-            <span v-else style="color: #5b6476">-</span>
+            <span v-else style="color: #7d8aa5">-</span>
           </template>
         </a-table-column>
         <a-table-column title="耗时" key="latency_ms" :width="80" align="right">

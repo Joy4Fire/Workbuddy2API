@@ -45,6 +45,29 @@ class TestRegionUserAgent(unittest.TestCase):
             self.assertEqual(region.user_agent("www.codebuddy.cn"), "MyCustom/9.9")
 
 
+class TestRegionIdeName(unittest.TestCase):
+    """控制台「使用端」由 X-IDE-Name 决定，必须按区域取值。
+
+    2026-09-20 四组对照实测：只改 X-IDE-Name 才能把使用端从 `CLI` 变成
+    `WorkBuddy`；改 X-IDE-Type 或 User-Agent 都不变（见 identity.py 模块注释）。
+    """
+
+    def test_global_reports_workbuddy(self):
+        self.assertEqual(region.ide_name("www.workbuddy.ai"), "WorkBuddy")
+
+    def test_cn_reports_cli(self):
+        self.assertEqual(region.ide_name("www.codebuddy.cn"), "CLI")
+
+    def test_unknown_domain_falls_back_to_cn(self):
+        self.assertEqual(region.ide_name(""), "CLI")
+        self.assertEqual(region.ide_name("example.com"), "CLI")
+
+    def test_user_agent_override_does_not_change_ide_name(self):
+        # UA 与「使用端」是两个独立开关：换 UA 不该连带换使用端标识
+        with patch.object(region.config, "user_agent", "MyCustom/9.9"):
+            self.assertEqual(region.ide_name("www.workbuddy.ai"), "WorkBuddy")
+
+
 class TestRequestId(unittest.TestCase):
     def test_format_is_32_lowercase_hex(self):
         rid = identity.new_request_id()
@@ -64,6 +87,16 @@ class TestIdentityHeaders(unittest.TestCase):
         self.assertEqual(h["X-IDE-Type"], "CLI")
         self.assertEqual(h["X-Requested-With"], "XMLHttpRequest")
 
+    def test_identity_headers_carry_region_ide_name(self):
+        # 使用端标识按区域注入（国际版 WorkBuddy / 国内版 CLI）
+        self.assertEqual(identity.identity_headers("www.workbuddy.ai")["X-IDE-Name"], "WorkBuddy")
+        self.assertEqual(identity.identity_headers("www.codebuddy.cn")["X-IDE-Name"], "CLI")
+
+    def test_static_identity_has_no_ide_name(self):
+        """`X-IDE-Name` 必须留在按区域注入的那一层，不能回到静态表里——
+        否则国际版会被写死成 CLI，控制台「使用端」又变回认不出的状态。"""
+        self.assertNotIn("X-IDE-Name", identity._IDENTITY)
+
     def test_identity_headers_have_no_request_id(self):
         # 身份头是静态的，不能混进每请求变化的 id（否则无法复用/比对）
         self.assertNotIn("X-Request-ID", identity.identity_headers("www.codebuddy.cn"))
@@ -79,14 +112,26 @@ class TestIdentityHeaders(unittest.TestCase):
         h = identity.chat_headers("www.workbuddy.ai")
         self.assertEqual(h["X-Conversation-Message-ID"], h["X-Request-ID"])
 
-    def test_chat_headers_do_not_send_conversation_scope_ids(self):
-        """刻意不发会话级 id：实测它们单独发送对响应没有任何影响，而
-        `X-Conversation-ID` 很可能正是上游 prompt cache 的归属键——每请求随机
-        有打散缓存、白烧额度的风险（见 identity.py 模块注释）。
-        这条用例防止有人"顺手补齐"。"""
+    def test_chat_headers_send_conversation_request_id(self):
+        """实测：控制台「请求」列那个 id 由 `X-Conversation-Request-ID` 决定；
+        不发时上游代造成 `crb-<uuid1>`（这就是长期对不上的那个前缀）。
+        与其余两个 id 头共用同一个值，便于「控制台 ↔ 响应头 ↔ SSE」对账。"""
         h = identity.chat_headers("www.workbuddy.ai")
-        for key in ("X-Conversation-ID", "X-Session-ID", "X-Conversation-Request-ID"):
+        self.assertEqual(h["X-Conversation-Request-ID"], h["X-Request-ID"])
+        self.assertEqual(len(h["X-Conversation-Request-ID"]), 32)
+
+    def test_chat_headers_do_not_send_conversation_scope_ids(self):
+        """刻意不发会话级 id：CW4/CW5 实测它们单独发送对响应和控制台显示都没有
+        任何影响，而 `X-Conversation-ID` 很可能正是上游 prompt cache 的归属键——
+        每请求随机有打散缓存、白烧额度的风险（见 identity.py 模块注释）。
+        这条用例防止有人"顺手补齐"。
+
+        注意 `X-Conversation-Request-ID` **不在**排除名单里：它是请求级 id，
+        且已实测对 prompt cache 零影响（命中 2304/2358 保持不变）。"""
+        h = identity.chat_headers("www.workbuddy.ai")
+        for key in ("X-Conversation-ID", "X-Session-ID"):
             self.assertNotIn(key, h)
+        self.assertIn("X-Conversation-Request-ID", h)
 
     def test_chat_headers_differ_per_call(self):
         a = identity.chat_headers("www.workbuddy.ai")
@@ -168,7 +213,9 @@ class TestStreamUpstreamSendsIdentity(unittest.IsolatedAsyncioTestCase):
         h = sink["headers"]
         self.assertEqual(h["User-Agent"], "WorkBuddy/5.4.2")
         self.assertEqual(h["X-Product"], "SaaS")
+        self.assertEqual(h["X-IDE-Name"], "WorkBuddy")
         self.assertEqual(len(h["X-Request-ID"]), 32)
+        self.assertEqual(h["X-Conversation-Request-ID"], h["X-Request-ID"])
         # 原有鉴权/路由字段不能被身份头挤掉
         self.assertEqual(h["Authorization"], "Bearer t")
         self.assertIn("workbuddy.ai", sink["url"])
@@ -176,6 +223,7 @@ class TestStreamUpstreamSendsIdentity(unittest.IsolatedAsyncioTestCase):
     async def test_cn_account_gets_cn_identity(self):
         sink = await self._capture({"X-Domain": "www.codebuddy.cn", "Authorization": "Bearer t"})
         self.assertEqual(sink["headers"]["User-Agent"], "CLI/2.139.0 CodeBuddy/2.139.0")
+        self.assertEqual(sink["headers"]["X-IDE-Name"], "CLI")
         self.assertIn("copilot.tencent.com", sink["url"])
 
     async def test_caller_headers_are_not_mutated(self):

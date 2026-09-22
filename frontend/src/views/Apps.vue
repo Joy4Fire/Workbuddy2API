@@ -134,7 +134,7 @@ onMounted(load)
         :loading="loading"
         row-key="id"
         :pagination="false"
-        :scroll="{ x: 1160 }"
+        :scroll="{ x: 1200 }"
         table-layout="fixed"
       >
         <a-table-column title="应用名称" data-index="name" key="name" :width="140">
@@ -147,10 +147,15 @@ onMounted(load)
             <code style="color: #7cc0f5">{{ record.key_prefix }}</code>
           </template>
         </a-table-column>
-        <a-table-column title="备注" key="note" :width="180" ellipsis>
+        <!-- 备注列刻意**不用** ellipsis：a-table-column 组件没有声明任何 props，
+             裸写 `ellipsis` 在 Vue 里是空字符串（恒为假），属性会被静默忽略、
+             既不截断也不报错；而备注需要完整可读，让它自然换行才对。
+             真需要截断时必须写 :ellipsis="true"（带冒号绑定）。
+             宽度 220 是为了让「DeepSeek Harness 网关调用」这类常见备注单行放下。 -->
+        <a-table-column title="备注" key="note" :width="220">
           <template #default="{ record }">
             <span v-if="record.note" style="color: #a5b8d8">{{ record.note }}</span>
-            <span v-else style="color: #5b6476">-</span>
+            <span v-else style="color: #7d8aa5">-</span>
           </template>
         </a-table-column>
         <a-table-column title="请求数" key="requests" :width="80" align="right">

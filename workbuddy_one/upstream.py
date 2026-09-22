@@ -40,8 +40,11 @@ _client: httpx.AsyncClient | None = None
 def _get_client() -> httpx.AsyncClient:
     global _client
     if _client is None or _client.is_closed:
+        # 细粒度超时：聊天流式**必须**把 read 放大（模型思考/长回答期间没有字节），
+        # 但 connect 要短——上游不可达时不该干等 5 分钟才失败。
+        # 传单个数字（如 timeout=300）会让 connect 也变成 300，正是要避免的。
         _client = net.async_client(
-            timeout=300,
+            timeout=httpx.Timeout(connect=10.0, read=300.0, write=30.0, pool=10.0),
             limits=httpx.Limits(max_connections=50, max_keepalive_connections=20),
         )
     return _client
@@ -86,7 +89,7 @@ async def stream_upstream(headers: dict, body: dict) -> AsyncIterator[str]:
     async with client.stream("POST", url, headers=headers, json=body) as resp:
         if resp.status_code != 200:
             raw = await resp.aread()
-            raise UpstreamError(resp.status_code, raw)
+            raise UpstreamError(resp.status_code, raw, dict(resp.headers))
         async for line in resp.aiter_lines():
             line = line.strip()
             if line.startswith("data:"):
@@ -205,7 +208,11 @@ async def collect_upstream(headers: dict, body: dict) -> dict:
 
 
 class UpstreamError(Exception):
-    def __init__(self, status_code: int, raw: bytes):
+    def __init__(self, status_code: int, raw: bytes, headers=None):
         self.status_code = status_code
         self.raw = raw
+        # 响应头（可选）：限流/拦截场景上游会带 Retry-After / Retry-After-Ms /
+        # X-Ratelimit-Reset，是比 body 文案更直接的等待时长来源。缺省 None
+        # （内部构造的 502 空流等没有响应头）。
+        self.headers = headers
         super().__init__(f"upstream HTTP {status_code}")

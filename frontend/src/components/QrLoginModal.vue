@@ -86,19 +86,25 @@ function close() {
         <a-radio-button value="cn">国内版</a-radio-button>
         <a-radio-button value="global">国际版</a-radio-button>
       </a-radio-group>
-      <div style="color: #999; font-size: 12px; margin-top: 6px; line-height: 1.6">
+      <!-- 颜色用主题里既有的次级/三级文字色。别用 #999/#666 这类中性灰：
+           它们是为浅色底设计的，叠在弹窗底色 #1a2140 上分别只有 5.1:1 / 2.74:1，
+           后者连 AA 的 4.5:1 都不到——内联色不受 dark-theme.css 的 !important 影响，
+           写错了没有任何地方能兜住。 -->
+      <div style="color: #8a94a6; font-size: 12px; margin-top: 6px; line-height: 1.6">
         国内版账号（CodeBuddy / codebuddy.cn）选「国内版」，国际版账号（WorkBuddy / workbuddy.ai）选「国际版」。
         两者控制面不同，选错会拿不到有效二维码。
       </div>
     </div>
     <div style="text-align: center; padding: 12px 0">
       <a-spin :spinning="qrLoading">
+        <!-- 这里的白底是**功能性**的，不是漏改深色：二维码识别依赖深色模块/白色静区，
+             换成深色底会导致部分手机扫不出来。同理边框保持浅色。 -->
         <div v-if="qrImg" style="display: inline-block; background: #fff; padding: 8px; border: 1px solid #eee; border-radius: 8px">
           <img :src="qrImg" alt="登录二维码" style="width: 220px; height: 220px" />
         </div>
-        <div v-else-if="!qrLoading" style="color: #999">正在获取二维码…</div>
+        <div v-else-if="!qrLoading" style="color: #8a94a6">正在获取二维码…</div>
       </a-spin>
-      <p style="margin-top: 12px; color: #666">
+      <p style="margin-top: 12px; color: #a5b8d8">
         请用 {{ region === 'global' ? 'WorkBuddy' : 'CodeBuddy' }} 手机端扫码登录
       </p>
       <a v-if="qrAuthUrl" :href="qrAuthUrl" target="_blank" rel="noopener">无法扫码？点此在浏览器打开登录</a>

@@ -1,8 +1,8 @@
 """区域适配：WorkBuddy 国内版 / 国际版的 host、路径、Origin 与客户端身份差异。
 
 两个版本共用同一套协议（`/v2/chat/completions` 等路径前缀完全一致），但
-**控制面 host、模型目录路径、Origin/Referer、客户端身份（User-Agent）**
-必须严格分区，混用会被上游拒绝：
+**控制面 host、模型目录路径、Origin/Referer、客户端身份（User-Agent 与
+`X-IDE-Name` 使用端标识）**必须严格分区，混用会被上游拒绝：
 
   - 模型目录：国际版的 `/console/enterprises/personal/models` 是 OIDC 页面
     （未登录 302 跳 Keycloak，已登录返回 500 HTML），必须改打
@@ -38,6 +38,7 @@ class Region:
     origin: str          # Origin / Referer
     default_domain: str  # auth 文件缺失 domain 时的兜底值
     client_user_agent: str  # 出站身份 UA（上游据此解析客户端与版本）
+    client_ide_name: str    # X-IDE-Name，决定控制台里的「使用端」标识
 
 
 # 国内版：billing 沿用 copilot.tencent.com（本项目既有实现即如此，实测可用），
@@ -45,6 +46,9 @@ class Region:
 #
 # UA 必须用 CLI 身份：2026-09-20 实测，同一个国内版账号打 /v3/config，
 # CLI UA 拿到 16 个 cli 白名单模型，换成桌面端 UA 后 **cli 白名单直接为空**。
+#
+# 「使用端」也用 CLI：与上面的 CLI UA 保持同一身份，且国内版没有实测过
+# 换标识的收益，不做未经验证的改动（见 GLOBAL 的说明）。
 CN = Region(
     id="cn",
     label="国内版",
@@ -54,13 +58,24 @@ CN = Region(
     origin="https://www.codebuddy.cn",
     default_domain="www.codebuddy.cn",
     client_user_agent="CLI/2.139.0 CodeBuddy/2.139.0",
+    client_ide_name="CLI",
 )
 
 # 国际版：三个 base 是同一个 host。
 #
 # UA 必须用桌面端身份：2026-09-20 实测，同一个国际版账号打 /v3/config，
 # 桌面端 UA 拿到 21 个 cli 白名单模型（含 deepseek-v4.1-flash-sg、hy4-preview-f），
-# CLI UA 只有 20 个。这同时与客户端在控制台里的「使用端」标识一致。
+# CLI UA 只有 20 个。
+#
+# 「使用端」必须是 WorkBuddy：2026-09-20 用 4 组对照请求（同账号/同模型/同 prompt）
+# 定位到，控制台「使用端」这一列**只由 `X-IDE-Name` 决定**：
+#   - 不带任何自报身份头 → 使用端 `-`（上游认不出客户端）
+#   - 只改 `X-IDE-Type`   → 使用端仍是 `CLI`（说明 Type 不是开关）
+#   - 只改 `X-IDE-Name`   → 使用端变 `WorkBuddy`（说明 Name 就是开关）
+# 同时实测 **UA 不影响这一列**（发 `WorkBuddy/5.4.2` 也照样显示 `CLI`），
+# 所以改的是 `X-IDE-Name`，不是 User-Agent。
+# 功能安全性已实测：把 Name 换成 WorkBuddy 后，插件目录仍是 18 个（不变），
+# /v3/config 是 21 个（与桌面端身份一致），chat 正常 200。
 GLOBAL = Region(
     id="global",
     label="国际版",
@@ -70,6 +85,7 @@ GLOBAL = Region(
     origin="https://www.workbuddy.ai",
     default_domain="www.workbuddy.ai",
     client_user_agent="WorkBuddy/5.4.2",
+    client_ide_name="WorkBuddy",
 )
 
 REGIONS: dict[str, Region] = {CN.id: CN, GLOBAL.id: GLOBAL}
@@ -152,6 +168,20 @@ def user_agent(domain: str | None) -> str:
     USER_AGENT 环境变量可整体覆盖（救急用，见 config.user_agent）。
     """
     return config.user_agent or detect_region(domain).client_user_agent
+
+
+def ide_name(domain: str | None) -> str:
+    """该域名出站时自报的「使用端」标识（`X-IDE-Name`）。
+
+    这个值决定上游控制台「请求」列表里「使用端」那一列显示什么。2026-09-20
+    用 4 组对照请求定位到开关就是它——不是 User-Agent，也不是 `X-IDE-Type`
+    （详见 GLOBAL 的注释）。国际版给 `WorkBuddy`，与官方桌面端在控制台里的
+    标识一致；国内版维持 `CLI`。
+
+    刻意**不**提供环境变量覆盖：改这个值会改变请求在控制台里的归属，
+    属于"看起来像谁"的问题，应该跟着区域走，而不是留一个随手能改的口子。
+    """
+    return detect_region(domain).client_ide_name
 
 
 def region_of_account(account) -> Region:

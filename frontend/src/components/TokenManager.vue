@@ -34,7 +34,7 @@ function saveToken() {
   <a-popover v-model:open="tokenVisible" title="管理 Token（可选）" trigger="click" placement="bottomRight">
     <template #content>
       <div style="width: 260px">
-        <p style="font-size: 12px; color: #888; margin-bottom: 8px">
+        <p style="font-size: 12px; color: #8a94a6; margin-bottom: 8px">
           仅当后端设置了 <code>ADMIN_TOKEN</code>（如从局域网访问）时才需要填写。
         </p>
         <a-input

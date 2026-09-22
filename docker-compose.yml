@@ -23,6 +23,10 @@ services:
       HOST: 0.0.0.0
       PORT: "8787"
       TZ: Asia/Shanghai
+      # 日志级别。默认 WARNING = 既有行为；排查问题（模型档位降级、max_tokens 裁剪、
+      # 选号与冷却原因等）时改成 INFO，会输出那 30 处 logger.info。
+      # 也可以在宿主机 `LOG_LEVEL=INFO docker-compose up -d` 覆盖，或写进 .env。
+      LOG_LEVEL: "${LOG_LEVEL:-WARNING}"
       # 个人自用（仅本机 localhost 访问）：无需设置 ADMIN_TOKEN。
       # 管理端回环校验已在源码中兼容 Docker 端口映射（Host 为 localhost 即放行）。
       # 如需从局域网/公网访问，取消下面注释并设置一个随机 token，在 WebUI 右上角

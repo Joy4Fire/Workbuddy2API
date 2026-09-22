@@ -1,6 +1,8 @@
 [project]
 name = "workbuddy2api"
-version = "0.4.1"
+# 版本号从 `workbuddy_one/__init__.py` 读（下面 [tool.hatch.version]），**不在这里写死**：
+# 以前这里和后端各存一份，漂移了不会有任何东西报错。
+dynamic = ["version"]
 description = "WorkBuddy2API：单用户专属 WorkBuddy API 网关，OpenAI Chat + Responses + Anthropic 三协议，多账号、SQLite、Vue3 WebUI"
 readme = "README.md"
 requires-python = ">=3.11"
@@ -28,6 +30,10 @@ default = true
 [build-system]
 requires = ["hatchling"]
 build-backend = "hatchling.build"
+
+# 版本号唯一真源 = workbuddy_one/__init__.py 的 __version__
+[tool.hatch.version]
+path = "workbuddy_one/__init__.py"
 
 [tool.hatch.build.targets.wheel]
 packages = ["workbuddy_one"]

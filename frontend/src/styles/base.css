@@ -67,8 +67,10 @@ html { scrollbar-color: rgba(99, 179, 237, 0.3) transparent; scrollbar-width: th
 }
 .brand-sub { font-size: 11px; color: #7d8aa5; margin-top: 2px; }
 
+/* 次级文字统一用 #7d8aa5：叠在侧边栏底色 #0d1120 上约 5.4:1，过 AA；
+   原先的 #5c6a8a 只有 3.47:1，11px 小字基本糊成一团。 */
 .menu-title {
-  font-size: 11px; color: #5c6a8a; letter-spacing: 2px;
+  font-size: 11px; color: #7d8aa5; letter-spacing: 2px;
   padding: 16px 24px 8px; font-weight: 600;
   position: relative; z-index: 1;
 }
@@ -142,7 +144,15 @@ html { scrollbar-color: rgba(99, 179, 237, 0.3) transparent; scrollbar-width: th
 .health-badge.bad { color: #fb7185; background: rgba(244,63,94,0.14); border: 1px solid rgba(244,63,94,0.35); }
 .health-badge.loading { color: #8a94a6; background: rgba(148,163,184,0.12); border: 1px solid rgba(148,163,184,0.3); }
 .health-dot { width: 7px; height: 7px; border-radius: 50%; background: currentColor; display: inline-block; }
-.version-tag { margin-left: auto; color: #5c6a8a; }
+/* 「数据已升级」徽标：只在**本次启动真的发生过 schema 迁移**时出现。
+   为什么要显示：迁移成功那条日志是 logger.info，默认日志级别 WARNING 看不到，
+   用户无法确认旧数据有没有被升上来。用琥珀色（提示而非告警）配 title 说明备份位置。 */
+.migrated-badge {
+  padding: 3px 8px; border-radius: 20px; font-size: 12px; font-weight: 600;
+  color: #fbbf24; background: rgba(251,191,36,0.14); border: 1px solid rgba(251,191,36,0.35);
+  cursor: help; white-space: nowrap;
+}
+.version-tag { margin-left: auto; color: #7d8aa5; cursor: help; }
 .status-dot {
   width: 8px; height: 8px; border-radius: 50%;
   background: #22c55e;

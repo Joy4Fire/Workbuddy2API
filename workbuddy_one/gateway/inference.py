@@ -15,7 +15,9 @@ from fastapi import HTTPException
 from ..config import config
 from ..desensitize import desensitize_body
 from ..region import region_of_account
-from .errors import is_rate_limit_body  # noqa: F401（re-export 供 routes 使用）
+from .errors import (  # noqa: F401（is_rate_limit_body re-export 供 routes 使用）
+    ErrKind, action_for, classify, is_rate_limit_body,
+)
 from . import session
 from ..ratelimit import AsyncAccountRateLimiter
 from ..reasoning import sanitize_body
@@ -30,11 +32,10 @@ COOLDOWN_HARD = 1800.0     # 认证/限流（401/403/429）
 
 
 def cooldown_for(status_code: int) -> float:
-    """按上游 HTTP 状态码选择冷却时长。
+    """按上游 HTTP 状态码选择冷却时长（**已不参与主链路**，保留给旧调用方/测试）。
 
-    429 限流若只用 60s 软冷却，账号会反复被限流、UI 在健康/不可用间抖动，
-    故限流给 5 分钟；认证类错误（401/403）用 30 分钟；上游服务错误 2 分钟；
-    其余走 60s 软冷却。
+    主链路改用 `errors.classify` + `errors.action_for`（错误分类表）。本函数只在
+    "分类器也判不出语义"的极端兜底场景有意义，目前无生产调用方。
     """
     if status_code == 429:
         return 300.0
@@ -45,20 +46,13 @@ def cooldown_for(status_code: int) -> float:
     return COOLDOWN_SOFT
 
 
-def cooldown_for_error(status_code: int, raw: bytes) -> float:
-    """按状态码 + 响应体综合决策冷却时长（Sliverkiss #28/#31 的吸收）。
+def cooldown_for_error(status_code: int, raw: bytes, headers=None) -> float:
+    """错误 → 冷却秒数（错误分类表的薄封装，保留向后兼容的签名）。
 
-    - 429 或响应体含限流文案（200+11140 "rate-limiting"、400+"rate limit"、
-      6004 "frequency limit" 等）都视为限流——此前非 429 的限流响应漏判，
-      账号不被冷却、反复被选中撞同一堵墙；
-    - 限流时优先解析响应体里的「将在 …重置」墙钟（6004 模型级限流携带），
-      按上游明示的恢复时刻精确冷却（夹在 [60s, 2h]）；无时间文案退回固定
-      5 分钟。绝不臆造时间。
+    真正的语义在 `errors.classify`（这是什么错）+ `errors.action_for`（怎么处置）。
     """
-    from .errors import is_rate_limit_body, rate_limit_cooldown
-    if status_code == 429 or is_rate_limit_body(raw):
-        return rate_limit_cooldown(raw)
-    return cooldown_for(status_code)
+    from .errors import classify as _classify
+    return action_for(_classify(status_code, raw, headers), raw, headers).cooldown
 
 
 def hash_key(key: str) -> str:
@@ -91,14 +85,20 @@ def limiter(ctx, uid: str) -> AsyncAccountRateLimiter:
     return ctx.limiters[uid]
 
 
-def pick_account(ctx, regions: set[str] | None = None):
+def pick_account(ctx, regions: set[str] | None = None, model: str = ""):
     """从池中选择一个账号，返回 Account；无账号则 503。
 
     regions: 可选，限定区域（见 pool.pick 与 models.regions_for）。混池下按请求的
     模型把候选账号收敛到「确实提供该模型」的区域，避免被上游 400（11102）拒绝。
+    model: 可选，请求的模型名。用于跳过「该 (账号,模型) 已被冷却」的组合
+    （6004 模型级限流 / 11102 负缓存），否则换号时会原地重试同一个坏组合。
     """
-    acc = ctx.pool.pick(regions=regions)
+    acc = ctx.pool.pick(regions=regions, model=model)
     if acc is None:
+        if model:
+            raise HTTPException(status_code=503, detail={"error": {
+                "message": f"模型 {model} 在全部账号上均不可用（已被限流或该账号无此模型），请稍后重试或更换模型",
+                "type": "model_unavailable"}})
         raise HTTPException(status_code=503, detail={"error": {"message": "无可用账号（全部冷却或额度耗尽），请检查账号状态", "type": "auth_error"}})
     # fallback 顶班账号（无健康账号时选出的最早冷却到期者）若还要冷却 30 秒以上，
     # 不硬打——把请求送上去只会再吃一个 429，形成 429 风暴；直接明确拒绝
@@ -138,6 +138,7 @@ def acquire_account(ctx, body: dict, raw: dict | None = None):
     """
     key = session.extract_session_key(raw if raw is not None else body)
     regions = model_regions(ctx, body)
+    model = str(body.get("model") or "").strip()
     sticky_uid = ctx.session_router.lookup(key, ctx.pool) if key else None
     if sticky_uid:
         for a in ctx.pool.accounts:
@@ -146,12 +147,17 @@ def acquire_account(ctx, body: dict, raw: dict | None = None):
                     # 粘住的账号所在区域不提供该模型：解粘，让下面按区域重选
                     ctx.session_router.unbind(key)
                     break
+                if a.model_cooling(time.time(), model):
+                    # 粘住的账号刚好把这个模型冷却了（6004/11102）：解粘重选，
+                    # 否则会一路粘着撞同一堵墙
+                    ctx.session_router.unbind(key)
+                    break
                 if a.cooldown_until - time.time() <= 30:  # 与 pick_account 同一冷却兜底
                     return a, key
                 # 粘住的账号在冷却：解粘走正常轮换
                 ctx.session_router.unbind(key)
                 break
-    acc = pick_account(ctx, regions=regions)
+    acc = pick_account(ctx, regions=regions, model=model)
     if key:
         ctx.session_router.bind(key, acc.uid)
     return acc, key
@@ -172,13 +178,60 @@ def get_headers(ctx, account):
 
 
 async def open_upstream_once(ctx, account, body: dict):
-    """对单个账号建立上游连接并预取首个 SSE 行，成功返回 (iterator, 首行)。"""
+    """对单个账号建立上游连接并预取首个 SSE 行，成功返回 (iterator, 首行)。
+
+    在途名额只在这段窗口里占用（P1-1）：上游风控看的是**同时打到它的连接数**，
+    首字节到达后流已建立，再计数只会引入"流没读完就泄漏名额"的故障模式。
+    占用失败不拒绝请求——选号侧已经优先避开占满的账号，这里再拒就变成 503 了。
+    """
     if config.ratelimit:
         await limiter(ctx, account.uid).wait_if_needed()
     headers = get_headers(ctx, account)
-    it = stream_upstream(headers, body).__aiter__()
-    first = await it.__anext__()   # 首次 anext 会真正发起上游请求；失败抛 UpstreamError
+    ctx.pool.acquire_slot(account.uid)
+    try:
+        it = stream_upstream(headers, body).__aiter__()
+        first = await it.__anext__()   # 首次 anext 会真正发起上游请求；失败抛 UpstreamError
+    finally:
+        ctx.pool.release_slot(account.uid)
     return it, first
+
+
+def apply_error_policy(ctx, account, kind: ErrKind, act, model: str):
+    """把一条处置策略落到账号池（罚号 / 禁用 / (账号,模型) 冷却 / 连败计数）。
+
+    与 `action_for` 分开的理由：策略是"该怎么反应"（纯函数、好测），这里是
+    "落到哪个对象上"（副作用）。测试策略表不用造账号池。
+    """
+    uid = account.uid
+    if act.disable:
+        # 终态：session 失效 / 被上游封禁。用**自动禁用位**而不是手动停用位，
+        # 否则用户点一下"启用"就会把它放回池子，下一个请求立刻再吃一次同样的错。
+        reason = act.reason or "上游要求重新登录"
+        ctx.pool.disable_auto(uid, reason)
+        try:
+            ctx.db.set_account_state(uid, auto_disabled_reason=reason)
+        except Exception:  # noqa: BLE001  落库失败不该让请求本身失败
+            logger.warning("自动禁用落库失败 uid=%s", uid[:8], exc_info=True)
+        logger.warning("账号 %s 已自动禁用：%s", uid[:8], reason)
+        return
+    if act.model_scoped and model:
+        ctx.pool.cooldown_model(uid, model, act.cooldown, neg_cache=act.neg_cache)
+        # 落库：11102 的负缓存 TTL 是 6~24 小时，重启就丢等于每次重启都要重新
+        # 去上游碰一次钉子。落库失败不影响本次请求（只是重启后会重新试探）。
+        try:
+            snap = ctx.pool.model_block_state(uid, model)
+            if snap:
+                ctx.db.save_model_block(uid, model, snap["until"], snap["streak"], act.reason)
+        except Exception:  # noqa: BLE001
+            logger.warning("模型冷却落库失败 uid=%s model=%s", uid[:8], model, exc_info=True)
+        logger.info("账号 %s 的模型 %s 已冷却 %.0fs（%s）", uid[:8], model, act.cooldown, act.reason)
+        return
+    if act.cooldown > 0:
+        ctx.pool.on_failure(uid, act.cooldown)
+        return
+    if kind is ErrKind.CLIENT:
+        # 无权威分类的失败：单次不罚，连成串才降权（P1-2）
+        ctx.pool.note_failures(uid, config.fail_streak_threshold, config.fail_degrade_seconds)
 
 
 async def open_upstream(ctx, account, body: dict):
@@ -186,32 +239,64 @@ async def open_upstream(ctx, account, body: dict):
 
     这样上游在流真正开始前失败时，能返回正确的 HTTP 状态码（而非 200+SSE 错误），
     客户端可以正确识别错误而不是卡住等待。
-    返回 (iterator, 首行, 实际使用的账号)——429/502/503 时会自动换健康账号重试一次
+    返回 (iterator, 首行, 实际使用的账号)——可换号的错误会自动换健康账号重试一次
     （仅一次，不递归），换号后调用方必须用返回的账号记账，而不是最初的账号。
+
+    **换不换号由错误分类决定**（`errors.action_for`）：
+      - 请求级错误（11115 超上下文 / 11135 图片无效 / 内容拦截）→ `fail_fast`：
+        不换号、不罚号，原样抛给调用方透传。同一份 body 换任何账号结果都一样，
+        换号只会白烧健康号的请求配额。
+      - 账号级错误 → 按策略罚号（冷却/禁用/(账号,模型) 冷却）后换号重试一次。
     """
     # 脱敏在选号后、发上游前施加：只在此处做一次，避免换号重试时重复注入零宽字符
     body = apply_desensitize(body, account)
+    model = str(body.get("model") or "").strip()
     try:
         it, first = await open_upstream_once(ctx, account, body)
         return it, first, account
     except UpstreamError as e:
-        if e.status_code not in (429, 502, 503) and not is_rate_limit_body(e.raw):
-            # 非限流、非换号候选错误：原样抛给调用方
+        kind = classify(e.status_code, e.raw, e.headers)
+        act = action_for(kind, e.raw, e.headers)
+        logger.info("上游错误 %s（HTTP %s）→ %s，换号=%s 冷却=%.0fs",
+                    kind.value, e.status_code, act.reason or "-", act.rotate, act.cooldown)
+        apply_error_policy(ctx, account, kind, act, model)
+        if act.fail_fast:
+            # 请求自身的问题：不轮转，把上游原文交给调用方透传
             raise
-        # 该账号已确认打不通：先上冷却（限流按响应体重置墙钟/文案精确决策），
-        # 避免下面 pick() 又选中它原地重试
-        ctx.pool.on_failure(account.uid, cooldown_for_error(e.status_code, e.raw))
+        if act.disable or not act.rotate:
+            raise
         if ctx.pool.healthy_count() < 1:
             # 没有其它健康账号：放弃重试，按原错误交给调用方记录/返回
             #（后续请求会被 pick_account 的冷却兜底挡下并得到 503）
             raise
-        alt = pick_account(ctx, regions=model_regions(ctx, body))
+        alt = pick_account(ctx, regions=model_regions(ctx, body), model=model)
         try:
             it, first = await open_upstream_once(ctx, alt, body)
-        except (UpstreamError, httpx.HTTPError):
+        except UpstreamError as e2:
+            kind2 = classify(e2.status_code, e2.raw, e2.headers)
+            act2 = action_for(kind2, e2.raw, e2.headers)
+            apply_error_policy(ctx, alt, kind2, act2, model)
+            raise
+        except httpx.HTTPError:
             ctx.pool.on_failure(alt.uid, COOLDOWN_SOFT)
             raise
         return it, first, alt
+
+
+def penalize(ctx, account, status_code: int, raw, headers=None, model: str = ""):
+    """按错误分类表对账号施加处置，返回本次的 Action。
+
+    给**路由层**用：`open_upstream` 内部已经施过处置，路由在它之外捕获到上游错误时
+    （流中途断开、`collect_upstream` 直连）才调这个，避免同一个错误被罚两次。
+
+    为什么必须由路由层走这里而不是自己算个冷却秒数：`log_usage` 的 `cooldown` 参数
+    只能表达"冷却多久"，表达不了"这个错误该不该罚号"（11115/11135 罚号就是错的）
+    和"要不要禁用"（12153/11140）。走分类表才能和主链路同一口径。
+    """
+    kind = classify(status_code, raw, headers)
+    act = action_for(kind, raw, headers)
+    apply_error_policy(ctx, account, kind, act, model)
+    return act
 
 
 def enhance_body(ctx, body: dict) -> dict:
@@ -221,9 +306,11 @@ def enhance_body(ctx, body: dict) -> dict:
     apply_desensitize），而本函数在选号之前调用，此时账号还未知。
     """
     from ..reasoning import parse_model_aliases, resolve_model_alias
+    # 设置只读一次：别名解析与系统提示词模式都要用（get_settings 会打 DB）
+    settings = ctx.db.get_settings()
     # 模型别名解析：客户端用熟名字（gpt-4o 等）也能路由到真实模型
     if body.get("model"):
-        aliases = parse_model_aliases(ctx.db.get_settings().get("model_aliases") or "")
+        aliases = parse_model_aliases(settings.get("model_aliases") or "")
         body["model"] = resolve_model_alias(str(body["model"]), aliases)
     # 输出上限按模型实际能力裁剪：Claude Code 常发 32000+，超过部分模型上限会被
     # 上游拒绝（目录未知时不裁剪）。max_tokens 与 max_completion_tokens 都要管——
@@ -244,7 +331,11 @@ def enhance_body(ctx, body: dict) -> dict:
         efforts = ctx.models.reasoning_efforts(model_id)
         if efforts:
             dyn_efforts = {model_id: efforts}
-    body = sanitize_body(body, efforts=dyn_efforts)
+    # 系统提示词三模式（P2-1）：默认 passthrough = 零改动。custom/append 需要
+    # 用户配了 prompt_text 才生效（空文本一律视为 passthrough，见 apply_prompt_mode）。
+    body = sanitize_body(body, efforts=dyn_efforts,
+                         prompt_mode=str(settings.get("prompt_mode") or ""),
+                         prompt_text=str(settings.get("prompt_text") or ""))
     return body
 
 
@@ -275,6 +366,26 @@ def log_usage(ctx, protocol, model_name, account, t0, status, err="", usage=None
     if update_pool:
         if status == "ok":
             ctx.pool.on_success(account.uid)
+            # 成功即证明该 (账号,模型) 可用：清掉可能存在的负缓存/模型冷却。
+            # 不清的话，一条错误的 11102 判断会让这个组合被避让最长 24 小时。
+            if model_name and ctx.pool.clear_model_cooldown(account.uid, model_name):
+                try:
+                    ctx.db.delete_model_block(account.uid, model_name)
+                except Exception:  # noqa: BLE001
+                    logger.warning("清除模型负缓存落库失败", exc_info=True)
+            # 成本台账（P2-3）：用本次的 credits 与 token 数更新 (账号,模型) 单价。
+            # credits=0 是**有效观测**（免费额度包），会被记成 tier0。
+            if model_name:
+                tokens = (usage.get("prompt_tokens") or usage.get("input_tokens") or 0) + \
+                         (usage.get("completion_tokens") or usage.get("output_tokens") or 0)
+                snap = ctx.pool.record_cost(account.uid, model_name,
+                                            usage.get("credit") or 0, tokens)
+                if snap:
+                    try:
+                        ctx.db.save_model_cost(snap["uid"], snap["model"], snap["cost_per_1k"],
+                                               snap["samples"], snap["updated_at"])
+                    except Exception:  # noqa: BLE001
+                        logger.warning("成本台账落库失败", exc_info=True)
         else:
             ctx.pool.on_failure(account.uid, cooldown or COOLDOWN_SOFT)
     # 超长文本裁剪：思考链/输出也可能很长（实测 COT 单条 4 万+ 字符）

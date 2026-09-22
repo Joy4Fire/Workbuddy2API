@@ -17,17 +17,29 @@ RUN apt-get update \
     && apt-get install -y --no-install-recommends tzdata \
     && rm -rf /var/lib/apt/lists/*
 
-# 拷贝依赖清单（uv.lock 仅供 uv 使用，pip 安装不读它，不入构建上下文）
-COPY pyproject.toml ./
-
-# 安装运行时依赖（pip 安装，版本约束与 pyproject 一致）
-RUN pip install --no-cache-dir \
+# 安装运行时依赖（pip 安装，版本约束与 pyproject 的 [project].dependencies 一致；
+# tests/test_policy.py 有用例钉住这两处不许漂）。
+#
+# 为什么显式指定国内镜像源：直连 pypi.org 在**国内网络下会间歇性吃 TLS 握手被中断**
+# （实测 `SSLError(SSLEOFError(8, '[SSL: UNEXPECTED_EOF_WHILE_READING]'))`），
+# 表现为 `Could not find a version that satisfies the requirement ... (from versions: none)`
+# —— 看着像"包不存在"，其实是网络。与 pyproject 里 `[[tool.uv.index]]` 的选择保持一致。
+# 需要官方源时：`docker-compose build --build-arg PIP_INDEX_URL=https://pypi.org/simple`
+ARG PIP_INDEX_URL=https://pypi.tuna.tsinghua.edu.cn/simple
+RUN pip install --no-cache-dir -i "$PIP_INDEX_URL" \
         "fastapi>=0.110" \
         "uvicorn[standard]>=0.29" \
         "httpx>=0.27" \
         "pydantic>=2.6" \
         "qrcode>=8.2" \
         "python-multipart>=0.0.32"
+
+# ⚠️ `COPY pyproject.toml` 必须放在 `RUN pip install` **之后**：
+# 放在前面的话，任何对 pyproject 的编辑（哪怕只是改个版本号）都会击穿依赖层缓存、
+# 强制重新联网装一遍全部依赖 —— 2026-09-22 就是这么被 pypi.org 的 TLS 抖动
+# 卡住了一次构建（改版本号 → 依赖层失效 → pip 真的去联网 → 失败）。
+# 它本来也不参与 pip 安装（上面是显式列包的），只是个清单副本。
+COPY pyproject.toml ./
 
 # 拷贝后端源码与已构建的前端产物
 COPY workbuddy_one/ workbuddy_one/

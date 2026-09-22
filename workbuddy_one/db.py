@@ -17,7 +17,12 @@ logger = logging.getLogger("workbuddy_one.db")
 
 # 当前数据库 schema 版本（用 SQLite PRAGMA user_version 持久化）。
 # 每次对表结构做不兼容/增量修改时 +1，并在 _migrate 里追加对应迁移步骤。
-SCHEMA_VERSION = 4
+SCHEMA_VERSION = 7
+
+# 使用记录页「模型」筛选下拉的分组阈值：这么久之内用过的算「最近」，其余算「更早」。
+# 只影响下拉的展示分组，不影响筛选结果（两组并集 = 全部用过的模型）。
+# 刻意不做成配置项：这是纯展示细节，不是部署开关，没必要增加设置页负担。
+MODEL_RECENT_DAYS = 7
 
 
 def _local_midnight_ts() -> int:
@@ -39,6 +44,11 @@ class Database:
         self.path = Path(path)
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self._lock = threading.Lock()
+        # 本次进程启动时**真的发生过** schema 迁移才有值（旧版本号）；新库 / 已是最新 = None。
+        # 为什么要记它：迁移成功那条日志是 `logger.info`，而默认 `LOG_LEVEL=WARNING`
+        # 根本看不到 —— 用户因此无法确认"我的旧数据到底升级了没有"。现在通过
+        # `/health` 暴露出去、由 WebUI 显示，把一次性的升级事件变成**看得见的事实**。
+        self.migrated_from: int | None = None
         self._conn = sqlite3.connect(str(self.path), check_same_thread=False)
         self._conn.row_factory = sqlite3.Row
         self._conn.execute("PRAGMA journal_mode=WAL")
@@ -66,6 +76,9 @@ class Database:
             ).fetchone()
             if not has_tables:
                 return  # 全新空库，首次建表不算"升级"
+            # 放在备份之前赋值：即便备份本身失败（下面的 except 会吞掉），
+            # "这次确实是从旧版本升上来的"这个事实依然成立，必须如实记下。
+            self.migrated_from = int(ver)
             backup_dir = self.path.parent / "backups"
             backup_dir.mkdir(parents=True, exist_ok=True)
             name = f"{self.path.stem}.pre-migrate-v{ver}-to-v{SCHEMA_VERSION}.{int(time.time())}.bak"
@@ -162,6 +175,10 @@ class Database:
             ("priority", "INTEGER DEFAULT 0"), ("credits_remaining", "REAL"),
             ("credits_total", "REAL"), ("credits_expire_at", "TEXT"),
             ("last_used_at", "REAL"), ("last_checkin_date", "TEXT"),
+            # 上游签到状态（唯一权威口径）。NULL = 尚未同步过，界面回落本地记账。
+            ("checkin_today", "INTEGER"), ("checkin_active", "INTEGER"),
+            ("checkin_synced_at", "REAL"),
+            ("auto_disabled_reason", "TEXT DEFAULT ''"),
             ("failure_count", "INTEGER DEFAULT 0"), ("cooldown_until", "REAL DEFAULT 0"),
             ("created_at", "REAL"), ("updated_at", "REAL"),
         ],
@@ -210,6 +227,67 @@ class Database:
         """v4：accounts 补 disabled_reason（禁用原因，供 WebUI 展示"为什么不可用"）。"""
         self._add_column("accounts", "disabled_reason", "TEXT DEFAULT ''")
 
+    def _migration_v5(self):
+        """v5：accounts 补上游签到状态（checkin_today / checkin_active / checkin_synced_at）。
+
+        背景：`last_checkin_date` 记的是"本网关替你签过没有"，与上游真值会脱节
+        （用户在官方客户端自己签到 → 我们显示"未签到"）。这三列存上游
+        `checkin-activity-status` 的返回值，界面据此展示。旧库该三列为 NULL
+        = 尚未同步，界面回落本地记账，行为与升级前一致，不会突变。
+        """
+        self._add_column("accounts", "checkin_today", "INTEGER")
+        self._add_column("accounts", "checkin_active", "INTEGER")
+        self._add_column("accounts", "checkin_synced_at", "REAL")
+
+    def _migration_v6(self):
+        """v6：停用双状态位 + (账号,模型) 冷却持久化。
+
+        1) `accounts.auto_disabled_reason` —— **系统自动禁用**位，与 `enabled`
+           （运维手动停用）**独立**。以前只有 `enabled` 一个位，任何自动复活路径
+           （签到解冻、额度刷新）都可能把一个"上游已明确说不能用了"的账号放回池子。
+           旧库该列为空串 = 无自动禁用，行为与升级前一致。
+        2) `model_blocks` 表 —— (账号, 模型) 维度的冷却/负缓存。6004 模型级限流与
+           11102「该后端无此模型」都落在这里。持久化的理由：11102 的负缓存 TTL 是
+           6~24 小时，重启就丢意味着每次重启都要重新去上游碰一次钉子；
+           短 TTL 的限流记录顺带一起存，重启后接着用，不必重新试探。
+        """
+        self._add_column("accounts", "auto_disabled_reason", "TEXT DEFAULT ''")
+        self._conn.executescript(
+            """
+            CREATE TABLE IF NOT EXISTS model_blocks (
+                uid TEXT,                  -- 账号 uid
+                model TEXT,                -- 模型名
+                until REAL,                -- 冷却截止时间戳（秒）
+                streak INTEGER DEFAULT 0,  -- 负缓存连续命中次数（TTL 指数放大的指数）
+                reason TEXT DEFAULT '',
+                PRIMARY KEY (uid, model)
+            );
+            """
+        )
+
+    def _migration_v7(self):
+        """v7：`model_costs` 表 —— (账号, 模型) 维度的积分单价台账（P2-3）。
+
+        为什么需要它：同一个模型在不同账号上的计费并不一样（实测免费额度包与
+        付费包的单价差一整个数量级）。网关手里有 `usage.credit`，把它折算成
+        "每千 token 积分单价"就能在选号时**优先用便宜的那个账号**。
+
+        只存 EMA 平滑后的单价与样本数，不存明细：明细在 usage_logs 里已经有了，
+        这里要的是"现在这个组合大概多少钱一千 token"这一个数字。
+        """
+        self._conn.executescript(
+            """
+            CREATE TABLE IF NOT EXISTS model_costs (
+                uid TEXT,                   -- 账号 uid
+                model TEXT,                 -- 模型名
+                cost_per_1k REAL,           -- 每千 token 积分单价（EMA 平滑）
+                samples INTEGER DEFAULT 0,  -- 累计观测次数（越大越可信）
+                updated_at REAL,            -- 最近一次观测时间（用于过期判定）
+                PRIMARY KEY (uid, model)
+            );
+            """
+        )
+
     # 迁移注册表：每个条目 = (目标版本号, 迁移函数)。按版本号升序。
     # 后续新增结构 → 在此追加新条目，并在 SCHEMA_VERSION 处 +1。
     _MIGRATIONS = [
@@ -217,6 +295,9 @@ class Database:
         (2, _migration_v2),
         (3, _migration_v3),
         (4, _migration_v4),
+        (5, _migration_v5),
+        (6, _migration_v6),
+        (7, _migration_v7),
     ]
 
     def _user_version(self) -> int:
@@ -391,11 +472,16 @@ class Database:
     def delete_account(self, uid: str) -> bool:
         with self._lock:
             cur = self._conn.execute("DELETE FROM accounts WHERE uid=?", (uid,))
+            # 连带清掉该账号的 (账号,模型) 冷却与成本观测记录，否则删了账号再同名
+            # 加回来会继承一批本不属于它的负缓存/单价（这两张表没有外键约束）
+            self._conn.execute("DELETE FROM model_blocks WHERE uid=?", (uid,))
+            self._conn.execute("DELETE FROM model_costs WHERE uid=?", (uid,))
             self._conn.commit()
         return cur.rowcount > 0
 
     def set_account_state(self, uid: str, **fields):
-        allowed = {"enabled", "disabled_reason", "priority", "credits_remaining", "credits_total",
+        allowed = {"enabled", "disabled_reason", "auto_disabled_reason", "priority",
+                   "credits_remaining", "credits_total",
                    "credits_expire_at", "last_used_at", "failure_count", "cooldown_until"}
         sets = []
         vals = []
@@ -410,9 +496,92 @@ class Database:
             self._conn.execute(f"UPDATE accounts SET {', '.join(sets)} WHERE uid=?", vals)
             self._conn.commit()
 
+    # ---- (账号, 模型) 冷却持久化（v6）----
+    #
+    # 6004 模型级限流与 11102「该后端无此模型」都落 model_blocks。
+    # 只做存取，策略（TTL 指数放大、取更长者）在 pool.cooldown_model 里。
+
+    def model_blocks(self) -> list[dict]:
+        """全部 (账号,模型) 冷却记录（含已过期的，由调用方按 until 过滤）。"""
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT uid, model, until, streak, reason FROM model_blocks").fetchall()
+        return [dict(r) for r in rows]
+
+    def save_model_block(self, uid: str, model: str, until: float,
+                         streak: int = 0, reason: str = ""):
+        with self._lock:
+            self._conn.execute(
+                "INSERT INTO model_blocks(uid, model, until, streak, reason) VALUES(?,?,?,?,?) "
+                "ON CONFLICT(uid, model) DO UPDATE SET until=excluded.until, "
+                "streak=excluded.streak, reason=excluded.reason",
+                (uid, model, until, int(streak), reason),
+            )
+            self._conn.commit()
+
+    def delete_model_block(self, uid: str, model: str = ""):
+        """清除 (账号,模型) 冷却记录；model 为空则清该账号全部。"""
+        with self._lock:
+            if model:
+                self._conn.execute("DELETE FROM model_blocks WHERE uid=? AND model=?", (uid, model))
+            else:
+                self._conn.execute("DELETE FROM model_blocks WHERE uid=?", (uid,))
+            self._conn.commit()
+
+    def purge_expired_model_blocks(self, now: float | None = None):
+        """清理已过期的记录（启动时调一次即可，避免表无限增长）。"""
+        now = time.time() if now is None else now
+        with self._lock:
+            self._conn.execute("DELETE FROM model_blocks WHERE until <= ?", (now,))
+            self._conn.commit()
+
+    # ---- (账号, 模型) 积分单价台账（v7）----
+    #
+    # 只做存取；EMA 平滑、过期判定、分层选号策略在 pool.py。
+
+    def model_costs(self) -> list[dict]:
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT uid, model, cost_per_1k, samples, updated_at FROM model_costs").fetchall()
+        return [dict(r) for r in rows]
+
+    def save_model_cost(self, uid: str, model: str, cost_per_1k: float,
+                        samples: int, updated_at: float):
+        with self._lock:
+            self._conn.execute(
+                "INSERT INTO model_costs(uid, model, cost_per_1k, samples, updated_at) "
+                "VALUES(?,?,?,?,?) "
+                "ON CONFLICT(uid, model) DO UPDATE SET cost_per_1k=excluded.cost_per_1k, "
+                "samples=excluded.samples, updated_at=excluded.updated_at",
+                (uid, model, float(cost_per_1k), int(samples), float(updated_at)),
+            )
+            self._conn.commit()
+
+    def delete_model_cost(self, uid: str, model: str = ""):
+        with self._lock:
+            if model:
+                self._conn.execute("DELETE FROM model_costs WHERE uid=? AND model=?", (uid, model))
+            else:
+                self._conn.execute("DELETE FROM model_costs WHERE uid=?", (uid,))
+            self._conn.commit()
+
+    def purge_stale_model_costs(self, cutoff: float):
+        """清理早于 cutoff 的观测（启动时调一次，避免表无限增长）。"""
+        with self._lock:
+            self._conn.execute("DELETE FROM model_costs WHERE updated_at < ?", (cutoff,))
+            self._conn.commit()
+
     # ---- 签到状态 ----
+    #
+    # 两套口径，别混：
+    #   last_checkin_date —— **本地记账**："本网关最后一次成功替他签到的日期"。
+    #                        仅在上游确认成功/已签到时才写（见 scheduler.do_checkin）。
+    #   checkin_today / checkin_active / checkin_synced_at —— **上游真值**：
+    #                        上游 checkin-activity-status 的返回值，界面优先用它。
+    # 界面展示以"上游真值"为准，未同步（NULL）时才回落本地记账。
+
     def set_checkin_date(self, uid: str, date: str):
-        """记录某账号最近签到日期（YYYY-MM-DD）。"""
+        """记录本网关最近一次**成功**签到的日期（YYYY-MM-DD）。"""
         with self._lock:
             self._conn.execute(
                 "UPDATE accounts SET last_checkin_date=?, updated_at=? WHERE uid=?",
@@ -421,10 +590,41 @@ class Database:
             self._conn.commit()
 
     def checkin_dates(self) -> dict[str, str]:
-        """返回 {uid: last_checkin_date}。"""
+        """返回 {uid: last_checkin_date}（本地记账口径）。"""
         with self._lock:
             rows = self._conn.execute("SELECT uid, last_checkin_date FROM accounts").fetchall()
         return {r["uid"]: r["last_checkin_date"] for r in rows if r["last_checkin_date"]}
+
+    def set_checkin_status(self, uid: str, today: bool, active: bool, synced_at: float):
+        """写入从上游查到的签到状态（上游真值口径）。"""
+        with self._lock:
+            self._conn.execute(
+                "UPDATE accounts SET checkin_today=?, checkin_active=?, checkin_synced_at=?,"
+                " updated_at=? WHERE uid=?",
+                (1 if today else 0, 1 if active else 0, synced_at, time.time(), uid),
+            )
+            self._conn.commit()
+
+    def checkin_status(self) -> dict[str, dict]:
+        """返回 {uid: {today, active, synced_at}}；从未同步过的账号不在结果里。
+
+        today/active 用 bool | None 表达：None 表示"该列还没写过"，
+        与"明确是 False"区分开——前端要靠这个决定是显示真值还是回落本地记账。
+        """
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT uid, checkin_today, checkin_active, checkin_synced_at FROM accounts"
+            ).fetchall()
+        out: dict[str, dict] = {}
+        for r in rows:
+            if r["checkin_synced_at"] is None:
+                continue
+            out[r["uid"]] = {
+                "today": None if r["checkin_today"] is None else bool(r["checkin_today"]),
+                "active": None if r["checkin_active"] is None else bool(r["checkin_active"]),
+                "synced_at": r["checkin_synced_at"],
+            }
+        return out
 
     # ---- 设置 ----
     DEFAULT_SETTINGS = {
@@ -443,10 +643,40 @@ class Database:
         "alert_threshold_percent": "10",  # 余额占比低于该值触发预警
         "alert_expiry_days": "3",      # 积分 N 天内到期触发预警
         "model_aliases": "",           # 模型别名映射，每行一条：别名=真实模型
+        # ---- 系统提示词三模式（P2-1）----
+        # passthrough=原样透传（零改动）/ custom=整段替换 / append=插在开头 system 之后
+        "prompt_mode": "passthrough",
+        "prompt_text": "",             # custom / append 模式下注入的提示词原文
+        # ---- 补签保连登（P3 试点）----
+        # 两个默认值都是"保守档"：总开关关 + 演练开。判据链里有一环未验证
+        # （活跃地图分数量的是对话活跃度、不是签到状态），而补签花的是用户自己的卡。
+        "makeup_enabled": "0",
+        "makeup_dry_run": "1",
+        # ---- 猫猫旅行（国内版专属）----
+        # 同样是保守档：总开关关 + 演练开。旅行本身是纯收益（不消耗任何资产），
+        # 默认演练只是"先让用户确认状态机判断对不对"。
+        "travel_enabled": "0",
+        "travel_dry_run": "1",
+        # ---- 活跃地图每日提醒 ----
+        # **默认开**，与上面几个保守档不同，理由是它**只读 + 只提醒**：
+        # 不写上游、不花积分、不动账号状态，最坏结果就是一条你本来就要的提醒。
+        # （为什么不"自动发一条对话去续连登"：2026-09-22 受控实验证明 chat API
+        # 根本不点亮活跃地图——发两次真实请求后当天格子仍是 0，历史数据里
+        # 31 次请求 / 419 积分的那天同样是 0。详见 billing.py 与
+        # skill `workbuddy2api-upstream-probe` 的 probe_heatmap*.py。）
+        "active_map_enabled": "1",
+        # 每天几点检查（CST）。默认 23 点——给当天留最后 1 小时，用户还来得及
+        # 自己在官方客户端聊一句把格子点亮。
+        "active_map_hour": "23",
         # ---- 区域与网络（DB 值优先于同名环境变量；空=回落环境变量/自动） ----
         "backend": "",                 # 强制所有账号打同一 host（仅单区域部署用）
         "proxy": "",                   # 出站代理（http:// / socks5://），空=直连
         "workbuddy_exe": "",           # 官方客户端路径，用于解密 $wbEncrypted 登录态
+        # ---- 在途并发上限（P1-1）----
+        # 默认**空串**而不是 "0"：空串 = 用户没设过 → 回落环境变量（3 / 2）；
+        # "0" = 显式要求不限制。默认给 "0" 会让所有部署升级后静默失去并发保护。
+        "max_in_flight": "",
+        "max_in_flight_global": "",
     }
 
     def get_settings(self) -> dict:
@@ -673,8 +903,12 @@ class Database:
         apps 只列 apps 表**现存**应用（与应用页对应）；usage_logs 里 app_name 是
         请求当时的快照，应用删除后历史记录仍保留旧名——这些名字放进 apps_history，
         前端分组展示，避免"筛选里冒出应用页不存在的名字"的困惑。
+        models 同理按「最近 MODEL_RECENT_DAYS 天内用过没有」分成 models / models_history
+        两组：模型会下架，退役模型的名字却永远留在历史记录里，平铺在一个下拉里既长又难找。
+        **两组并集不变**，所以筛选行为与分组前完全一致，只是下拉多了一个分隔标题。
         has_unnamed 标记是否存在无应用归属的旧记录（供"（未记录应用）"筛选项）。
         """
+        cutoff = time.time() - MODEL_RECENT_DAYS * 86400
         with self._lock:
             def col(field: str) -> list[str]:
                 rows = self._conn.execute(
@@ -687,18 +921,26 @@ class Database:
             ).fetchall()
             current_apps = [r["name"] for r in self._conn.execute("SELECT name FROM apps ORDER BY id")]
             used_apps = col("app_name")
+            # 每个模型的最后一次使用时间。ts 为空的极旧记录按"更早"处理（0 < cutoff）。
+            model_rows = self._conn.execute(
+                "SELECT model, MAX(ts) AS last_ts FROM usage_logs "
+                "WHERE model IS NOT NULL AND model != '' GROUP BY model ORDER BY model"
+            ).fetchall()
             has_unnamed = self._conn.execute(
                 "SELECT 1 FROM usage_logs WHERE app_name IS NULL OR app_name = '' LIMIT 1"
             ).fetchone() is not None
-        current_set = set(current_apps)
-        return {
-            "protocols": col("protocol"),
-            "models": col("model"),
-            "apps": current_apps,
-            "apps_history": [a for a in used_apps if a not in current_set],
-            "has_unnamed": has_unnamed,
-            "statuses": [r[0] for r in st],
-        }
+            # 全部查询都在锁内完成再返回：原先返回语句里的 col() 调用发生在 with 块之外，
+            # 等于绕过了这把锁（单连接跨线程，理论上能撞上并发写）。
+            current_set = set(current_apps)
+            return {
+                "protocols": col("protocol"),
+                "models": [str(r["model"]) for r in model_rows if (r["last_ts"] or 0) >= cutoff],
+                "models_history": [str(r["model"]) for r in model_rows if (r["last_ts"] or 0) < cutoff],
+                "apps": current_apps,
+                "apps_history": [a for a in used_apps if a not in current_set],
+                "has_unnamed": has_unnamed,
+                "statuses": [r[0] for r in st],
+            }
 
     def usage_credit_stats(self) -> dict:
         """按模型累计积分与 token 统计，用于估算'每积分可换多少 token'。

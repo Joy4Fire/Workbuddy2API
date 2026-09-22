@@ -16,6 +16,19 @@
 | v2 | `accounts` 补 `last_checkin_date`；`usage_logs` 补 `input_content` / `output_content` / `reasoning_content` / `credits` / `app_name` |
 | v3 | `apps` 补 `key_enc`（应用 Key 加密存储） |
 | v4 | `accounts` 补 `disabled_reason`（禁用原因，供 WebUI 展示"为什么不可用"） |
+| v5 | `accounts` 补 `checkin_today` / `checkin_active` / `checkin_synced_at`（签到状态改用**上游真值**，`last_checkin_date` 语义收窄为"本网关最后一次成功签到日期"） |
+| v6 | `accounts` 补 `auto_disabled_reason`（**系统**自动禁用位，与人工 `enabled` / `disabled_reason` 分离）；新建 `model_blocks` 表（(账号,模型) 负缓存，11102 指数 TTL 持久化，重启不重新探测） |
+| v7 | 新建 `model_costs` 表（(账号,模型) 成本台账，每 1k token 积分消耗，EMA 平滑 + 6h TTL，供成本分层选号） |
+
+> 当前 `SCHEMA_VERSION = 7`。v6 / v7 属于 2026-09-21 的「账号池治理批次」，
+> 背景与不变量见 `docs/吸收评估-sliverkiss-2026-09-21.md` 与 `AGENTS.md` 第 6 节。
+
+### 新增表的删除级联（v6 / v7 起的约定）
+
+`model_blocks` / `model_costs` 都以 `uid` 关联账号。**删除账号时必须级联清掉**——
+`db.delete_account()` 已包含这两张表。新增任何"以 uid 为键的附属表"时，
+记得同步加进 `delete_account()`，否则删号后会留下孤儿行，
+而这些行会让下一次**同 uid 重新登录**继承上一个账号的冷却/成本数据（很难排查）。
 
 ## 旧库自动合并
 
@@ -72,6 +85,34 @@ _MIGRATIONS = [
 ```bash
 sqlite3 data/workbuddy.db "PRAGMA user_version;"
 ```
+
+也可以在运行中的服务上直接看（**无需 sqlite 客户端**）：
+
+```bash
+curl -s http://127.0.0.1:8787/health
+# {"status":"ok","version":"0.5.0","schema_version":7,"migrated_from":null,...}
+```
+
+## 升级是否真的发生了？——看 `/health` 与 WebUI
+
+`/health` 的这三个字段就是给"我的旧数据到底升级了没有"这个问题的答案：
+
+| 字段 | 含义 |
+|---|---|
+| `version` | 网关版本（唯一真源 = `workbuddy_one/__init__.py`） |
+| `schema_version` | 当前库应达到的 schema 版本（= `SCHEMA_VERSION`） |
+| `migrated_from` | **本次启动真的发生过迁移**时的旧版本号；新库 / 已最新 = `null` |
+
+WebUI 侧边栏底部会显示 `v0.5.0 · db v7`；若本次启动发生过迁移，
+还会多一个琥珀色「数据已升级」徽标（鼠标悬停显示来源版本与备份位置）。
+
+**为什么专门做这个**：迁移成功原本只打一条 `logger.info`，而默认 `LOG_LEVEL=WARNING`
+下它**根本不输出** —— 用户看不到任何迹象，只能怀疑"数据是不是没升级 / 会不会丢"。
+把一次性的升级事件变成界面上看得见的事实，比在文档里写一百遍"会自动迁移"都有用。
+
+> 容器部署时 `./data` 是**卷挂载**，所以「重建容器」不会动数据库；
+> 升级路径就是：拉新代码 → 重建镜像 → 启动时自动迁移（先备份）。
+> 想更保险可以先跑 `python scripts/migrate_db.py` 预迁移，再起服务。
 
 ## 独立迁移脚本
 

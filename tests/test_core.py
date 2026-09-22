@@ -50,9 +50,24 @@ class TestReasoning(unittest.TestCase):
 
     def test_reasoning_downgrade(self):
         from workbuddy_one.reasoning import normalize_reasoning_effort
-        b = {"model": "deepseek-v4-flash", "reasoning_effort": "max"}
+        # 原来这里用的是 deepseek-v4-flash——该模型已随上游目录下架
+        # （2026-09-21 实测目录里只剩 deepseek-v4-pro / deepseek-v4.1-flash），
+        # 名字不在 KNOWN_EFFORTS 里就变成透传，测不到降级。改用仍在册的模型。
+        b = {"model": "deepseek-v4-pro", "reasoning_effort": "max"}
         normalize_reasoning_effort(b)
         self.assertEqual(b["reasoning_effort"], "high")
+
+    def test_reasoning_only_reasoning_model_lifts_off(self):
+        """onlyReasoning 模型收到 off 必须被抬到最低支持档，不能原样透传。
+
+        静态表以前给 deepseek-v4-pro 配了 off，与 `models.reasoning_efforts()`
+        的约定（onlyReasoning 不提供 off）自相矛盾——客户端发 off 会被透传，
+        而 `inject_thinking` 同时注入 `thinking:{type:enabled}`，两个信号打架。
+        """
+        from workbuddy_one.reasoning import normalize_reasoning_effort
+        b = {"model": "deepseek-v4-pro", "reasoning_effort": "off"}
+        normalize_reasoning_effort(b)
+        self.assertEqual(b["reasoning_effort"], "low")
 
     def test_reasoning_pass_through_supported(self):
         from workbuddy_one.reasoning import normalize_reasoning_effort
@@ -207,15 +222,37 @@ class TestRateLimitDetection(unittest.TestCase):
         self.assertEqual(rate_limit_cooldown("将在 2099-01-01 12:00:00 UTC+8 重置".encode("utf-8")), 7200.0)
 
     def test_cooldown_for_error_matrix(self):
+        """错误 → 冷却时长（错误分类表的薄封装）。
+
+        与旧版的差异是**刻意的**（2026-09-21 吸收 Sliverkiss Classify）：
+        - 401 无标记文案 → CLIENT（未知 4xx 只换号不罚）→ 0s，不再无脑罚 30 分钟。
+          防雪崩靠 P1-2 的连败降权（连续 N 次才临时出池），比一次就罚 30 分钟精准。
+        - 429 无时间文案 → 60s 软冷却，不再固定 5 分钟（上游没明说就别多罚）。
+        """
         from workbuddy_one.gateway.inference import cooldown_for_error
-        self.assertEqual(cooldown_for_error(401, b"x"), 1800.0)
+        # 无权威分类的未知 4xx：不罚号（由连败降权兜底）
+        self.assertEqual(cooldown_for_error(401, b"x"), 0.0)
+        self.assertEqual(cooldown_for_error(400, b'{"msg":"something else"}'), 0.0)
+        # 上游 5xx：短冷却
         self.assertEqual(cooldown_for_error(500, b"internal error"), 120.0)
-        self.assertEqual(cooldown_for_error(429, b"no time text"), 300.0)
-        # 非 429 但带限流文案 → 按限流处理（旧版漏判）
-        self.assertEqual(cooldown_for_error(502, b'{"msg":"rate-limiting"}'), 300.0)
-        self.assertEqual(cooldown_for_error(200, "请求过于频繁".encode("utf-8")), 300.0)
-        # 429 + 重置墙钟 → 精确对齐（cap）
+        # 限流（429 无时间文案 → 软冷却基数）
+        self.assertEqual(cooldown_for_error(429, b"no time text"), 60.0)
+        # 非 429 但带限流文案 → 按限流处理（旧版漏判）；限流文案层先于 5xx 层
+        self.assertEqual(cooldown_for_error(502, b'{"msg":"rate-limiting"}'), 60.0)
+        self.assertEqual(cooldown_for_error(200, "请求过于频繁".encode("utf-8")), 60.0)
+        # 429 + 重置墙钟 → 精确对齐（封顶 2h）
         self.assertEqual(cooldown_for_error(429, "将在 2099-01-01 12:00:00 UTC+8 重置".encode("utf-8")), 7200.0)
+        # 404 固定 60s
+        self.assertEqual(cooldown_for_error(404, b"not found"), 60.0)
+        # 余额耗尽 → 冷却到次日 04:00（一定大于 1 小时，且不超过 24 小时）
+        cd = cooldown_for_error(402, b'{"msg":"payment required"}')
+        self.assertTrue(3600 < cd <= 86400, cd)
+        # 请求级错误：不罚号
+        self.assertEqual(cooldown_for_error(400, b'{"code":11115,"msg":"prompt is too long"}'), 0.0)
+        self.assertEqual(cooldown_for_error(400, b'{"code": 11135}'), 0.0)
+        # WAF 403（无业务信封）：抖动后落在 [45, 75]
+        cd = cooldown_for_error(403, b"<html>blocked</html>")
+        self.assertTrue(45 <= cd <= 75, cd)
 
 
 class TestEmptyStreamSentinel(unittest.IsolatedAsyncioTestCase):
@@ -345,8 +382,13 @@ class TestNetProxy(unittest.TestCase):
         from workbuddy_one.config import config
         with patch.object(config, "proxy", ""):
             kw = net.client_kwargs()
-        self.assertEqual(kw, {"trust_env": False})
+        # 只断言"直连"这一件事：trust_env 关闭 + 没有 proxy 参数。
+        # 不断言整个 dict——连接层加固（P1-1）往里面加了 timeout/limits/http2，
+        # 那些各有自己的用例，混在这里会让"加了默认超时"误报成"代理策略变了"。
+        self.assertFalse(kw["trust_env"])
         self.assertNotIn("proxy", kw)
+        self.assertIn("timeout", kw)
+        self.assertIn("limits", kw)
 
     def test_explicit_proxy_is_applied(self):
         from unittest.mock import patch
@@ -793,6 +835,85 @@ class TestUsageSearch(unittest.TestCase):
                 f.unlink(missing_ok=True)
 
 
+class TestUsageModelFilterGrouping(unittest.TestCase):
+    """使用记录页「模型」筛选下拉按最近使用时间分两组（TODO #29）。
+
+    分组只影响展示，**两组并集必须恒等于"用过的全部模型"**——所以这里既钉分组正确，
+    也钉并集不变：分组一旦漏掉模型，老模型就再也筛不出来了。
+    """
+
+    def _make_db(self, name: str):
+        from workbuddy_one.db import Database
+        _TMP.mkdir(exist_ok=True)
+        return Database(str(_TMP / name))
+
+    def _cleanup(self, db, name: str):
+        db._conn.close()
+        for f in _TMP.glob(f"{name}*"):
+            f.unlink(missing_ok=True)
+
+    def _age(self, db, model: str, ts: float | None):
+        """把某模型的记录时间改掉。log_usage 的 ts 固定取当前时间，只能事后改库。"""
+        db._conn.execute("UPDATE usage_logs SET ts = ? WHERE model = ?", (ts, model))
+        db._conn.commit()
+
+    def test_models_split_by_recent_usage(self):
+        import time
+        from workbuddy_one.db import MODEL_RECENT_DAYS
+        name = "filter_group_test.db"
+        db = self._make_db(name)
+        try:
+            db.log_usage(model="fresh", protocol="chat", account_uid="u", status="ok")
+            db.log_usage(model="retired", protocol="chat", account_uid="u", status="ok")
+            self._age(db, "retired", time.time() - (MODEL_RECENT_DAYS + 1) * 86400)
+
+            f = db.usage_filters()
+            self.assertEqual(f["models"], ["fresh"])
+            self.assertEqual(f["models_history"], ["retired"])
+            # 并集不变
+            self.assertEqual(sorted(f["models"] + f["models_history"]), ["fresh", "retired"])
+            # 重写 usage_filters 时顺手把 models 的取数换成了 GROUP BY，别的键不能掉
+            self.assertEqual(f["protocols"], ["chat"])
+            self.assertEqual(f["statuses"], ["ok"])
+            self.assertEqual(f["apps"], [])
+            self.assertIs(f["has_unnamed"], True)  # 两条都没记 app_name
+        finally:
+            self._cleanup(db, name)
+
+    def test_window_boundary_is_inclusive(self):
+        """恰好卡在窗口边界上的算「最近」（判据是 `>=`）。留 60 秒余量避免与执行耗时赛跑。"""
+        import time
+        from workbuddy_one.db import MODEL_RECENT_DAYS
+        name = "filter_boundary_test.db"
+        db = self._make_db(name)
+        try:
+            db.log_usage(model="inside", protocol="chat", account_uid="u", status="ok")
+            db.log_usage(model="outside", protocol="chat", account_uid="u", status="ok")
+            window = MODEL_RECENT_DAYS * 86400
+            self._age(db, "inside", time.time() - (window - 60))
+            self._age(db, "outside", time.time() - (window + 60))
+
+            f = db.usage_filters()
+            self.assertEqual(f["models"], ["inside"])
+            self.assertEqual(f["models_history"], ["outside"])
+        finally:
+            self._cleanup(db, name)
+
+    def test_null_ts_counts_as_history(self):
+        """极旧记录可能没有 ts；没有时间证据的按「更早」处理，不能算进「最近用过」。"""
+        name = "filter_null_ts_test.db"
+        db = self._make_db(name)
+        try:
+            db.log_usage(model="nots", protocol="chat", account_uid="u", status="ok")
+            self._age(db, "nots", None)
+
+            f = db.usage_filters()
+            self.assertEqual(f["models"], [])
+            self.assertEqual(f["models_history"], ["nots"])
+        finally:
+            self._cleanup(db, name)
+
+
 class TestDisabledReason(unittest.TestCase):
     def test_persist_and_clear(self):
         from workbuddy_one.db import Database
@@ -839,6 +960,112 @@ class TestKeepalive(unittest.IsolatedAsyncioTestCase):
 
         out = [c if isinstance(c, str) else c.decode() async for c in _with_keepalive(fast(), 1.0)]
         self.assertEqual(out, ["c0", "c1", "c2", "c3", "c4"])
+
+
+class TestLogSetup(unittest.TestCase):
+    """日志级别开关（`LOG_LEVEL` / `--log-level`）。
+
+    为什么值得单测：项目里 30 处 `logger.info` 在默认配置下**永远不输出**
+    （根 logger 默认 WARNING，且全项目没有 `basicConfig`/`setLevel`）。
+    这个开关是排查时**唯一**能看到那些记录的入口，而它坏掉的方式是"静默的"——
+    少打几行日志不会让任何功能失败，所以只能靠用例守住。
+    """
+
+    def setUp(self):
+        from workbuddy_one import logsetup
+        self.logsetup = logsetup
+        # 日志是**进程级全局状态**：用例之间必须互相隔离，
+        # 否则前一条留下的 handler/级别会改变后一条看到的东西。
+        logsetup.reset_for_tests()
+        self.addCleanup(logsetup.reset_for_tests)
+
+    def test_parse_level_table(self):
+        import logging as lg
+        cases = {
+            None: (lg.WARNING, True),          # 未设置 = 默认档
+            "": (lg.WARNING, True),            # 空串同"未设置"，不算非法
+            "INFO": (lg.INFO, True),
+            "info": (lg.INFO, True),           # 大小写不敏感
+            "  error  ": (lg.ERROR, True),     # 容忍空白
+            "WARN": (lg.WARNING, True),        # logging 的别名
+            "20": (20, True),                  # 纯数字也收
+            "bogus": (lg.WARNING, False),      # 非法 -> 回落且标记为非法
+        }
+        for raw, want in cases.items():
+            with self.subTest(raw=raw):
+                self.assertEqual(self.logsetup.parse_level(raw), want)
+
+    def test_default_level_is_warning(self):
+        """默认必须是 WARNING —— 这是"不改变既有日志输出"的保证。
+
+        若默认被改成 INFO，容器日志会多出大量上游降级/裁剪记录，淹掉真正的告警。
+        """
+        import logging as lg
+        from workbuddy_one.config import config
+        self.assertEqual(self.logsetup.parse_level(config.log_level), (lg.WARNING, True))
+
+    def test_info_level_actually_emits(self):
+        """设成 INFO 之后，`logger.info` 必须真的能落到 handler 上。"""
+        import logging as lg
+        self.logsetup.setup_logging("INFO")
+        logger = lg.getLogger("workbuddy_one.reasoning")
+        with self.assertLogs("workbuddy_one", level="INFO") as cap:
+            logger.info("档位降级：m low -> high")
+        self.assertTrue(any("档位降级" in m for m in cap.output))
+
+    def test_default_level_suppresses_info(self):
+        """默认档位下 INFO 被压掉、WARNING 仍放行——这就是要修的那个"死代码"边界。"""
+        import logging as lg
+        self.logsetup.setup_logging(None)
+        logger = lg.getLogger("workbuddy_one.reasoning")
+        self.assertFalse(logger.isEnabledFor(lg.INFO))
+        self.assertTrue(logger.isEnabledFor(lg.WARNING))
+
+    def test_idempotent_no_duplicate_handlers(self):
+        """重复调用只更新级别，不叠加 handler（否则每调一次就多打一行）。"""
+        import logging as lg
+        self.logsetup.setup_logging("INFO")
+        n1 = len(lg.getLogger("workbuddy_one").handlers)
+        self.logsetup.setup_logging("DEBUG")
+        n2 = len(lg.getLogger("workbuddy_one").handlers)
+        self.assertEqual(n1, n2)
+        self.assertEqual(lg.getLogger("workbuddy_one").level, lg.DEBUG)
+
+    def test_propagate_disabled(self):
+        """propagate 必须关掉：否则 WARNING 及以上会同时走根 logger 的 lastResort
+        handler，同一行打两遍（一遍带格式、一遍裸消息）。"""
+        import logging as lg
+        self.logsetup.setup_logging("INFO")
+        self.assertFalse(lg.getLogger("workbuddy_one").propagate)
+
+    def test_invalid_level_falls_back_with_warning(self):
+        """非法值不能抛异常：启动期因为一个环境变量拼错就崩掉，比降级严重得多。
+
+        但也不能**静默**回落——否则用户设了 `LOG_LEVEL=verbose` 却什么都没发生，
+        会以为是代码没生效。
+        """
+        import logging as lg
+        # 先完成装配再进 assertLogs：assertLogs 会临时接管 handlers，
+        # 若此时 setup_logging 往里加 handler，退出时的还原会把它丢掉，
+        # 留下"标记已配置但没 handler"的不一致状态。
+        self.logsetup.setup_logging("INFO")
+        with self.assertLogs("workbuddy_one", level="WARNING") as cap:
+            level = self.logsetup.setup_logging("verbose")
+        self.assertEqual(level, lg.WARNING)
+        self.assertTrue(any("verbose" in m for m in cap.output),
+                        f"非法级别没有告警：{cap.output}")
+
+    def test_setup_is_reachable_from_create_app(self):
+        """接线检查：`create_app` 必须真的调用 `setup_logging`。
+
+        和 settings 键名拼错是同一类问题——开关存在但没人调用，
+        所有用例依然全绿，线上却永远打不开 INFO。
+        """
+        import inspect
+        from workbuddy_one import app as app_mod
+        src = inspect.getsource(app_mod.create_app)
+        self.assertIn("setup_logging", src,
+                      "create_app 没有调用 setup_logging，LOG_LEVEL 会完全失效")
 
 
 if __name__ == "__main__":

@@ -55,6 +55,15 @@ def register(app: FastAPI, ctx) -> None:
             "aa_refresh_hour": s.get("aa_refresh_hour", "7"),
             "keepalive_hour": s.get("keepalive_hour", "22"),
             "keepalive_enabled": s.get("keepalive_enabled", "1"),
+            # 补签保连登（P3 试点）：总开关默认关，演练默认开（见 scheduler 同名方法）
+            "makeup_enabled": s.get("makeup_enabled", "0"),
+            "makeup_dry_run": s.get("makeup_dry_run", "1"),
+            # 猫猫旅行（国内版专属）：总开关默认关，演练默认开（见 scheduler 同名方法）
+            "travel_enabled": s.get("travel_enabled", "0"),
+            "travel_dry_run": s.get("travel_dry_run", "1"),
+            # 活跃地图每日提醒：默认**开**（只读 + 只提醒，不写上游、不花积分）
+            "active_map_enabled": s.get("active_map_enabled", "1"),
+            "active_map_hour": s.get("active_map_hour", "23"),
             # 不回明文 key（掩码用于前端展示），完整 key 只在保存时传入、存 DB 即可
             "aa_api_key_masked": _mask_secret(aa_key),
             "aa_enabled": bool(aa_key),
@@ -65,12 +74,21 @@ def register(app: FastAPI, ctx) -> None:
             "alert_expiry_days": s.get("alert_expiry_days", "3"),
             # 模型别名映射（每行一条：别名=真实模型）
             "model_aliases": s.get("model_aliases", ""),
+            # 系统提示词三模式（P2-1）：passthrough（默认，零改动）/ custom / append
+            "prompt_mode": s.get("prompt_mode", "passthrough"),
+            "prompt_text": s.get("prompt_text", ""),
             # 区域与网络：DB 值（用户设过的）与环境变量值分开返回——
             # 前端才能显示"你没设过，当前生效的是环境变量里的 XXX"，而不是误导成空。
             "regions": _region_counts(),
             "backend": s.get("backend", ""),
             "proxy": s.get("proxy", ""),
             "workbuddy_exe": s.get("workbuddy_exe", ""),
+            # 在途并发上限（P1-1）：0 = 不限制。DB 值与环境变量值分开返回，
+            # 前端才能显示"你没设过，当前生效的是环境变量里的 X"。
+            "max_in_flight": s.get("max_in_flight", ""),
+            "max_in_flight_global": s.get("max_in_flight_global", ""),
+            "env_max_in_flight": str(config.max_in_flight),
+            "env_max_in_flight_global": str(config.max_in_flight_global),
             "env_backend": config.backend,
             "env_proxy": config.proxy,
             "env_workbuddy_exe": config.workbuddy_exe,
@@ -117,6 +135,29 @@ def register(app: FastAPI, ctx) -> None:
         if "keepalive_enabled" in body:
             val = str(body.get("keepalive_enabled") or "").strip()
             db.save_settings(keepalive_enabled="1" if val in ("1", "true", "on") else "0")
+        if "makeup_enabled" in body:
+            val = str(body.get("makeup_enabled") or "").strip().lower()
+            db.save_settings(makeup_enabled="1" if val in ("1", "true", "on") else "0")
+        if "makeup_dry_run" in body:
+            val = str(body.get("makeup_dry_run") or "").strip().lower()
+            db.save_settings(makeup_dry_run="1" if val in ("1", "true", "on") else "0")
+        if "travel_enabled" in body:
+            val = str(body.get("travel_enabled") or "").strip().lower()
+            db.save_settings(travel_enabled="1" if val in ("1", "true", "on") else "0")
+        if "travel_dry_run" in body:
+            val = str(body.get("travel_dry_run") or "").strip().lower()
+            db.save_settings(travel_dry_run="1" if val in ("1", "true", "on") else "0")
+        if "active_map_enabled" in body:
+            val = str(body.get("active_map_enabled") or "").strip().lower()
+            db.save_settings(active_map_enabled="1" if val in ("1", "true", "on") else "0")
+        if "active_map_hour" in body:
+            # 0~23；非法值直接丢弃（落进"空值=不改"分支），别写一个跑不起来的点
+            try:
+                h = int(body.get("active_map_hour"))
+                if 0 <= h <= 23:
+                    db.save_settings(active_map_hour=str(h))
+            except (TypeError, ValueError):
+                pass
         if "alert_enabled" in body:
             val = str(body.get("alert_enabled") or "").strip().lower()
             db.save_settings(alert_enabled="1" if val in ("1", "true", "on") else "0")
@@ -149,6 +190,14 @@ def register(app: FastAPI, ctx) -> None:
                     raise HTTPException(status_code=400,
                                         detail={"error": {"message": f"模型别名格式错误：{ln}（应为 别名=真实模型）"}})
             db.save_settings(model_aliases=raw)
+        if "prompt_mode" in body:
+            mode = str(body.get("prompt_mode") or "").strip().lower() or "passthrough"
+            if mode not in ("passthrough", "custom", "append"):
+                raise HTTPException(status_code=400, detail={"error": {"message":
+                    "系统提示词模式需为 passthrough / custom / append"}})
+            db.save_settings(prompt_mode=mode)
+        if "prompt_text" in body:
+            db.save_settings(prompt_text=str(body.get("prompt_text") or ""))
         if "aa_api_key" in body:
             aa_key = str(body.get("aa_api_key") or "").strip()
             # 留空且已有配置 → 视为不修改（避免误清空）；显式清除用特殊标记
@@ -174,9 +223,27 @@ def register(app: FastAPI, ctx) -> None:
         if "workbuddy_exe" in body:
             # 允许直接粘贴带引号的 Windows 路径（用户从资源管理器复制出来的样子）
             db.save_settings(workbuddy_exe=str(body.get("workbuddy_exe") or "").strip().strip('"'))
-        # 这三项是"每次调用现读"的（区域判定 / 出站客户端 / 解密探测），
+        for key, label in (("max_in_flight", "单账号在途并发上限"),
+                           ("max_in_flight_global", "国际版在途并发上限")):
+            if key not in body:
+                continue
+            v = str(body.get(key) or "").strip()
+            if v == "":
+                db.save_settings(**{key: ""})   # 留空 = 回落环境变量
+                continue
+            try:
+                n = int(v)
+                if n < 0 or n > 64:
+                    raise ValueError
+            except (TypeError, ValueError):
+                raise HTTPException(status_code=400, detail={"error": {
+                    "message": f"{label}需为 0-64 的整数（0 = 不限制；留空 = 用环境变量）"}})
+            db.save_settings(**{key: str(n)})
+        # 这几项是"每次调用现读"的（区域判定 / 出站客户端 / 解密探测），
         # 所以保存后立刻重载覆盖即可生效，不需要重启进程。
         config.load_overrides(db.get_settings())
+        # 在途并发上限缓存在账号实例上（pick 持锁时不读配置），改完必须显式刷一次
+        pool.apply_capacity_limits()
         # 设置已存入 DB，调度器下个周期自动生效；响应结构与 GET 一致（不回明文 key）
         resp = dict(admin_get_settings())
         resp["ok"] = True

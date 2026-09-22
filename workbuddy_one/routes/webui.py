@@ -10,6 +10,8 @@ from pathlib import Path
 from fastapi import FastAPI, HTTPException
 
 from ..config import PACKAGE_ROOT
+from ..db import SCHEMA_VERSION
+from .. import __version__
 from fastapi.responses import FileResponse, JSONResponse
 
 _DIST_DIR = PACKAGE_ROOT / "frontend" / "dist"
@@ -18,8 +20,27 @@ _DIST_DIR = PACKAGE_ROOT / "frontend" / "dist"
 def register(app: FastAPI, ctx) -> None:
     @app.get("/health")
     def health():
-        info = {"status": "ok", "auth_files": ctx.auth_files_count, "accounts": list(ctx.managers.keys())}
-        return info
+        """健康检查 + 版本信息。
+
+        **为什么要带上版本号**：前端侧边栏以前把版本**硬编码**在
+        `AppSidebar.vue` 里，忘记同步就会一直显示上一个版本（而且没人会发现）。
+        现在改成从这里读，版本号只有一个真源（`workbuddy_one/__init__.py`）。
+
+        `schema_version` / `migrated_from` 让"旧数据有没有自动升级"变成**看得见的事实**：
+        迁移成功那条日志是 `logger.info`，默认 `LOG_LEVEL=WARNING` 时不可见，
+        用户无法确认自己的历史数据是否被升上来。`migrated_from` 只在**本次启动真的
+        发生过迁移**时才有值（新库 / 已最新 = null），语义上就是"从哪个版本升上来的"。
+
+        本端点**不做任何上游请求**（它是被高频轮询的），只读进程内内存。
+        """
+        return {
+            "status": "ok",
+            "version": __version__,
+            "schema_version": SCHEMA_VERSION,
+            "migrated_from": getattr(ctx.db, "migrated_from", None),
+            "auth_files": ctx.auth_files_count,
+            "accounts": list(ctx.managers.keys()),
+        }
 
     @app.get("/")
     def index():

@@ -66,6 +66,47 @@ def register(app: FastAPI, ctx) -> None:
                         "message": f"账号 {a['uid'][:8]} 的积分将在 {days:.1f} 天后到期（剩余 {a.get('credits_remaining'):.0f}），请及时消耗",
                     })
 
+        # 活跃地图未点亮（今天还没在官方客户端聊过 → **活跃连登今天会断**）。
+        #
+        # 数据来自 scheduler 的**只读快照**，本端点绝不因此打上游 —— 概览是高频轮询
+        # 端点，在这里查 heatmap 等于每秒往上游打几十个请求（见
+        # `scheduler.active_map_snapshot` 的说明）。
+        #
+        # 这条横幅是**没有配 webhook 时唯一能看到提醒的地方**：`do_active_map_check`
+        # 的 webhook 只在 `alert_webhook_url` 非空时才推，而容器日志用户不会去看。
+        am = ctx.scheduler.active_map_snapshot()
+        if am:
+            unlit = am.get("unlit") or []
+            unknown = am.get("unknown") or []
+            if unlit:
+                who = "、".join(f"{u['uid'][:8]}（{u['region_label']}）" for u in unlit[:3])
+                if len(unlit) > 3:
+                    who += f" 等 {len(unlit)} 个"
+                alerts.append({
+                    "level": "warning",
+                    "message": (
+                        f"今天（{am['date']}）有 {len(unlit)} 个账号没有点亮活跃地图，"
+                        f"活跃连登今天会断档：{who}。"
+                        f"到官方客户端聊一句即可点亮（当天 24:00 前有效）——"
+                        f"注意本网关的对话请求点不亮它，只有官方客户端会。"
+                    ),
+                })
+            if unknown:
+                # 单独一条、用 `info` 而不是 `warning`：**这是"没查出来"，不是"没点亮"**。
+                # 两者都用红色的话，用户一眼分不清哪条是确认的问题、哪条只是不确定。
+                # 但必须显示 —— 一次 TLS 抖动不能让某个账号静默失去保护。
+                who = "、".join(f"{u['uid'][:8]}（{u['region_label']}）" for u in unknown[:3])
+                if len(unknown) > 3:
+                    who += f" 等 {len(unknown)} 个"
+                alerts.append({
+                    "level": "info",
+                    "message": (
+                        f"另有 {len(unknown)} 个账号的活跃地图查询失败，"
+                        f"无法判断今天是否点亮：{who}。"
+                        f"保险起见也去官方客户端聊一句（当天 24:00 前有效）。"
+                    ),
+                })
+
         return {
             "accounts": accounts,
             # 概览是高频轮询端点：模型只读缓存快照，绝不触发上游网络请求

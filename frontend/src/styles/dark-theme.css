@@ -23,44 +23,47 @@ body .ant-popover-title {
   border-bottom-color: rgba(255,255,255,0.08);
 }
 
-/* 表格深色化（核心：antd 默认白底 #fff / 表头 #fafafa，必须强制覆盖） */
-.page-content .ant-table,
-.page-content .ant-table-container,
-.page-content .ant-table-content,
-.page-content .ant-table-body {
+/* 表格深色化（核心：antd 默认白底 #fff / 表头 #fafafa，必须强制覆盖）
+   前缀用 :is(.page-content, .ant-modal) 双写：表格以前只出现在页面里，
+   但「连登状态」表格是放在弹窗里的，只写 .page-content 会让弹窗里的表格
+   退回 antd 默认浅色（白底黑字）。凡是可能同时出现在页面与弹窗里的组件都要双写。 */
+:is(.page-content, .ant-modal) .ant-table,
+:is(.page-content, .ant-modal) .ant-table-container,
+:is(.page-content, .ant-modal) .ant-table-content,
+:is(.page-content, .ant-modal) .ant-table-body {
   background: transparent !important;
   color: #cdd6e8;
 }
-.page-content .ant-table-thead > tr > th {
+:is(.page-content, .ant-modal) .ant-table-thead > tr > th {
   /* 必须不透明：横向滚动时表头固定列不能透出底下经过的列（rgba 半透明会露馅） */
   background: #213051 !important;
   color: #a5b8d8 !important;
   border-bottom: 1px solid rgba(255,255,255,0.08) !important;
 }
-.page-content .ant-table-tbody > tr > td {
+:is(.page-content, .ant-modal) .ant-table-tbody > tr > td {
   border-bottom: 1px solid rgba(255,255,255,0.06) !important;
   color: #cdd6e8 !important;
 }
 /* 普通单元格透明；固定列必须保持不透明——否则横向滚动时，
    经过固定列下方的其它列内容会透出来（曾致操作列旁浮现优先级输入框残影） */
-.page-content .ant-table-tbody > tr > td:not(.ant-table-cell-fix-left):not(.ant-table-cell-fix-right) {
+:is(.page-content, .ant-modal) .ant-table-tbody > tr > td:not(.ant-table-cell-fix-left):not(.ant-table-cell-fix-right) {
   background: transparent !important;
 }
-.page-content .ant-table-tbody > tr:hover > td:not(.ant-table-cell-fix-left):not(.ant-table-cell-fix-right) {
+:is(.page-content, .ant-modal) .ant-table-tbody > tr:hover > td:not(.ant-table-cell-fix-left):not(.ant-table-cell-fix-right) {
   background: rgba(99,179,237,0.08) !important;
 }
-.page-content .ant-table-tbody > tr:hover > td.ant-table-cell-fix-left,
-.page-content .ant-table-tbody > tr:hover > td.ant-table-cell-fix-right {
+:is(.page-content, .ant-modal) .ant-table-tbody > tr:hover > td.ant-table-cell-fix-left,
+:is(.page-content, .ant-modal) .ant-table-tbody > tr:hover > td.ant-table-cell-fix-right {
   background: #213051 !important;
 }
-.page-content .ant-table-placeholder,
-.page-content .ant-table-expanded-row-fixed {
+:is(.page-content, .ant-modal) .ant-table-placeholder,
+:is(.page-content, .ant-modal) .ant-table-expanded-row-fixed {
   background: transparent !important;
 }
-.page-content .ant-table-cell { color: #cdd6e8 !important; }
+:is(.page-content, .ant-modal) .ant-table-cell { color: #cdd6e8 !important; }
 /* 固定列（sticky）底色：与卡片背景一致的不透明色 */
-.page-content .ant-table-cell-fix-left,
-.page-content .ant-table-cell-fix-right {
+:is(.page-content, .ant-modal) .ant-table-cell-fix-left,
+:is(.page-content, .ant-modal) .ant-table-cell-fix-right {
   background: #1a2140 !important;
 }
 
@@ -100,20 +103,47 @@ body .ant-select-dropdown .ant-select-selection-placeholder { color: #8a94a6 !im
   background: linear-gradient(135deg, #4f52e0, #7c4ce0) !important;
 }
 .page-content .ant-btn-dangerous { color: #ff6b6b; border-color: rgba(255,107,107,0.4); }
+/* 危险按钮（a-button danger）出现在弹窗 / 浮层里时也必须深色化。
+   漏掉的症状是"白底"：antd 的 danger 只改文字与边框色，**背景仍取 colorBgContainer
+   = 白**，在深色弹窗里就是一块白板。弹窗与浮层各自 portal 到 body 下，
+   .page-content 的前缀管不到，所以三个作用域都要写。 */
+.ant-modal .ant-btn-dangerous,
+.ant-popover .ant-btn-dangerous,
+.ant-popconfirm .ant-btn-dangerous {
+  background: transparent !important;
+  color: #ff6b6b !important;
+  border-color: rgba(255,107,107,0.4) !important;
+}
+.ant-modal .ant-btn-dangerous:hover,
+.ant-popover .ant-btn-dangerous:hover,
+.ant-popconfirm .ant-btn-dangerous:hover {
+  border-color: #ff6b6b !important; color: #ff8a8a !important;
+}
 
-/* 状态标签：实心化，提升深色下识别度 */
-.page-content .ant-tag-green,
-.page-content .ant-tag-success { background: rgba(34,197,94,0.18) !important; color: #4ade80 !important; border-color: rgba(34,197,94,0.4) !important; }
-.page-content .ant-tag-red,
-.page-content .ant-tag-error { background: rgba(244,63,94,0.18) !important; color: #fb7185 !important; border-color: rgba(244,63,94,0.4) !important; }
-.page-content .ant-tag-blue { background: rgba(99,179,237,0.16) !important; color: #7cc0f5 !important; border-color: rgba(99,179,237,0.4) !important; }
-.page-content .ant-tag-purple { background: rgba(167,139,250,0.16) !important; color: #c4b5fd !important; border-color: rgba(167,139,250,0.4) !important; }
-.page-content .ant-tag-gold { background: rgba(245,158,11,0.16) !important; color: #fbbf24 !important; border-color: rgba(245,158,11,0.4) !important; }
-.page-content .ant-tag-geekblue { background: rgba(79,111,230,0.16) !important; color: #94a6f0 !important; border-color: rgba(79,111,230,0.4) !important; }
-.page-content .ant-tag-orange { background: rgba(249,115,22,0.16) !important; color: #fdba74 !important; border-color: rgba(249,115,22,0.4) !important; }
-.page-content .ant-tag-cyan { background: rgba(34,211,238,0.16) !important; color: #67e8f9 !important; border-color: rgba(34,211,238,0.4) !important; }
-.page-content .ant-tag-default { background: rgba(148,163,184,0.16) !important; color: #cbd5e1 !important; border-color: rgba(148,163,184,0.4) !important; }
-.page-content .ant-tag { color: #cdd6e8 !important; border-radius: 6px; }
+/* 状态标签：实心化，提升深色下识别度。
+   用 :is() 一并覆盖「页面」与「弹窗」两个 portal 作用域——之前只写了
+   .page-content，导致记录详情弹窗里的状态标签（ok/error）露出 antd 默认
+   **浅绿底 + 深绿字**，在深色弹窗里既突兀、又只有 3.37:1（实测）。
+   标签还会出现在别的弹窗里，所以整组一起扩，不要只补当前用到的那两个色。
+
+   注意顺序：这条**通用**兜底色必须写在下面各配色规则**之前**。
+   `:is(.page-content,.ant-modal) .ant-tag` 与 `… .ant-tag-green` 的特异性
+   完全一样（都是 0,2,0），CSS 里同特异性由**后写的胜出** —— 放后面会把
+   green/red/… 的字色全部盖成 #cdd6e8，所有标签看起来一个颜色（实测过：
+   「已签到」标签带 ant-tag-green 类，字色却是 rgb(205,214,232)）。
+   它只负责给没有配色类的裸 .ant-tag 兜个底色。 */
+:is(.page-content, .ant-modal) .ant-tag { color: #cdd6e8 !important; border-radius: 6px; }
+:is(.page-content, .ant-modal) .ant-tag-green,
+:is(.page-content, .ant-modal) .ant-tag-success { background: rgba(34,197,94,0.18) !important; color: #4ade80 !important; border-color: rgba(34,197,94,0.4) !important; }
+:is(.page-content, .ant-modal) .ant-tag-red,
+:is(.page-content, .ant-modal) .ant-tag-error { background: rgba(244,63,94,0.18) !important; color: #fb7185 !important; border-color: rgba(244,63,94,0.4) !important; }
+:is(.page-content, .ant-modal) .ant-tag-blue { background: rgba(99,179,237,0.16) !important; color: #7cc0f5 !important; border-color: rgba(99,179,237,0.4) !important; }
+:is(.page-content, .ant-modal) .ant-tag-purple { background: rgba(167,139,250,0.16) !important; color: #c4b5fd !important; border-color: rgba(167,139,250,0.4) !important; }
+:is(.page-content, .ant-modal) .ant-tag-gold { background: rgba(245,158,11,0.16) !important; color: #fbbf24 !important; border-color: rgba(245,158,11,0.4) !important; }
+:is(.page-content, .ant-modal) .ant-tag-geekblue { background: rgba(79,111,230,0.16) !important; color: #94a6f0 !important; border-color: rgba(79,111,230,0.4) !important; }
+:is(.page-content, .ant-modal) .ant-tag-orange { background: rgba(249,115,22,0.16) !important; color: #fdba74 !important; border-color: rgba(249,115,22,0.4) !important; }
+:is(.page-content, .ant-modal) .ant-tag-cyan { background: rgba(34,211,238,0.16) !important; color: #67e8f9 !important; border-color: rgba(34,211,238,0.4) !important; }
+:is(.page-content, .ant-modal) .ant-tag-default { background: rgba(148,163,184,0.16) !important; color: #cbd5e1 !important; border-color: rgba(148,163,184,0.4) !important; }
 
 /* 分页 */
 /* 总数文字（"共 N 条"）antd 默认深灰，深色底上看不清 */
@@ -128,9 +158,14 @@ body .ant-select-dropdown .ant-select-selection-placeholder { color: #8a94a6 !im
   border-color: #6366f1; background: rgba(99,102,241,0.2);
 }
 .page-content .ant-pagination-item-active a { color: #fff; }
+/* 跳页省略号（"•••"）：antd 默认 colorTextDisabled = rgba(0,0,0,0.25)，
+   叠在 #1a2140 上合成后对比度只有 1.11:1——等于隐身，用户看不到"这里还有页码可跳"。
+   父级 .ant-pagination-item 的颜色管不到它，它自己带 color，必须单独覆盖。 */
+.page-content .ant-pagination-item-ellipsis { color: #8a94a6 !important; }
 
-/* 空状态 */
-.page-content .ant-empty-description { color: #8a94a6; }
+/* 空状态。弹窗里的表格（如"连登状态"）也会出现空状态，必须一起覆盖——
+   antd 默认 colorTextDescription 是 rgba(0,0,0,0.45)，叠在 #1a2140 上等于隐形。 */
+:is(.page-content, .ant-modal) .ant-empty-description { color: #8a94a6 !important; }
 
 /* 统计数字 */
 .page-content .ant-statistic-title { color: #8a94a6; }
@@ -150,7 +185,17 @@ body .ant-select-dropdown .ant-select-selection-placeholder { color: #8a94a6 !im
 .ant-modal .ant-modal-close { color: #8a94a6 !important; }
 .ant-modal .ant-modal-close:hover { color: #e6edf7 !important; background: rgba(255,255,255,0.08) !important; }
 .ant-modal .ant-modal-body { color: #e6edf7 !important; }
-.ant-modal .ant-form-item-label > label { color: #cdd6e8 !important; }
+/* 表单标签。这条原先只写了 .ant-modal —— 当时表单只存在于弹窗里。
+   设置改成独立页面（/settings）后，页内表单落在 .page-content 作用域，
+   没覆盖 → 标签退回 antd 默认 rgba(0,0,0,0.88)，叠在 #1a2140 上实测只有 1.3:1，
+   放大 8 倍才看得出是近黑字（小尺寸下抗锯齿会骗过肉眼，必须靠量）。
+   用 :is() 一次覆盖两个作用域，避免以后再搬动又漏。 */
+:is(.page-content, .ant-modal) .ant-form-item-label > label { color: #cdd6e8 !important; }
+/* 校验错误文案与说明文案。antd 默认错误色 #ff4d4f（深底上约 4.8:1，勉强达标），
+   统一提到与 .ant-btn-dangerous 同色的 #ff6b6b（约 5.7:1）；
+   说明文案默认 rgba(0,0,0,0.45) 是深色，深底上完全看不见，必须一并覆盖。 */
+:is(.page-content, .ant-modal) .ant-form-item-explain-error { color: #ff6b6b !important; }
+:is(.page-content, .ant-modal) .ant-form-item-extra { color: #8a94a6 !important; }
 
 /* 弹窗内分隔线。antd 默认：线 rgba(5,5,5,0.06) 在深色底上几乎不可见、
    文字 rgba(0,0,0,0.88) 是深色——不覆盖会「黑字黑底看不见」（历史事故同类）。
@@ -208,6 +253,12 @@ body .ant-select-dropdown .ant-select-selection-placeholder { color: #8a94a6 !im
 }
 .ant-modal .ant-alert { background: rgba(99, 179, 237, 0.08); border-color: rgba(99, 179, 237, 0.2); }
 
+/* 弹窗内的普通链接（扫码登录的「无法扫码？点此在浏览器打开登录」）。
+   antd 默认 colorLink = #1677ff，叠在弹窗底色 #1a2140 上只有 3.83:1，
+   未达 AA 正文要求的 4.5:1；换成全局既有的浅蓝，约 8:1。 */
+.ant-modal a { color: #7cc0f5 !important; }
+.ant-modal a:hover { color: #9dd0ff !important; }
+
 /* 概览积分预警横幅深色化（warning=橙 / info=蓝，文字提亮保证可读） */
 .page-content .ant-alert-warning {
   background: rgba(245, 158, 11, 0.12) !important;
@@ -243,8 +294,65 @@ body .ant-select-item-option-selected .ant-select-item-option-content { color: #
 /* 下拉里的分组标题（opt-group label）默认是深灰，深色底上看不清 */
 body .ant-select-item-group { color: #7d8aa5 !important; }
 
-/* 复选 / 单选框 */
+/* 复选 / 单选框。
+   弹窗里的复选框（设置里的「清除已配置的 Key」）必须单独写：它的文案
+   由 antd 用 CSS-in-JS 直接设在 label 内的 span 上（colorText ≈ rgba(0,0,0,.88)），
+   叠在弹窗底色上对比度 1.30:1 —— 字基本看不见，而父级 !important 不会覆盖
+   子元素自带的声明。所以既要覆盖 wrapper，也要覆盖那个 span。 */
 .page-content .ant-checkbox-wrapper { color: #cdd6e8; }
+.ant-modal .ant-checkbox-wrapper,
+.ant-modal .ant-checkbox-wrapper > span:not(.ant-checkbox) { color: #cdd6e8 !important; }
+
+/* 复选框的**方框本体**。上面两条只管住了文案颜色，方框本身没人管：
+   antd v5 默认 colorBgContainer = #fff，所以未选中的框是一块**纯白方块**，
+   深色弹窗里非常刺眼；选中态则是 antd 默认蓝 #1677ff，与全局紫蓝主色不一致。
+   （同类事故：a-switch 的轨道曾漏在外面，未选中时对比度只有 1.10:1。
+   教训是"文案覆盖了"不等于"组件覆盖了"，方框、轨道这类非文字部件要单独写。） */
+:is(.page-content, .ant-modal) .ant-checkbox .ant-checkbox-inner {
+  background: #121a30 !important;
+  border-color: rgba(99,179,237,0.35) !important;
+}
+:is(.page-content, .ant-modal) .ant-checkbox-checked .ant-checkbox-inner {
+  /* 与 .ant-btn-primary / radio-button-checked 同一套紫蓝主色 */
+  background: linear-gradient(135deg, #6366f1, #8b5cf6) !important;
+  border-color: #818cf8 !important;
+}
+:is(.page-content, .ant-modal) .ant-checkbox-wrapper:hover .ant-checkbox-inner {
+  border-color: #7cc0f5 !important;
+}
+
+/* 开关（Switch）——设置弹窗里的「每日 token 保活」「积分预警」两个开关。
+   antd v5 默认未选中轨道是 token.colorTextQuaternary = rgba(0,0,0,0.25)，
+   叠在弹窗底色 #1a2140 上合成 #141930，与底色对比度只有 1.10:1 —— 轨道基本消失，
+   看起来只剩一个悬空的白点，既不像开关也看不出状态。选中态则是 antd 默认蓝
+   #1677ff，与全局的紫蓝渐变主色（.ant-btn-primary / radio-button-checked）不一致。
+   两处都按本文件既有写法覆盖。
+   开关目前只出现在弹窗里（portal 到 body 下），但 .page-content 前缀一并写上，
+   避免以后挪到页面内又露馅（同类事故见文件头注释）。 */
+.page-content .ant-switch,
+.ant-modal .ant-switch {
+  /* 半透明白比写死十六进制更稳：换任何深色底都不会糊在一起 */
+  background: rgba(255, 255, 255, 0.25) !important;
+}
+.page-content .ant-switch:hover:not(.ant-switch-disabled),
+.ant-modal .ant-switch:hover:not(.ant-switch-disabled) {
+  background: rgba(255, 255, 255, 0.32) !important;
+}
+.page-content .ant-switch.ant-switch-checked,
+.ant-modal .ant-switch.ant-switch-checked {
+  background: linear-gradient(135deg, #6366f1, #8b5cf6) !important;
+}
+/* 轨道上的「开启 / 关闭」文字（checked-children / un-checked-children） */
+.page-content .ant-switch .ant-switch-inner,
+.ant-modal .ant-switch .ant-switch-inner {
+  color: #fff !important;
+}
+/* 把手：保持白色，另加一圈极淡描边，防止与提亮后的轨道糊在一起 */
+.page-content .ant-switch .ant-switch-handle::before,
+.ant-modal .ant-switch .ant-switch-handle::before {
+  background: #fff !important;
+  box-shadow: 0 0 0 1px rgba(13, 17, 32, 0.35);
+}
 
 /* 分段控件（radio-button）深色化：覆盖 antd 默认白底 */
 .page-content .ant-radio-group .ant-radio-button-wrapper {
@@ -311,6 +419,37 @@ body .ant-select-item-group { color: #7d8aa5 !important; }
   color: #fff !important;
 }
 
+/* popover / popconfirm 内的输入框：浮层 portal 到 body 下，.page-content 与
+   .ant-modal 两个前缀都管不到它——漏了就会在深色浮层里露出一块**纯白底黑字**
+   的输入框（Token 管理里实测 background=rgb(255,255,255)、color=rgba(0,0,0,.88)）。 */
+.ant-popover .ant-input,
+.ant-popover .ant-input-affix-wrapper,
+.ant-popover .ant-input-number,
+.ant-popover .ant-select-selector,
+.ant-popconfirm .ant-input,
+.ant-popconfirm .ant-input-affix-wrapper {
+  background: #121a30 !important;
+  border-color: rgba(99, 179, 237, 0.25) !important;
+  color: #e6edf7 !important;
+}
+.ant-popover .ant-input-number-input { color: #e6edf7 !important; }
+.ant-popover .ant-input::placeholder,
+.ant-popconfirm .ant-input::placeholder { color: #6b7794 !important; }
+.ant-popover .ant-select-selection-item { color: #e6edf7 !important; }
+.ant-popover .ant-select-selection-placeholder { color: #8a94a6 !important; }
+.ant-popover .ant-select-arrow { color: #8a94a6; }
+
+/* 浮层内的 code 片段（Token 管理说明里的 ADMIN_TOKEN）：与弹窗内的 code 保持一致，
+   给一个浅蓝底 + 浅蓝字。不给的话它只能继承说明文字的灰色，既无区分度、
+   又会被压到 4.44:1（实测）——刚好卡在 AA 线下面。 */
+.ant-popover code {
+  background: rgba(99, 179, 237, 0.12);
+  color: #7cc0f5;
+  padding: 1px 6px;
+  border-radius: 4px;
+  word-break: break-all;
+}
+
 /* alert */
 .page-content .ant-alert {
   border-radius: 10px;
@@ -330,12 +469,44 @@ body .ant-select-item-group { color: #7d8aa5 !important; }
 .ant-message .anticon { color: #63b3ed; }
 .ant-message .ant-message-notice-content span { color: #e6edf7 !important; }
 
-/* 表格滚动条深色 */
-.page-content .ant-table-body::-webkit-scrollbar,
-.page-content .ant-table-content::-webkit-scrollbar { height: 8px; width: 8px; }
-.page-content .ant-table-body::-webkit-scrollbar-thumb,
-.page-content .ant-table-content::-webkit-scrollbar-thumb {
+/* 表格滚动条深色（弹窗里的表格同样需要，否则横向滚动时露出系统浅色滚动条） */
+:is(.page-content, .ant-modal) .ant-table-body::-webkit-scrollbar,
+:is(.page-content, .ant-modal) .ant-table-content::-webkit-scrollbar { height: 8px; width: 8px; }
+:is(.page-content, .ant-modal) .ant-table-body::-webkit-scrollbar-thumb,
+:is(.page-content, .ant-modal) .ant-table-content::-webkit-scrollbar-thumb {
   background: rgba(99,179,237,0.3); border-radius: 4px;
 }
-.page-content .ant-table-body::-webkit-scrollbar-track,
-.page-content .ant-table-content::-webkit-scrollbar-track { background: transparent; }
+:is(.page-content, .ant-modal) .ant-table-body::-webkit-scrollbar-track,
+:is(.page-content, .ant-modal) .ant-table-content::-webkit-scrollbar-track { background: transparent; }
+/* 标签页（Tabs）——设置页（/settings）首次使用。antd 默认全是浅色主题值：
+   · 未选中标签文字 colorText = rgba(0,0,0,0.88) → 深色底上几乎不可见
+   · 导航条底部有一条 rgba(5,5,5,0.06) 的细线，深色底上看不见 → 分组边界消失
+   · 选中态文字与下划线（ink-bar）是 antd 默认蓝 #1677ff，与全局紫蓝渐变主色不一致
+   与前面几节同理统一覆盖；目前标签只在页面内，但仍按既有写法带上 .page-content 前缀，
+   避免以后挪进弹窗/浮层又露馅。 */
+.page-content .ant-tabs-tab,
+.page-content .ant-tabs-tab .ant-tabs-tab-btn {
+  color: #8a94a6 !important;
+}
+.page-content .ant-tabs-tab:hover,
+.page-content .ant-tabs-tab:hover .ant-tabs-tab-btn {
+  color: #cdd6e8 !important;
+}
+.page-content .ant-tabs-tab.ant-tabs-tab-active .ant-tabs-tab-btn {
+  color: #a5b8ff !important;
+}
+/* 导航条底部分隔线：antd 默认 rgba(5,5,5,0.06)，深色底上等于没有 */
+.page-content .ant-tabs-nav::before {
+  border-bottom-color: rgba(255, 255, 255, 0.12) !important;
+}
+/* 选中下划线：对齐全局主色渐变（与 .ant-btn-primary / switch-checked 同一套） */
+.page-content .ant-tabs-ink-bar {
+  background: linear-gradient(135deg, #6366f1, #8b5cf6) !important;
+}
+/* 标签过多时 antd 会折叠成「更多」下拉，它 portal 到 body 下，页面前缀管不到 */
+.ant-tabs-dropdown .ant-tabs-dropdown-menu-item {
+  color: #cdd6e8 !important;
+}
+.ant-tabs-dropdown .ant-tabs-dropdown-menu-item:hover {
+  background: rgba(99, 179, 237, 0.14) !important;
+}

@@ -528,6 +528,41 @@ class TestConfigOverrides(unittest.TestCase):
             candidates = atrest.official_exe_candidates()
         self.assertEqual(candidates[0], Path("/custom/WorkBuddy"))
 
+    # ---- 整数型覆盖项（在途并发上限）----
+    # 这两项与上面三项有一个关键差别：**"0" 是一个有意义的值**（= 不限制），
+    # 不是"未设置"。所以不能用 falsy 判断来决定是否回落环境变量，
+    # 否则用户显式设的"0 = 不限制"会被静默当成"没设过"而失效。
+
+    def test_int_override_zero_is_a_real_value(self):
+        with patch.object(self.config, "max_in_flight", 3):
+            self.config.load_overrides({"max_in_flight": "0"})
+            self.assertEqual(self.config.max_in_flight_effective, 0)
+            # override_of 也要如实回显 "0"，否则设置页输入框会显示成空
+            self.assertEqual(self.config.override_of("max_in_flight"), "0")
+
+    def test_int_override_empty_falls_back_to_env(self):
+        with patch.object(self.config, "max_in_flight", 3):
+            self.config.load_overrides({"max_in_flight": ""})
+            self.assertEqual(self.config.max_in_flight_effective, 3)
+            self.assertEqual(self.config.override_of("max_in_flight"), "")
+
+    def test_int_override_bad_value_falls_back_not_raises(self):
+        """配置坏掉不该让进程起不来：非法值回落环境变量，不抛异常。"""
+        with patch.object(self.config, "max_in_flight", 3):
+            self.config.load_overrides({"max_in_flight": "abc"})
+            self.assertEqual(self.config.max_in_flight_effective, 3)
+
+    def test_global_override_is_separate_from_general(self):
+        """国际版那一档必须独立生效——两区域风控档位不同，共用一个值就没意义了。"""
+        with patch.object(self.config, "max_in_flight", 3), \
+             patch.object(self.config, "max_in_flight_global", 2):
+            self.config.load_overrides({"max_in_flight": "8"})
+            self.assertEqual(self.config.max_in_flight_effective, 8)
+            self.assertEqual(self.config.max_in_flight_global_effective, 2)
+            self.config.load_overrides({"max_in_flight_global": "1"})
+            self.assertEqual(self.config.max_in_flight_global_effective, 1)
+            self.assertEqual(self.config.max_in_flight_effective, 3)
+
 
 class TestSettingsWhitelist(unittest.TestCase):
     """设置白名单：没登记进 DEFAULT_SETTINGS 的 key 会被 save_settings 静默丢弃。
@@ -566,6 +601,212 @@ class TestSettingsWhitelist(unittest.TestCase):
         self.assertEqual(s["backend"], "")
         self.assertEqual(s["proxy"], "")
         self.assertEqual(s["workbuddy_exe"], "")
+
+    # ---- P1~P3 新增设置项的落库（同样要登记白名单，否则界面改不动）----
+
+    def test_in_flight_keys_persist(self):
+        db = self._db()
+        db.save_settings(max_in_flight="5", max_in_flight_global="1")
+        s = db.get_settings()
+        self.assertEqual(s["max_in_flight"], "5")
+        self.assertEqual(s["max_in_flight_global"], "1")
+
+    def test_in_flight_defaults_are_empty_not_zero(self):
+        """默认必须是**空串**而不是 "0"。
+
+        空串 = "用户没设过" → 回落环境变量（3 / 2）；"0" = 显式要求不限制。
+        默认给 "0" 会让所有部署在升级后静默失去并发保护。
+        """
+        db = self._db()
+        s = db.get_settings()
+        self.assertEqual(s["max_in_flight"], "")
+        self.assertEqual(s["max_in_flight_global"], "")
+
+    def test_prompt_mode_keys_persist(self):
+        db = self._db()
+        db.save_settings(prompt_mode="append", prompt_text="你是助手")
+        s = db.get_settings()
+        self.assertEqual(s["prompt_mode"], "append")
+        self.assertEqual(s["prompt_text"], "你是助手")
+
+    def test_prompt_mode_default_is_passthrough(self):
+        """默认必须是"不改动"——这个功能对老用户应当是零影响。"""
+        db = self._db()
+        s = db.get_settings()
+        self.assertEqual(s["prompt_mode"], "passthrough")
+        self.assertEqual(s["prompt_text"], "")
+
+    def test_makeup_defaults_are_safe(self):
+        """补签默认必须是"总开关关 + 演练开"。
+
+        判据链里有一环未验证（活跃地图分数 ≠ 签到状态），而补签花的是**用户自己的卡**。
+        两个默认值任一被改成"激进"，都可能在用户没确认判据前就把卡花掉。
+        """
+        db = self._db()
+        s = db.get_settings()
+        self.assertEqual(s["makeup_enabled"], "0")
+        self.assertEqual(s["makeup_dry_run"], "1")
+
+    def test_travel_defaults_are_safe(self):
+        """猫猫旅行默认必须是"总开关关 + 演练开"。
+
+        旅行本身不消耗任何资产（纯收益），但它每天会**替用户向上游写两次状态**
+        （派出 / 领取）。默认演练是为了先让人确认状态机判断正确，而不是出于风险——
+        但两个默认值任一被改成"激进"，都会让用户在没看过判断结果前就被代跑。
+        """
+        db = self._db()
+        s = db.get_settings()
+        self.assertEqual(s["travel_enabled"], "0")
+        self.assertEqual(s["travel_dry_run"], "1")
+
+
+class TestTravelWiring(unittest.TestCase):
+    """猫猫旅行的**接线**守卫（配置项登记 + 路由 + 定时注册）。
+
+    这一节存在的理由：本项目**两次**因为"配置项没登记全"导致 WebUI 里改不动、
+    功能静默不生效——`DEFAULT_SETTINGS` 白名单外 `save_settings` **静默丢弃**，
+    消费端键名拼错又落进"空值=不改"分支，两个方向都是全绿静默失效。
+
+    `test_travel_defaults_are_safe` 只挡住白名单那一侧；**路由 GET/POST 是否接上**
+    必须另有守卫，否则键登记了但界面拿不到、也存不进去。
+    """
+
+    def test_settings_route_exposes_and_accepts_travel_keys(self):
+        import inspect
+        from workbuddy_one.routes import settings as settings_route
+        src = inspect.getsource(settings_route.register)
+        for key in ("travel_enabled", "travel_dry_run"):
+            self.assertIn(f'"{key}"', src,
+                          f"GET /admin/settings 没返回 {key}，界面拿不到当前值")
+            self.assertIn(f'"{key}" in body', src,
+                          f"POST /admin/settings 没接 {key}，保存会被静默忽略")
+
+    def test_admin_travel_routes_exist(self):
+        import inspect
+        from workbuddy_one.routes import accounts as accounts_route
+        src = inspect.getsource(accounts_route.register)
+        self.assertIn('"/admin/travel"', src, "缺少手动触发入口，演练结果无处可看")
+        self.assertIn('"travel": travel', src, "/admin/streak 没带上旅行状态，界面无法显示")
+
+    def test_scheduler_registers_travel_task(self):
+        """定时巡检必须真注册进 `_run`——否则"加了功能但永远不会自己跑"。"""
+        import inspect
+        from workbuddy_one.scheduler import Scheduler
+        src = inspect.getsource(Scheduler._run)
+        self.assertIn("do_travel", src)
+        self.assertIn("_travel_enabled", src)
+        # 去重槽位必须精确到小时：只用日期的话当天第二轮会被整体跳过，
+        # 而行程要 1~4 小时才到站 —— 早上派出、晚上领取全靠这两个窗口。
+        self.assertIn("_last_travel_slot", src)
+
+
+class TestActiveMapWiring(unittest.TestCase):
+    """活跃地图提醒的**接线**守卫（配置项登记 + 路由 + 只读接口）。
+
+    与 `TestTravelWiring` 同构，理由也一样：`DEFAULT_SETTINGS` 是白名单，
+    未登记的 key 被 `save_settings` **静默丢弃**，消费端键名拼错又落进"空值=不改"
+    分支——两个方向都会全绿静默失效。这个项目已经因此踩过**两次**。
+    """
+
+    def test_settings_route_exposes_and_accepts_active_map_keys(self):
+        import inspect
+        from workbuddy_one.routes import settings as settings_route
+        src = inspect.getsource(settings_route.register)
+        for key in ("active_map_enabled", "active_map_hour"):
+            self.assertIn(f'"{key}"', src,
+                          f"GET /admin/settings 没返回 {key}，界面拿不到当前值")
+            self.assertIn(f'"{key}" in body', src,
+                          f"POST /admin/settings 没接 {key}，保存会被静默忽略")
+
+    def test_default_settings_register_active_map_keys(self):
+        """白名单里必须有这两个 key，否则界面保存时被静默丢弃。"""
+        from workbuddy_one.db import Database
+        defaults = Database.DEFAULT_SETTINGS
+        self.assertIn("active_map_enabled", defaults)
+        self.assertIn("active_map_hour", defaults)
+        # 默认开（全项目唯一）——见 TestActiveMapPilot.test_default_is_on_unlike_makeup_and_travel
+        self.assertEqual(defaults["active_map_enabled"], "1")
+        self.assertEqual(defaults["active_map_hour"], "23")
+
+    def test_check_route_exists(self):
+        import inspect
+        from workbuddy_one.routes import accounts as accounts_route
+        src = inspect.getsource(accounts_route.register)
+        self.assertIn('"/admin/active-map/check"', src, "缺少手动检查入口，判据无处可看")
+        self.assertIn("do_active_map_check", src, "路由没有调调度器的检查方法")
+
+    def test_streak_route_reports_todays_heat(self):
+        """`/admin/streak` 必须带上**今天**的地图分数。
+
+        它是用户唯一能看到"今天到底亮没亮"的地方（定时任务只推 webhook，界面看不到），
+        而 heatmap 那个请求**本来就已经拉过了**，顺手带出来零成本。
+        """
+        import inspect
+        from workbuddy_one.routes import accounts as accounts_route
+        src = inspect.getsource(accounts_route.register)
+        self.assertIn('"heat_today"', src, "/admin/streak 没带今天的地图分数，界面只能显示空白")
+
+    def test_overview_surfaces_active_map_alert(self):
+        """概览页横幅必须读活跃地图快照。
+
+        这是**没配 webhook 时唯一能看到提醒的地方**：`do_active_map_check` 的 webhook
+        只在 `alert_webhook_url` 非空时才推，而容器日志用户不会去看。
+        少了这一步，整条功能在默认配置下（`alert_webhook_url=""`）就是**完全静默**的 ——
+        测试全绿、日志里也有 WARNING，但用户永远不知道。
+        """
+        import inspect
+        from workbuddy_one.routes import overview as overview_route
+        src = inspect.getsource(overview_route.register)
+        self.assertIn("active_map_snapshot", src,
+                      "概览没读活跃地图快照 → 默认配置下提醒完全静默")
+        self.assertIn("alerts.append", src, "读了快照却没往 alerts 里加，界面照样看不到")
+
+    def test_overview_never_hits_upstream(self):
+        """概览是**高频轮询端点**，绝不能在这里打上游。
+
+        活跃地图判据需要 heatmap + streak 两个上游请求 —— 放进概览就是每秒几十个请求
+        （前端每隔几秒拉一次）。所以查询只在调度器里发生（每天一次，或用户手动一次），
+        概览只读内存里的快照。这条守的是**架构不变量**，不只是这一次改动。
+        """
+        import inspect
+        from workbuddy_one.routes import overview as overview_route
+        src = inspect.getsource(overview_route.register)
+        for forbidden in ("fetch_heatmap", "fetch_streak", "fetch_credits",
+                          "collect_upstream", "stream_upstream"):
+            self.assertNotIn(forbidden, src,
+                             f"概览端点里出现了 {forbidden}：高频轮询端点禁止上游网络请求")
+
+
+class TestCostRegionWiring(unittest.TestCase):
+    """成本展示的接线守卫：**区域维度必须真的走到界面**。
+
+    两处成本是完全不同的东西，别混：
+      - 模型页的 `credits` = 上游标称的成本系数（倍率），按区域可能不同
+        → `credits_by_region` 明细（行为用例见 `TestCreditsByRegion`）；
+      - 用量页的「实测积分单价」= 我们自己按真实请求算出的 `积分 / token × 1000`，
+        台账是 (账号, 模型) 维度 → 每行必须带 `region`，否则混池时分不清国内/国际。
+    """
+
+    def test_cost_route_exists_and_reports_its_window(self):
+        import inspect
+        from workbuddy_one.routes import usage as usage_route
+        src = inspect.getsource(usage_route.register)
+        self.assertIn('"/admin/usage/costs"', src, "缺少实测积分单价的只读接口")
+        self.assertIn("cost_table", src, "接口没有读台账")
+        self.assertIn("ttl_seconds", src, "没告诉前端观测窗口有多长，界面无法解释「为什么这行会消失」")
+
+    def test_cost_route_registered_before_int_converter(self):
+        """字面路由必须排在 `{record_id:int}` 之前。
+
+        这个文件里已经因为注册顺序踩过一次（`/admin/usage/filters` 被 `{record_id}`
+        吞成 422）。`{record_id:int}` 的 int 转换器让字面路径侥幸不冲突，但顺序是
+        文件里唯一显式的防线，别让后来者把新路由随手加到最后。
+        """
+        import inspect
+        from workbuddy_one.routes import usage as usage_route
+        src = inspect.getsource(usage_route.register)
+        self.assertLess(src.index('"/admin/usage/costs"'), src.index("{record_id:int}"),
+                        "字面路由被排到了 {record_id:int} 之后")
 
 
 if __name__ == "__main__":

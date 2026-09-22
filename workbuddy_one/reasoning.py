@@ -14,27 +14,68 @@ logger = logging.getLogger("workbuddy_one.reasoning")
 # Anthropic 系用 off），都归到 0 档，避免 "none" 因不在表里被原样透传给上游。
 _EFFORT_RANK = {"none": 0, "off": 0, "minimal": 1, "low": 2, "medium": 3, "high": 4, "xhigh": 5, "max": 6}
 
-# 已知模型的 reasoning 支持档位（尽力而为；未知模型透传）。
-# 运行时以模型目录的动态表为准，这里只是目录冷启动时的兜底。
+# 已知模型的 reasoning 支持档位。
+#
+# ⚠️ 这**不是**"只在模型目录冷启动时才用"的兜底 —— 它是**当前生效的主策略**。
+# `enhance_body` 只在目录**给出了 supportedEfforts** 时才把动态表传下去
+# （`models.reasoning_efforts()` 对没有 supportedEfforts 的模型返回 None），
+# 其余情况一路回落到本表（`normalize_reasoning_effort` 里的
+# `efforts = efforts or KNOWN_EFFORTS`）。2026-09-21 实测 29 个模型里只有 9 个带
+# supportedEfforts，**剩下 20 个都看这张表**。所以表里写错 = 线上就错。
+#
+# 维护规则：
+#   1. **只写实测确认过、且当前目录里还活着的模型**。目录对某模型返回 None 时
+#      宁可透传（上游自己判），也不要凭印象编一组档位。
+#   2. **目录标了 onlyReasoning 的模型不能带 "off"** —— 这类模型关不掉思考。
+#      带上 off 会让客户端的 off 被原样透传，而 `inject_thinking` 又同时注入
+#      `thinking:{type:enabled}`，等于给上游两个互相矛盾的信号。
+#      见 `models.reasoning_efforts()` 的同名约定。
+#   3. 上游**不校验** reasoning_effort 的取值（2026-09-21 实测：给只声明
+#      [high,xhigh] 的 glm-5.2 发 low、给只声明 effort=high 的 auto 发 low，
+#      均返回 200）。所以这张表的作用是"把客户端请求收敛到模型声明的档位"，
+#      **不是**"避免 400"；别拿"反正上游不报错"当理由删掉它，也别拿它当硬约束。
+#   4. 条目是**保守超集**，只在目录拿不到 supportedEfforts 时才生效。
+#      所以它不必与目录逐字对齐（例：glm-5.2 目录是 [high,xhigh]，这里是
+#      [low,medium,high]——目录一到位就以目录为准）。**不要**为了"对齐"去改它，
+#      除非确认目录里那组值在**两个区域**都成立。
 KNOWN_EFFORTS: dict[str, list[str]] = {
     "glm-5.2": ["low", "medium", "high"],
     "glm-5.1": ["low", "medium", "high"],
     "glm-5v-turbo": ["low", "medium", "high"],
     "kimi-k2.7": ["low", "medium", "high"],
     "kimi-k2.6": ["low", "medium", "high"],
-    "kimi-k2.5": ["low", "medium", "high"],
-    "deepseek-v4-pro": ["off", "low", "medium", "high"],
-    "deepseek-v4-flash": ["off", "low", "medium", "high"],
+    # deepseek-v4-pro：目录标 onlyReasoning=true，所以**不给 off**。
+    # 原来这里写了 off，与 models.reasoning_efforts() 的约定自相矛盾——
+    # 那条约定要求 onlyReasoning 模型的 off 被抬到最低档，而不是原样透传。
+    "deepseek-v4-pro": ["low", "medium", "high"],
     # deepseek-v4.1-flash：目录标注支持 reasoning（档位至 high，300k/1M 上下文），
     # 参考 cli2api #146 的目录元数据
     "deepseek-v4.1-flash": ["low", "medium", "high"],
-    "minimax-m3-pay": ["low", "medium", "high"],
-    "hy3-preview-agent": ["low", "medium", "high"],
 }
+# 已随上游目录下架、故从表中移除的条目（留着只会误导：
+# 这些名字已不在目录里，请求会先被 11102 挡掉，根本走不到档位裁剪）：
+#   kimi-k2.5 / deepseek-v4-flash / minimax-m3-pay（现为 minimax-m3）/
+#   hy3-preview-agent（现为 hy3、hy3-x）
+
+
+def _lowest_level(levels: list[str]) -> str:
+    """取档位列表里最低的一档（未知档位排到最后，避免选到表外的值）。"""
+    return min(levels, key=lambda s: _EFFORT_RANK.get(s.strip().lower(), 1 << 30))
 
 
 def normalize_reasoning_effort(body: dict, efforts: dict[str, list[str]] | None = None) -> dict:
-    """按模型支持的档位降级 reasoning_effort（snake/camel 双字段兼容）。"""
+    """按模型支持的档位收敛 reasoning_effort（snake/camel 双字段兼容）。
+
+    三种分支（详见下方注释里那条"off 是开关不是档位"的说明）：
+      1. 客户端要 `off`/`none` → 模型支持就给 `off`，否则抬到最低思考档；
+      2. 客户端要某个思考档 → 只在**思考档**里选"不超过请求档的最高档"，
+         都高于请求档时取最低思考档；
+      3. 模型只有 `off`（不支持思考）→ 只能 `off`。
+
+    `efforts` 为空时回落到 `KNOWN_EFFORTS`；两者都没有的模型原样透传。
+    上游**不校验**这个参数（实测发越界值也 200），所以本函数是"收敛到模型声明的档位"，
+    不是"避免 400"。
+    """
     efforts = efforts or KNOWN_EFFORTS
     if not efforts:
         return body
@@ -56,20 +97,36 @@ def normalize_reasoning_effort(body: dict, efforts: dict[str, list[str]] | None 
     if req not in _EFFORT_RANK:
         return body
     req_idx = _EFFORT_RANK[req]
-    # 在 ≤请求档位的支持档里选最高档
-    best, best_idx = "", -1
-    for s in supported:
-        idx = _EFFORT_RANK.get(s.strip().lower(), -1)
-        if idx != -1 and idx <= req_idx and idx > best_idx:
-            best, best_idx = s, idx
-    if best:
-        if best.lower() != req:
-            logger.info("reasoning_effort 降级 model=%s %s -> %s", model, req, best)
-            body[key] = best
+
+    def _idx(s: str) -> int:
+        return _EFFORT_RANK.get(s.strip().lower(), -1)
+
+    # ⚠️ `off` / `none` 是"不思考"这个**开关**，不是档位里最低的那一档，必须分开挑。
+    #
+    # 原来只有一趟"在 ≤请求档 里选最高档"的循环，而 off 的 rank 是 0 → 它**永远**
+    # 满足 `idx <= req_idx`，于是只要客户端要的档位低于模型的最低思考档，选出来的
+    # 就是 off：思考被**整个关掉**。实测（2026-09-21，合并修复让 glm-5.2 拿回真实
+    # 档位后暴露出来）：glm-5.2 支持 [high,xhigh,off]，客户端要 low/medium 都变成
+    # off；gpt-5.6-sol 支持 [low..max,off]，客户端要 minimal 也变成 off。
+    # 客户端明确要了"思考"，我们却把思考关掉，比不做降级更糟。
+    thinking = [s for s in supported if _idx(s) > 0]
+    off_like = [s for s in supported if _idx(s) == 0]
+
+    if req_idx == 0:
+        # 客户端明确要求不思考：模型支持 off 就给 off，否则抬到最低思考档
+        chosen = off_like[0] if off_like else (_lowest_level(thinking) if thinking else "")
+    elif thinking:
+        # 只在**思考档**里选"不超过请求档的最高档"；都高于请求档时取最低思考档
+        candidates = [s for s in thinking if _idx(s) <= req_idx]
+        chosen = max(candidates, key=_idx) if candidates else _lowest_level(thinking)
+    else:
+        # 模型只有 off（根本不支持思考）
+        chosen = off_like[0] if off_like else ""
+    if not chosen:
         return body
-    # 支持档全部高于请求档：取最低档
-    lowest = min(supported, key=lambda s: _EFFORT_RANK.get(s.strip().lower(), 1 << 30))
-    body[key] = lowest
+    if chosen.strip().lower() != req:
+        logger.info("reasoning_effort 降级 model=%s %s -> %s", model, req, chosen)
+    body[key] = chosen
     return body
 
 
@@ -103,12 +160,14 @@ def normalize_tool_choice(body: dict) -> dict:
     return body
 
 
-def sanitize_body(body: dict, efforts: dict[str, list[str]] | None = None) -> dict:
+def sanitize_body(body: dict, efforts: dict[str, list[str]] | None = None,
+                  prompt_mode: str = "", prompt_text: str = "") -> dict:
     """对发送给上游的 body 做统一规整。
 
     - tool_choice 归一化（对象 → string）
     - reasoning_effort 按模型档位降级
     - developer 角色归一为 system（上游 role 白名单校验，防 11128）
+    - 系统提示词三模式（见 apply_prompt_mode；默认 passthrough = 零改动）
     - 无任何 system 消息时补一条空 system（国际版硬校验 11128，见 ensure_leading_system）
     - DeepSeek 思维链开关注入 + 多轮 reasoning_content 回填
 
@@ -117,6 +176,7 @@ def sanitize_body(body: dict, efforts: dict[str, list[str]] | None = None) -> di
     body = normalize_tool_choice(body)
     body = normalize_reasoning_effort(body, efforts=efforts)
     body = normalize_roles(body)
+    body = apply_prompt_mode(body, prompt_mode, prompt_text)
     body = ensure_leading_system(body)
     body = inject_thinking(body)
     body = backfill_reasoning_content(body)
@@ -203,6 +263,49 @@ def ensure_leading_system(body: dict) -> dict:
     if isinstance(first, dict) and first.get("role") == "system":
         return body
     body["messages"] = [{"role": "system", "content": ""}] + msgs
+    return body
+
+
+def apply_prompt_mode(body: dict, mode: str = "", text: str = "") -> dict:
+    """系统提示词三模式（P2-1，吸收 Sliverkiss 的 `prompt.mode`）。
+
+    为什么需要 append 而不只是"替换"：
+      Claude Code / Codex CLI 这类客户端会在 system 里注入一大段**项目规范**
+      （工具用法、代码风格、安全约束）。整体替换会把它们抹掉，模型立刻变笨；
+      而"什么都不做"又没法给所有客户端加统一的网关提示词（比如"用中文回答"）。
+      append 就是为这个场景存在的：插在**开头连续的 system 块之后**，
+      客户端规范与网关提示词共存。
+
+    三种模式：
+      - `passthrough`（默认）/ 空 `text` → 原样透传，零改动（保持既有行为）
+      - `custom` → 删掉所有 system/developer 消息，换成网关提示词（整体接管）
+      - `append` → 在开头连续 system/developer 块**之后**插入一条，其余不动
+
+    调用位置必须在 `normalize_roles`（developer→system）之后：否则 append 的插入点
+    会停在 developer 消息之前，把客户端自己的 system 块割开。
+    """
+    if not text or mode in ("", "passthrough"):
+        return body
+    msgs = body.get("messages")
+    if not isinstance(msgs, list) or not msgs:
+        # 没有消息列表：custom 语义下网关提示词就是全部；append 无位置可插，不臆造
+        if mode == "custom":
+            body["messages"] = [{"role": "system", "content": text}]
+        return body
+    if mode == "custom":
+        rest = [m for m in msgs
+                if not (isinstance(m, dict) and m.get("role") in ("system", "developer"))]
+        body["messages"] = [{"role": "system", "content": text}] + rest
+        return body
+    if mode == "append":
+        i = 0
+        while (i < len(msgs) and isinstance(msgs[i], dict)
+               and msgs[i].get("role") in ("system", "developer")):
+            i += 1
+        new_msgs = list(msgs)
+        new_msgs.insert(i, {"role": "system", "content": text})
+        body["messages"] = new_msgs
+        return body
     return body
 
 

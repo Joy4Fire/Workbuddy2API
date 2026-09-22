@@ -1,6 +1,6 @@
 // 使用记录域 API：聚合统计、趋势、分页列表、详情、筛选
 import { http } from './http'
-import type { RecordsResponse, UsagePoint, UsageRecord, UsageSummary } from '@/types'
+import type { CostResponse, RecordsResponse, UsagePoint, UsageRecord, UsageSummary } from '@/types'
 
 export const usageApi = {
   usageSummary: () => http.get<unknown, UsageSummary>('/admin/usage/summary'),
@@ -23,12 +23,15 @@ export const usageApi = {
     if (filters.search) p.set('search', filters.search)
     return http.get<unknown, RecordsResponse>(`/admin/usage/recent?${p.toString()}`)
   },
+  // 实测积分单价台账（(账号, 模型) 维度，只含最近一个窗口内的观测）
+  usageCosts: () => http.get<unknown, CostResponse>('/admin/usage/costs'),
   // 单条记录详情（含完整输入/输出/COT）：列表走 light 投影，点开详情才按需取大文本
   usageDetail: (id: number) => http.get<unknown, { record: UsageRecord }>(`/admin/usage/${id}`),
   usageFilters: () =>
     http.get<unknown, {
       protocols: string[]
-      models: string[]
+      models: string[]          // 最近 7 天用过的模型
+      models_history: string[]  // 只在更早记录里出现过的模型（多为已下架）
       apps: string[]          // 现存应用（与应用页一致）
       apps_history: string[]  // 已删除应用的历史记录名
       has_unnamed?: boolean   // 是否存在未记录应用的旧记录

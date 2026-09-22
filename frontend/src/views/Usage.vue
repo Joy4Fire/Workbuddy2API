@@ -1,8 +1,9 @@
 <script setup lang="ts">
 import { ref, computed, onMounted, onUnmounted } from 'vue'
+import dayjs from 'dayjs'
 import { api } from '@/api/client'
-import type { UsageSummary, UsagePoint } from '@/types'
-import { ThunderboltOutlined, FileTextOutlined, DatabaseOutlined, ApartmentOutlined } from '@ant-design/icons-vue'
+import type { UsageSummary, UsagePoint, CostRow } from '@/types'
+import { ThunderboltOutlined, FileTextOutlined, DatabaseOutlined, ApartmentOutlined, ReloadOutlined } from '@ant-design/icons-vue'
 import * as echarts from 'echarts/core'
 import { LineChart } from 'echarts/charts'
 import { GridComponent, TooltipComponent, LegendComponent } from 'echarts/components'
@@ -111,9 +112,72 @@ function renderChart() {
 
 function onResize() { chart?.resize() }
 
+// ---- 实测积分单价（(账号, 模型) 维度的真实消耗台账）----
+//
+// 与模型页那个「成本」是两个不同的东西：模型页的 `credits` 是**上游标称的成本系数
+// （倍率）**，这里是**我们自己按真实请求算出来的** `积分 / token × 1000`。
+// 所以"这个模型到底烧多少额度"只能看这张表。
+//
+// 台账是 (账号, 模型) 维度 → 账号天然归属区域，所以它同时也是国内版/国际版各自的实测值。
+// 只含最近一个窗口内的观测：过期价格比没有价格更误导（上游调价后旧值会一直骗人）。
+type CostRowView = CostRow & { rowKey: string }
+const costs = ref<CostRowView[]>([])
+const costLoading = ref(false)
+const costTtl = ref(0)
+const costRegion = ref<'' | 'cn' | 'global'>('')
+const costSearch = ref('')
+
+const costRows = computed(() => {
+  let list = costs.value
+  if (costRegion.value) list = list.filter((r) => r.region === costRegion.value)
+  const q = costSearch.value.trim().toLowerCase()
+  if (q) list = list.filter((r) => r.model.toLowerCase().includes(q) || r.uid.toLowerCase().includes(q))
+  return list
+})
+
+// 两个区域各有几行——区域筛选按钮上直接标数量，省得用户点进去发现是空的
+const costRegionCount = computed(() => ({
+  cn: costs.value.filter((r) => r.region === 'cn').length,
+  global: costs.value.filter((r) => r.region === 'global').length,
+}))
+
+async function loadCosts() {
+  costLoading.value = true
+  try {
+    const res = await api.usageCosts()
+    // 表格 row-key 要唯一：台账本身就是 (账号, 模型) 维度，直接拿它当 key
+    costs.value = (res.costs || []).map((r) => ({ ...r, rowKey: `${r.uid}|${r.model}` }))
+    costTtl.value = res.ttl_seconds || 0
+  } catch { /* 拦截器已提示 */ } finally {
+    costLoading.value = false
+  }
+}
+
+function costTtlText(): string {
+  if (!costTtl.value) return ''
+  const h = costTtl.value / 3600
+  return h >= 1 ? `${Math.round(h)} 小时` : `${Math.round(costTtl.value / 60)} 分钟`
+}
+
+/** 单价文案：tier 0 是"观测到消耗为 0"（免费额度包），显示成 0 会被误读成"没数据" */
+function costText(r: CostRow): string {
+  if (r.tier === 0) return '免费'
+  return r.cost_per_1k.toFixed(4)
+}
+
+function fmtDateTime(ts: number): string {
+  if (!ts) return '-'
+  return dayjs(ts * 1000).format('MM-DD HH:mm:ss')
+}
+
+function shortUid(uid: string): string {
+  return uid && uid.length > 10 ? uid.slice(0, 8) + '…' : (uid || '-')
+}
+
 onMounted(async () => {
   await loadSummary()
   await loadTs()
+  await loadCosts()
   window.addEventListener('resize', onResize)
 })
 
@@ -206,6 +270,68 @@ onUnmounted(() => {
         </a-card>
       </a-col>
     </a-row>
+
+    <!-- 实测积分单价：(账号, 模型) 维度的**真实消耗**。
+         与模型页那个「成本」不是一回事——那里是上游标称的倍率，这里是我们自己按
+         真实请求算出来的 `积分 / token × 1000`。账号天然归属区域，所以这张表同时
+         给出了国内版 / 国际版账号各自的实测值。 -->
+    <a-card title="实测积分单价" style="margin-top: 16px">
+      <template #extra>
+        <a-tooltip title="只显示窗口内测得的观测。过期的价格比没有价格更误导——上游调价后旧值会一直骗人，所以宁可让这一行消失。">
+          <span style="font-size: 12px; color: #8a94a6">观测窗口 {{ costTtlText() || '-' }}</span>
+        </a-tooltip>
+      </template>
+      <div style="display: flex; gap: 12px; align-items: center; margin-bottom: 12px; flex-wrap: wrap">
+        <a-radio-group v-model:value="costRegion">
+          <a-radio-button value="">全部 {{ costs.length }}</a-radio-button>
+          <a-radio-button value="cn">国内版 {{ costRegionCount.cn }}</a-radio-button>
+          <a-radio-button value="global">国际版 {{ costRegionCount.global }}</a-radio-button>
+        </a-radio-group>
+        <a-input v-model:value="costSearch" placeholder="按模型 / 账号筛选" allow-clear style="width: 200px" />
+        <a-button size="small" :loading="costLoading" @click="loadCosts">
+          <template #icon><ReloadOutlined /></template>刷新
+        </a-button>
+        <span style="font-size: 12px; color: #8a94a6">
+          每 1k token 消耗的积分，按真实请求测得（EMA 平滑）；只有成功请求且上游返回了 token 数才会记一笔。
+        </span>
+      </div>
+      <a-table
+        :data-source="costRows"
+        :loading="costLoading"
+        :pagination="{ pageSize: 10, size: 'small', showSizeChanger: false }"
+        row-key="rowKey"
+        size="small"
+      >
+        <a-table-column title="账号" key="uid" :width="170">
+          <template #default="{ record }">
+            <a-tooltip :title="record.uid"><code>{{ shortUid(record.uid) }}</code></a-tooltip>
+          </template>
+        </a-table-column>
+        <a-table-column title="区域" key="region" :width="90">
+          <template #default="{ record }">
+            <a-tag :color="record.region === 'global' ? 'purple' : 'blue'">
+              {{ record.region_label || (record.region === 'global' ? '国际版' : '国内版') }}
+            </a-tag>
+          </template>
+        </a-table-column>
+        <a-table-column title="模型" key="model" :ellipsis="true">
+          <template #default="{ record }"><code>{{ record.model }}</code></template>
+        </a-table-column>
+        <a-table-column title="实测单价（积分 / 1k tok）" key="cost" :width="200">
+          <template #default="{ record }">
+            <a-tooltip :title="record.tier === 0
+              ? '观测到的积分消耗为 0（走的是免费额度包）——这是有效观测，不是「没有数据」。'
+              : '按真实请求算出的积分消耗（EMA 平滑），样本数见右列。'">
+              <span :class="{ 'cost-free': record.tier === 0 }">{{ costText(record) }}</span>
+            </a-tooltip>
+          </template>
+        </a-table-column>
+        <a-table-column title="样本" data-index="samples" key="samples" :width="70" />
+        <a-table-column title="最近观测" key="updated" :width="130">
+          <template #default="{ record }">{{ fmtDateTime(record.updated_at) }}</template>
+        </a-table-column>
+      </a-table>
+    </a-card>
   </div>
 </template>
 
@@ -241,4 +367,7 @@ onUnmounted(() => {
 .bar-val { width: 180px; font-size: 12px; color: #8a94a6; text-align: right; flex-shrink: 0; }
 .bar-pct { color: #a5b8d8; font-weight: 600; margin-left: 6px; }
 .bar-fill.dim { background: #3a4266; }
+
+/* 「免费」是有效观测（消耗为 0），别让它看起来像缺数据 */
+.cost-free { color: #14b8a6; font-weight: 600; }
 </style>

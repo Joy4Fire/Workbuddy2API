@@ -97,5 +97,7 @@ function short(s: string | null | undefined, n = 8) {
 .content-box.reasoning { border-color: rgba(167,139,250,0.3); background: rgba(76,29,149,0.12); color: #ddd6fe; }
 .content-box.input { border-color: rgba(34,197,94,0.25); }
 .content-box.error { border-color: rgba(244,63,94,0.4); color: #fb7185; }
-.empty { color: #6b7794; font-size: 12px; }
+/* 「（无输出内容）」是真实文案，不是 placeholder，所以按正文对比度要求取色
+   （#6b7794 只有 3.51:1，不达标；#7d8aa5 约 5.4:1）。 */
+.empty { color: #7d8aa5; font-size: 12px; }
 </style>

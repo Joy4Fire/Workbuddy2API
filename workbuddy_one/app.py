@@ -13,18 +13,25 @@ from .config import config
 from .context import GatewayContext
 from .credentials import CredentialManager, find_auth_files
 from .db import Database
+from .logsetup import setup_logging
 from .models import ModelRegistry
 from .pool import AccountPool
 from .routes import accounts, apps, inference, models_admin, overview, settings, usage, webui
 from .scheduler import Scheduler
+from . import __version__
 
 import logging
+import time
 logger = logging.getLogger("workbuddy_one.app")
 
 
 def create_app() -> FastAPI:
+    # 日志级别必须在任何 logger 调用之前定好：默认 WARNING 保持既有输出，
+    # LOG_LEVEL=INFO 才打开那 30 处 logger.info（见 logsetup.py 的说明）。
+    setup_logging(config.log_level)
     # 关闭自动生成的 /docs、/redoc、/openapi.json：本地网关无需暴露 API 文档（减少攻击面）
-    app = FastAPI(title="Workbuddy2API", version="0.4.1",
+    # 版本号引用唯一真源，**别在这里写死字符串**（见 `__init__.py` 的说明）。
+    app = FastAPI(title="Workbuddy2API", version=__version__,
                   docs_url=None, redoc_url=None, openapi_url=None)
     db = Database(config.db_path)
     # 载入 WebUI 里设置过的"区域与网络"覆盖项（BACKEND / PROXY / WORKBUDDY_EXE）。
@@ -61,6 +68,29 @@ def create_app() -> FastAPI:
             # 原因一并恢复（WebUI 展示"为什么不可用"）
             if _row.get("enabled") == 0:
                 pool.set_enabled(_acc.uid, False, reason=_row.get("disabled_reason") or "手动停用")
+            # 系统自动禁用位（session 失效 / 被上游封禁）：与手动停用独立，单独恢复。
+            # 不能合并进上面那一支——手动"启用"不该把它一起清掉（见 pool.set_enabled）。
+            if _row.get("auto_disabled_reason"):
+                pool.disable_auto(_acc.uid, _row.get("auto_disabled_reason"))
+    # 恢复上次查到的上游签到状态：重启后首屏就能显示真值，不必等第一轮同步。
+    # 跨零点会失效，由 scheduler 的"同步日期 == 今天"校验兜住（自动回落本地记账）。
+    for _uid, _st in db.checkin_status().items():
+        pool.set_checkin_status(_uid, bool(_st["today"]), bool(_st["active"]), _st["synced_at"])
+    # 恢复 (账号,模型) 冷却（6004 模型级限流 / 11102 负缓存）：11102 的 TTL 是
+    # 6~24 小时，重启就丢等于每次重启都要重新去上游碰一次钉子。过期记录顺手清掉。
+    try:
+        db.purge_expired_model_blocks()
+        pool.load_model_blocks(db.model_blocks())
+    except Exception:  # noqa: BLE001
+        logger.warning("恢复模型冷却记录失败（忽略，重新试探即可）", exc_info=True)
+    # 恢复 (账号,模型) 积分单价台账（P2-3）：成本观测 6 小时过期，重启后
+    # 若全丢，选号会退化成"人人都是无观测"，白白丢掉"优先用免费号"的收益。
+    try:
+        from .pool import COST_TTL
+        db.purge_stale_model_costs(time.time() - COST_TTL)
+        pool.load_costs(db.model_costs())
+    except Exception:  # noqa: BLE001
+        logger.warning("恢复成本台账失败（忽略，重新学习即可）", exc_info=True)
     models = ModelRegistry(pool, db=db)
     benchmarks = AABenchmarks(db=db)
     scheduler = Scheduler(pool, db=db, models=models, benchmarks=benchmarks,
