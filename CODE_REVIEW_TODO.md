@@ -8,7 +8,7 @@
 > **新增功能批次（2026-09-13，非 review 项）**：积分预警 webhook（Bark/企微/飞书自动识别 + 6h 去重 + 概览横幅）、账号禁用原因（schema v4 disabled_reason）、使用记录内容搜索、流式心跳（`: keepalive`，pump+队列实现防客户端超时）、每周自动全量备份（≥7 天触发，保留 4 份）、签到失败重试（2h×3 次）、模型别名映射（settings.model_aliases，/v1/models 别名条目 + 请求归一）。
 > 实现与方案的偏差已标注在对应条目内。
 >
-> **状态（2026-09-22）：本清单 #1~#33 全部完成，无遗留项。** 462 个测试全绿。
+> **状态（2026-09-22）：本清单 #1~#34 全部完成，无遗留项。** 464 个测试全绿。
 > 最后收口的是 #29（记录页模型筛选分组，原条目自己判定"可接受"，但 `apps`/`apps_history`
 > 已有现成先例，照抄成本极低）与 #31/#32（2026-09-22 新增：跨月判定恒真的真 bug，
 > 以及把"补签卡保护哪条连登"这一环查清——原注释标着"未验证"，实测结论与当时的担忧相反）。
@@ -52,13 +52,36 @@
   （端口代理已接）+ 容器内 `Connection refused`（uvicorn 还没 bind）= 应用还没启动完，不是网络故障。
   ② **任何在 lifespan 里 `await` 的外部调用，都等于把服务可用性押在外部站点上**，必须给时间上限。
 
+### 34. ✅ 已完成（2026-09-22）—— 启动时额度刷新被打**三遍**（`last_credit = 0.0` 让首轮必然触发）
+
+- **位置**：`workbuddy_one/scheduler.py` `_run()` 开头的 `last_credit = 0.0`。
+- **问题**：判据是 `now.timestamp() - last_credit >= interval * 60`，而 `now` 是 **1.7e9** 量级
+  → **第一轮循环必然满足**，于是刚启动就立刻再刷一遍额度；可 `start()` 的 `_warmup()` 刚刚刷过。
+  N 个账号 = 白白多打 **N 次额度接口 + N 次签到状态接口**，既浪费也徒增上游限流风险。
+- **证据**（先写用例看它红，再改）：
+  - 新用例 `test_first_loop_iteration_does_not_refresh_credits_again` 在**未改代码时**报
+    `AssertionError: Lists differ: [1] != []` —— 坐实那次多余的 `fetch_credits`。
+  - 真机（`LOG_LEVEL=INFO` 数启动 95 秒内的 `额度` 行，每轮 2 行 = 2 个账号）：
+    **改前 6 行（3 轮）→ 改后 4 行（2 轮）**。
+- **修法**：`last_credit = time.time()`。安全前提 = `_warmup()` 里的 `refresh_credits()`
+  **无条件**执行，且即便预热预算超时放行它仍在后台跑完（`asyncio.shield`）。
+  **该前提由一条单独的用例钉住**（`test_warmup_does_refresh_credits_so_skipping_the_loop_is_safe`）：
+  否则哪天有人删掉预热里的额度刷新，启动后就没人刷额度了，而回归用例**仍然是绿的**。
+- **剩下的两轮是刻意的，不要再"顺手去重"**：① 预热那一轮；② `do_checkin()` 末尾
+  `await self.refresh_credits()`（注释写明"**含自动解冻**"——签到成功后要把余额恢复的账号
+  从冷却里放出来，属功能需要）。其余三处调用都在 `routes/accounts.py` 的一次性动作里
+  （上传 auth / 扫码登录完成 / 显式 `refresh-credits` 端点），都不在轮询路径上。
+- **可复用的教训**：**"从 0 起算的累加器 + 与当前时间比较"是一个固定的 bug 形状** ——
+  初值 0 会让"第一轮"必然满足任何"距上次超过 N"的判据。写节流/定时代码时，
+  初值要么取当前时间，要么用显式的 `_last_x is None` 分支。
+
 ---
 
 ## 0. 环境与验证方式
 
 | 事项 | 命令 / 说明 |
 |---|---|
-| 后端测试 | 在 `Workbuddy2API/` 目录执行 `.venv\Scripts\python.exe -m unittest discover -s tests`（当前 **462** 个用例全绿，改完必须保持全绿；权威基线以 `AGENTS.md` 第 10 节为准） |
+| 后端测试 | 在 `Workbuddy2API/` 目录执行 `.venv\Scripts\python.exe -m unittest discover -s tests`（当前 **464** 个用例全绿，改完必须保持全绿；权威基线以 `AGENTS.md` 第 10 节为准） |
 | 前端构建 | `cd frontend && pnpm build`（改任何 .vue/.ts 后必须重新 build，否则 WebUI 不更新） |
 | 本地起服务 | `.venv\Scripts\python.exe -m uvicorn workbuddy_one.app:create_app --factory --host 127.0.0.1 --port 8787`（改任何 .py 后必须重启进程） |
 | Docker 重建 | `docker-compose up -d --build --force-recreate`（**独立可执行文件**；`docker compose` 带空格的子命令在本机不可用。宿主机 data/、auths/ 是挂载卷，不受影响） |

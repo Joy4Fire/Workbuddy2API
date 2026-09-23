@@ -2776,5 +2776,92 @@ class TestStartupWarmupBudget(unittest.IsolatedAsyncioTestCase):
                              "预算过大 → 上游异常时 WebUI 仍会长时间打不开")
 
 
+class TestStartupRefreshNotDuplicated(unittest.IsolatedAsyncioTestCase):
+    """启动时额度刷新**不能打两遍**：`_run()` 的首轮循环与 `start()` 的预热重复了。
+
+    `_run()` 里 `last_credit = 0.0`，而判据是 `now - last_credit >= interval * 60`
+    —— 第一轮循环**必然**满足（`now` 是 1.7e9 量级），于是立刻再刷一遍额度；
+    可 `start()` 的 `_warmup()` 刚刚已经刷过。N 个账号 = 白白多打 N 次额度接口
+    + N 次签到状态接口，既浪费也徒增上游限流风险。
+    """
+
+    def _sched(self):
+        """只有 1 个账号、除"额度刷新"外所有定时任务都换成空实现的调度器。"""
+        from unittest import mock
+        from workbuddy_one.pool import AccountPool
+        from workbuddy_one.scheduler import Scheduler
+
+        pool = AccountPool({})
+        pool.add_account("u1", None)
+        sched = Scheduler(pool, db=_FakeSettingsDB())
+        # 本用例只关心"启动时额度接口被打了几次"，其余每日任务全部换空实现，
+        # 否则它们会真的去打上游（也会让用例随时钟变化而行为不同）。
+        for name in ("do_checkin", "do_keepalive", "do_makeup", "do_travel",
+                     "do_active_map_check", "cleanup_usage", "refresh_models",
+                     "refresh_benchmarks", "_check_credit_alert"):
+            setattr(sched, name, mock.AsyncMock(return_value=[]))
+        sched._check_auth_dir_changes = mock.Mock()
+        sched._backup_due = mock.Mock(return_value=False)   # 免得撞上凌晨 3 点跑真备份
+        return sched
+
+    async def _one_iteration(self, sched):
+        """让 `_run()` 只跑一轮就退出（替换 sleep 在循环末尾把 `_running` 关掉）。"""
+        from unittest import mock
+        from workbuddy_one import scheduler as S
+
+        async def stop_after_first(_seconds):
+            sched._running = False
+
+        sched._running = True
+        with mock.patch.object(S.asyncio, "sleep", stop_after_first):
+            await sched._run()
+
+    async def test_first_loop_iteration_does_not_refresh_credits_again(self):
+        """回归：首轮循环不该再刷一次额度 —— 预热已经刷过了。"""
+        from unittest import mock
+        from workbuddy_one import billing
+
+        sched = self._sched()
+        calls = []
+
+        async def counting_fetch(_mgr):
+            calls.append(1)
+            return {"remain": 1, "total": 2, "expire_at": None, "packages": None}
+
+        with mock.patch.object(billing, "fetch_credits", counting_fetch), \
+                mock.patch.object(billing, "fetch_checkin_status",
+                                  mock.AsyncMock(return_value={"today_checked_in": False,
+                                                               "active": True})):
+            await self._one_iteration(sched)
+
+        self.assertEqual(
+            calls, [],
+            "首轮循环又刷了一遍额度：与 start() 的预热重复（账号越多浪费越大）")
+
+    async def test_warmup_does_refresh_credits_so_skipping_the_loop_is_safe(self):
+        """前提守卫：`_warmup()` **必然**刷额度。
+
+        "首轮循环不刷"这个修法之所以安全，全靠这个前提。哪天有人把预热里的额度刷新
+        删掉或挪进条件分支，启动后就再没人刷额度了 —— 而上面那条用例仍然是绿的。
+        """
+        from unittest import mock
+        from workbuddy_one import scheduler as S
+
+        sched = self._sched()
+        calls = []
+
+        async def counting():
+            calls.append(1)
+
+        sched.refresh_credits = counting
+        sched._run = mock.AsyncMock()
+        with mock.patch.object(S, "_WARMUP_BUDGET_SECONDS", 5.0):
+            await sched.start()
+        await sched.stop()
+
+        self.assertEqual(len(calls), 1,
+                         "预热没有刷新额度 → 首轮循环跳过它就会没人刷")
+
+
 if __name__ == "__main__":
     unittest.main()

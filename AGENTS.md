@@ -96,7 +96,7 @@ Workbuddy2API/
 │   ├── src/styles/           # base.css（布局）+ dark-theme.css（antd 深色覆盖，见 §7 前端要点）
 │   ├── src/types/index.ts    # 后端 /admin/* 响应的 TS 类型（改接口记得同步）
 │   └── dist/                 # 构建产物（跟踪进 git；由后端 app.py 直接伺服；改动前端后必须重新 build，见 §4）
-├── tests/                    # unittest 测试（462 个用例；test_policy.py 是错误处置/账号池治理）
+├── tests/                    # unittest 测试（464 个用例；test_policy.py 是错误处置/账号池治理）
 ├── docs/                     # 设计与评估文档（吸收评估、db 迁移、区域 UX、FIX_PLAN）
 ├── scripts/migrate_db.py     # 独立迁移脚本（--check 只查版本）
 ├── data/                     # 运行时数据：workbuddy.db、attachments/、.secret_key   ←机密，见 §8
@@ -117,7 +117,7 @@ Workbuddy2API/
 # 一切命令在 Workbuddy2API/ 目录下执行；Python 一律用 venv 解释器
 cd N:\代码\workbuddy2Api\Workbuddy2API
 
-# 跑测试（unittest，不是 pytest；462 个必须全绿）
+# 跑测试（unittest，不是 pytest；464 个必须全绿）
 .\.venv\Scripts\python.exe -m unittest discover -s tests
 
 # 本地起服务（开发调试用）
@@ -312,7 +312,7 @@ docker-compose up -d --build --force-recreate
 
 ## 10. 改完之后的自检清单
 
-1. `.\.venv\Scripts\python.exe -m unittest discover -s tests` → **462 个全绿**（现有基线，不允许变红）。
+1. `.\.venv\Scripts\python.exe -m unittest discover -s tests` → **464 个全绿**（现有基线，不允许变红）。
    顺带自查一遍有没有 `ResourceWarning: unclosed database`——测试里开了 `Database` 不关连接会在 GC 时报，
    在 Windows 上还可能让随后的 `unlink` 偶发失败。用 `addCleanup(db._conn.close)` 兜住
    （`tests/test_policy.py` 的 `_open_db()` 就是干这个的）。
@@ -327,7 +327,7 @@ docker-compose up -d --build --force-recreate
 
 ## 11. 当前状态速览（2026-09 快照）
 
-- 版本 **0.5.0**（唯一真源 = `workbuddy_one/__init__.py`，别在别处写死）；462 个测试全绿；本地 8787 端口跑 uvicorn（Docker 部署见第 9 节的 `docker-compose` 用法）。
+- 版本 **0.5.0**（唯一真源 = `workbuddy_one/__init__.py`，别在别处写死）；464 个测试全绿；本地 8787 端口跑 uvicorn（Docker 部署见第 9 节的 `docker-compose` 用法）。
 - `CODE_REVIEW_TODO.md` 的 **P0×4 / P1×4 / P2×11 / P3×13（#20~#32）已全部完成，无遗留项**（每条带实现备注）。
   后续新问题登记在它后面，按优先级做。其中 #24 的**原诊断被实测推翻**（`KNOWN_EFFORTS` 不是冷启动兜底
   而是当前生效的主策略），#29 由"可接受"改判为值得做（照抄 `apps`/`apps_history` 的现成分组先例）。
@@ -1027,5 +1027,35 @@ if not fetched:
      两者同时出现就是"应用还没启动完"，不是网络故障。
   2. **任何在 lifespan 里 `await` 的外部调用，都等于把"服务可用性"押在外部站点上。**
      预热是优化，必须给它时间上限（或干脆后台跑）。
+
+- **第十九轮：启动时额度刷新被打了三遍（改成两遍）—— `last_credit = 0.0` 的"首轮必然触发" —— 2026-09-22**（测试 462 → **464**）。
+
+  **起因**：第十八轮查启动路径时顺带读到 `_run()` 开头的 `last_credit = 0.0`，
+  而判据是 `now.timestamp() - last_credit >= interval * 60` ——
+  **`now` 是 1.7e9 量级，所以第一轮循环必然满足**，于是刚启动就立刻再刷一遍额度。
+  可 `start()` 的 `_warmup()` 刚刚刷过。N 个账号 = 白白多打 N 次额度接口 + N 次签到状态接口。
+
+  **证据**（先写用例、看它红，再改）：
+  - 新用例 `test_first_loop_iteration_does_not_refresh_credits_again` 在**未改代码时**
+    报 `AssertionError: Lists differ: [1] != []` —— 坐实了那次多余的 `fetch_credits`。
+  - 真机（`LOG_LEVEL=INFO` 数启动 95 秒内的 `额度` 日志行，每轮 2 行 = 2 个账号）：
+    **改前 6 行（3 轮）→ 改后 4 行（2 轮）**。
+
+  **改法**：`last_credit = time.time()`。之所以安全，全靠一个前提 ——
+  `_warmup()` 里的 `refresh_credits()` 是**无条件**执行的，且即便预热预算超时放行，
+  它也仍在后台跑完（`asyncio.shield`）。**这个前提被一条单独的用例钉住**
+  （`test_warmup_does_refresh_credits_so_skipping_the_loop_is_safe`）：
+  否则哪天有人把预热里的额度刷新删掉，启动后就再没人刷额度了，而上面那条回归用例**仍然是绿的**。
+
+  **剩下的两轮是刻意的，不要再"顺手去重"**：① 预热那一轮；② `do_checkin()` 末尾
+  `await self.refresh_credits()` —— 注释写的是"签到后刷新额度（**含自动解冻**）"，
+  即签到成功后要把余额已恢复的账号从冷却里放出来，属功能需要，不是重复。
+  （其余三处 `refresh_credits()` 调用点都在 `routes/accounts.py` 的一次性动作里：
+  上传 auth、扫码登录完成、以及显式的 `/admin/accounts/refresh-credits`，
+  都不在轮询路径上。）
+
+  **可复用的教训**：**"从 0 起算的累加器 + 与当前时间比较"是一个固定的 bug 形状** ——
+  初值 0 会让"第一轮"必然满足任何"距上次超过 N"的判据。写这类节流/定时代码时，
+  初值要么取当前时间，要么用一个显式的 `_last_x is None` 分支。
 
 

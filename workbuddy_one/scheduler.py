@@ -1207,7 +1207,18 @@ class Scheduler:
             logger.warning("auths 热加载检查异常: %s", e)
 
     async def _run(self):
-        last_credit = 0.0
+        # `last_credit` 从**当前时间**起算，不能写 `0.0`。
+        #
+        # 写 0.0 的话，下面的判据 `now - last_credit >= interval * 60` 在第一轮循环
+        # **必然**成立（`now` 是 1.7e9 量级），于是启动时立刻又刷一遍额度 ——
+        # 而 `start()` 的 `_warmup()` 刚刚刷过。N 个账号就是白白多打 N 次额度接口
+        # 加 N 次签到状态接口，既浪费也徒增上游限流风险。
+        #
+        # 为什么可以安全地从当前时间起算：`_warmup()` 里的 `refresh_credits()` 是
+        # **无条件**执行的；即便预热预算超时放行，它也仍在后台跑完（`asyncio.shield`
+        # 保证），所以"启动时必然刷过一次"这个前提成立。
+        # `TestStartupRefreshNotDuplicated` 同时钉住这条和那个前提。
+        last_credit = time.time()
         while self._running:
             now = datetime.now()
             today = now.strftime("%Y-%m-%d")
