@@ -43,13 +43,16 @@ class TestConfigDbPath(unittest.TestCase):
 
     def test_absolute_db_path_preserved(self):
         from workbuddy_one import config as cfgmod
-        p = cfgmod._resolve_db_path("C:/tmp/custom.db")
-        self.assertEqual(Path(p), Path("C:/tmp/custom.db"))
+        # 使用当前平台的绝对路径，Windows 与 Linux 容器验证同一规则。
+        absolute = Path(tempfile.gettempdir()).resolve() / "custom.db"
+        p = cfgmod._resolve_db_path(str(absolute))
+        self.assertEqual(Path(p), absolute)
 
     def test_project_auths_dir_anchored_to_package_root(self):
         # auths/ 应锚定到包根目录（与上传/扫码落盘位置一致），而非进程 cwd
         from workbuddy_one.credentials import PROJECT_AUTHS_DIR
-        self.assertEqual(PROJECT_AUTHS_DIR.parent.name, "Workbuddy2API")
+        from workbuddy_one.config import PACKAGE_ROOT
+        self.assertEqual(PROJECT_AUTHS_DIR.parent, PACKAGE_ROOT)
         self.assertTrue(PROJECT_AUTHS_DIR.name == "auths")
         # auth_dirs() 扫描列表应包含它
         from workbuddy_one.credentials import auth_dirs

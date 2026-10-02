@@ -10,6 +10,7 @@
 from __future__ import annotations
 
 import logging
+import math
 import threading
 import time
 
@@ -173,6 +174,14 @@ class ModelRegistry:
         """
         with self._lock:
             return set(self._model_regions.get(str(model or ""), set()))
+
+    def prices_for(self, model: str) -> dict[str, float]:
+        """只读区域报价快照；未知/非法值不冒充免费，也不在请求路径拉目录。"""
+        with self._lock:
+            entry = next((m for m in (self._models or []) if m.get('id') == model), {})
+            prices = dict(entry.get('credits_by_region') or {})
+        return {rid: float(value) for rid, value in prices.items()
+                if type(value) in (int, float) and math.isfinite(value) and value >= 0}
 
     def max_output_tokens(self, model: str) -> int | None:
         """返回某模型的最大输出 token 上限（目录未知时 None，调用方不裁剪）。"""

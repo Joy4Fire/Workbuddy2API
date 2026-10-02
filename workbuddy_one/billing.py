@@ -12,6 +12,7 @@
 """
 from __future__ import annotations
 
+import asyncio
 import os
 import time
 from datetime import datetime, timedelta, timezone
@@ -217,7 +218,7 @@ def _num(v) -> float:
 
 
 async def _post_json(mgr, url: str, body: dict) -> dict:
-    headers = _billing_headers(mgr)
+    headers = await asyncio.to_thread(_billing_headers, mgr)
     async with net.async_client(timeout=20) as client:
         resp = await client.post(url, headers=headers, json=body)
         try:
@@ -335,18 +336,26 @@ async def fetch_checkin_status(mgr) -> dict:
 
 
 async def daily_checkin(mgr) -> dict:
-    """执行每日签到。返回 {ok, message}。"""
+    """处理中时等上游落账再短重试；普通限流仍交给调度器的长周期退避。"""
     url = f"{_billing_base(mgr)}/v2/billing/meter/daily-checkin"
-    headers = _billing_headers(mgr)
+    headers = await asyncio.to_thread(_billing_headers, mgr)
     async with net.async_client(timeout=20) as client:
-        resp = await client.post(url, headers=headers, json={})
-        data = resp.json()
+        for attempt in range(4):
+            resp = await client.post(url, headers=headers, json={})
+            data = resp.json()
+            msg = str(data.get("msg") or data.get("message") or "")
+            processing = any(marker in msg.lower() for marker in (
+                "请求处理中", "request is being processed", "request processing"))
+            if resp.status_code != 429 or not processing or attempt == 3:
+                break
+            # 最多等 2+5+10 秒；不抓取消异常，服务关闭或用户中止时立即退出。
+            await asyncio.sleep((2, 5, 10)[attempt])
     code = data.get("code")
     msg = str(data.get("msg") or data.get("message") or "")
-    if code == 0:
+    if code == 0 and resp.is_success:
         return {"ok": True, "message": "签到成功"}
     # 已签到判定（含上游 HTTP 400 但消息提示已签到的场景）
-    if any(k in msg for k in ("已签到", "already", "checkin")):
+    if any(k in msg.lower() for k in ("已签到", "already checked in", "already checked-in", "already signed in")):
         return {"ok": False, "message": msg, "already": True}
     return {"ok": False, "message": msg}
 

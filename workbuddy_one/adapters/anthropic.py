@@ -118,42 +118,21 @@ def _convert_anthropic_message(msg: dict) -> list[dict]:
     # 检查是否包含 tool_result（role=user 时）
     if role == "user":
         result: list[dict] = []
-        text_parts: list[str] = []
-        image_parts: list[dict] = []
+        user_blocks: list[dict] = []
         for block in blocks:
             if not isinstance(block, dict):
                 continue
             bt = block.get("type", "")
-            if bt == "text":
-                text_parts.append(block.get("text", ""))
-            elif bt == "image":
-                # Anthropic image 块 → OpenAI image_url（data URI）。保留多模态图片输入。
-                src = block.get("source") or {}
-                mt = src.get("media_type", "image/png") if isinstance(src, dict) else "image/png"
-                data = src.get("data", "") if isinstance(src, dict) else ""
-                if data:
-                    image_parts.append({
-                        "type": "image_url",
-                        "image_url": {"url": f"data:{mt};base64,{data}"},
-                    })
-            elif bt == "tool_result":
+            if bt == "tool_result":
                 # tool_result → 独立的 tool 消息
                 tc_id = block.get("tool_use_id", "")
                 output = block.get("content", "")
-                if isinstance(output, list):
-                    output = "".join(
-                        b.get("text", "") for b in output if isinstance(b, dict) and b.get("type") == "text"
-                    )
-                result.append({"role": "tool", "tool_call_id": tc_id, "content": output})
-        # 文本与图片合并进同一条 user 消息（OpenAI 多模态 content 数组）
-        if text_parts or image_parts:
-            if image_parts:
-                segs: list[dict] = list(image_parts)
-                if text_parts:
-                    segs.insert(0, {"type": "text", "text": "".join(text_parts)})
-                result.insert(0, {"role": "user", "content": segs})
+                result.append({"role": "tool", "tool_call_id": tc_id, "content": _image_content(output)})
             else:
-                result.insert(0, {"role": "user", "content": "".join(text_parts)})
+                user_blocks.append(block)
+        # 工具结果必须紧接助手工具调用，普通 user 内容放在所有工具结果之后。
+        if user_blocks:
+            result.append({"role": "user", "content": _image_content(user_blocks)})
         return result
 
     # assistant 角色
@@ -186,6 +165,32 @@ def _convert_anthropic_message(msg: dict) -> list[dict]:
     # 其他角色：尝试提取文本
     text = _extract_blocks_text(blocks)
     return [{"role": role, "content": text}] if text else []
+
+
+def _image_content(content) -> str | list:
+    """工具截图与普通图片共用转换，保留文本/图片的原始顺序。"""
+    if isinstance(content, str):
+        return content
+    if not isinstance(content, list):
+        return "" if content is None else str(content)
+    parts: list[dict] = []
+    has_image = False
+    for block in content:
+        if not isinstance(block, dict):
+            continue
+        if block.get("type") == "text":
+            parts.append({"type": "text", "text": block.get("text", "")})
+        elif block.get("type") == "image":
+            src = block.get("source") or {}
+            if not isinstance(src, dict):
+                continue
+            url = src.get("url") if src.get("type") == "url" else ""
+            if not url and src.get("data"):
+                url = f"data:{src.get('media_type', 'image/png')};base64,{src['data']}"
+            if url:
+                parts.append({"type": "image_url", "image_url": {"url": url}})
+                has_image = True
+    return parts if has_image else "".join(part["text"] for part in parts)
 
 
 def _extract_blocks_text(blocks: list) -> str:
@@ -276,6 +281,9 @@ class AnthropicStreamConverter:
 
     def finish(self) -> str:
         """流结束，发出收尾事件。"""
+        if self._finish_reason is None:
+            from ..upstream import UpstreamError
+            raise UpstreamError(502, b'{"error":{"message":"upstream stream ended without a finish reason","type":"upstream_error"}}')
         events: list[str] = []
 
         # 关闭 text 块

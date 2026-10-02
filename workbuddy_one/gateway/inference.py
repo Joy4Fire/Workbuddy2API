@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 import hashlib
+import asyncio
 import time
 import logging
 
@@ -85,7 +86,12 @@ def limiter(ctx, uid: str) -> AsyncAccountRateLimiter:
     return ctx.limiters[uid]
 
 
-def pick_account(ctx, regions: set[str] | None = None, model: str = ""):
+def model_prices(ctx, model: str) -> dict:
+    models = getattr(ctx, 'models', None)
+    return models.prices_for(model) if models is not None and hasattr(models, 'prices_for') else {}
+
+
+def pick_account(ctx, regions: set[str] | None = None, model: str = "", exclude=None):
     """从池中选择一个账号，返回 Account；无账号则 503。
 
     regions: 可选，限定区域（见 pool.pick 与 models.regions_for）。混池下按请求的
@@ -93,7 +99,8 @@ def pick_account(ctx, regions: set[str] | None = None, model: str = ""):
     model: 可选，请求的模型名。用于跳过「该 (账号,模型) 已被冷却」的组合
     （6004 模型级限流 / 11102 负缓存），否则换号时会原地重试同一个坏组合。
     """
-    acc = ctx.pool.pick(regions=regions, model=model)
+    kwargs = {"exclude": exclude} if exclude else {}
+    acc = ctx.pool.pick(regions=regions, model=model, prices=model_prices(ctx, model), **kwargs)
     if acc is None:
         if model:
             raise HTTPException(status_code=503, detail={"error": {
@@ -132,14 +139,18 @@ def acquire_account(ctx, body: dict, raw: dict | None = None):
     会话键从 raw（客户端原始 payload）提取——build_upstream_body 的白名单
     会剥掉 prompt_cache_key/metadata 等非透传字段，从过滤后的 body 提取会
     丢失这两个键来源（只剩 user 字段与消息指纹兜底）。raw 缺省回落 body。
-    粘性（多账号场景）：同一会话键此前绑定的账号若仍健康（启用且不在冷却），
-    直接复用——保住上游 prompt cache 命中；账号进入冷却/被停用则解粘，
+    粘性（多账号场景）：同一会话键此前绑定的账号若仍在当前低价优选池，
+    直接复用——保住上游 prompt cache 命中；出现更低价可用账号或原账号不可用则解粘，
     回池按权重重选并重绑新账号。单账号场景键照常提取，行为不变。
     """
     key = session.extract_session_key(raw if raw is not None else body)
     regions = model_regions(ctx, body)
     model = str(body.get("model") or "").strip()
     sticky_uid = ctx.session_router.lookup(key, ctx.pool) if key else None
+    if sticky_uid and not ctx.pool.can_reuse(sticky_uid, regions=regions, model=model,
+                                             prices=model_prices(ctx, model)):
+        ctx.session_router.unbind(key)
+        sticky_uid = None
     if sticky_uid:
         for a in ctx.pool.accounts:
             if a.uid == sticky_uid:
@@ -182,15 +193,28 @@ async def open_upstream_once(ctx, account, body: dict):
 
     在途名额只在这段窗口里占用（P1-1）：上游风控看的是**同时打到它的连接数**，
     首字节到达后流已建立，再计数只会引入"流没读完就泄漏名额"的故障模式。
-    占用失败不拒绝请求——选号侧已经优先避开占满的账号，这里再拒就变成 503 了。
+    选号后的竞争由原子占位约束；满载最多等待 10 秒，不发送未获得名额的请求。
     """
     if config.ratelimit:
         await limiter(ctx, account.uid).wait_if_needed()
-    headers = get_headers(ctx, account)
-    ctx.pool.acquire_slot(account.uid)
+    # 可能刷新 token（同步网络）或等待凭据锁，必须让出事件循环给管理端。
+    headers = await asyncio.to_thread(get_headers, ctx, account)
+    deadline = time.monotonic() + 10.0
+    while not ctx.pool.acquire_slot(account.uid):
+        if time.monotonic() >= deadline:
+            raise HTTPException(status_code=503, detail={"error": {
+                "message": "账号连接名额繁忙，请稍后重试", "type": "capacity_error"}})
+        await asyncio.sleep(0.05)
+    it = None
     try:
         it = stream_upstream(headers, body).__aiter__()
         first = await it.__anext__()   # 首次 anext 会真正发起上游请求；失败抛 UpstreamError
+    except StopAsyncIteration:
+        raise UpstreamError(502, b'{"error":{"message":"upstream returned an empty stream","type":"upstream_error"}}')
+    except BaseException:
+        if it is not None:
+            await it.aclose()
+        raise
     finally:
         ctx.pool.release_slot(account.uid)
     return it, first
@@ -255,11 +279,13 @@ async def open_upstream(ctx, account, body: dict):
         it, first = await open_upstream_once(ctx, account, body)
         return it, first, account
     except UpstreamError as e:
+        e.account = account
+        e.policy_applied = True
         kind = classify(e.status_code, e.raw, e.headers)
         act = action_for(kind, e.raw, e.headers)
         logger.info("上游错误 %s（HTTP %s）→ %s，换号=%s 冷却=%.0fs",
                     kind.value, e.status_code, act.reason or "-", act.rotate, act.cooldown)
-        apply_error_policy(ctx, account, kind, act, model)
+        await asyncio.to_thread(apply_error_policy, ctx, account, kind, act, model)
         if act.fail_fast:
             # 请求自身的问题：不轮转，把上游原文交给调用方透传
             raise
@@ -269,16 +295,24 @@ async def open_upstream(ctx, account, body: dict):
             # 没有其它健康账号：放弃重试，按原错误交给调用方记录/返回
             #（后续请求会被 pick_account 的冷却兜底挡下并得到 503）
             raise
-        alt = pick_account(ctx, regions=model_regions(ctx, body), model=model)
+        try:
+            alt = pick_account(ctx, regions=model_regions(ctx, body), model=model, exclude={account.uid})
+        except HTTPException:
+            # 没有可重试组合时保留最初的上游错误，不把它覆盖为选号失败。
+            raise e
         try:
             it, first = await open_upstream_once(ctx, alt, body)
         except UpstreamError as e2:
+            e2.account = alt
+            e2.policy_applied = True
             kind2 = classify(e2.status_code, e2.raw, e2.headers)
             act2 = action_for(kind2, e2.raw, e2.headers)
-            apply_error_policy(ctx, alt, kind2, act2, model)
+            await asyncio.to_thread(apply_error_policy, ctx, alt, kind2, act2, model)
             raise
-        except httpx.HTTPError:
+        except httpx.HTTPError as e2:
             ctx.pool.on_failure(alt.uid, COOLDOWN_SOFT)
+            e2.account = alt
+            e2.policy_applied = True
             raise
         return it, first, alt
 
@@ -364,7 +398,7 @@ def log_usage(ctx, protocol, model_name, account, t0, status, err="", usage=None
     # 断开不是账号的失败，不应计入失败数/冷却（否则 Claude Code 常见的主动中断
     # 会把健康账号打成"冷却中"）
     if update_pool:
-        if status == "ok":
+        if status in ("ok", "incomplete"):
             ctx.pool.on_success(account.uid)
             # 成功即证明该 (账号,模型) 可用：清掉可能存在的负缓存/模型冷却。
             # 不清的话，一条错误的 11102 判断会让这个组合被避让最长 24 小时。
@@ -375,7 +409,7 @@ def log_usage(ctx, protocol, model_name, account, t0, status, err="", usage=None
                     logger.warning("清除模型负缓存落库失败", exc_info=True)
             # 成本台账（P2-3）：用本次的 credits 与 token 数更新 (账号,模型) 单价。
             # credits=0 是**有效观测**（免费额度包），会被记成 tier0。
-            if model_name:
+            if model_name and usage.get('credit') is not None:
                 tokens = (usage.get("prompt_tokens") or usage.get("input_tokens") or 0) + \
                          (usage.get("completion_tokens") or usage.get("output_tokens") or 0)
                 snap = ctx.pool.record_cost(account.uid, model_name,

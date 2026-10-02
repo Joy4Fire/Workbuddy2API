@@ -1,11 +1,12 @@
 """SQLite 访问层：初始化表结构，提供读写。
 
 Phase 1 先建 accounts（认证账号）与 usage_logs（使用记录）两张表。
-使用标准库 sqlite3 + 线程锁（单用户低并发足够，后续可换 aiosqlite）。
+使用标准库 sqlite3：写连接由线程锁串行化，查询使用独立 WAL 只读快照。
 """
 from __future__ import annotations
 
 import datetime as _dt
+from contextlib import contextmanager
 import json
 import logging
 import sqlite3
@@ -17,7 +18,7 @@ logger = logging.getLogger("workbuddy_one.db")
 
 # 当前数据库 schema 版本（用 SQLite PRAGMA user_version 持久化）。
 # 每次对表结构做不兼容/增量修改时 +1，并在 _migrate 里追加对应迁移步骤。
-SCHEMA_VERSION = 7
+SCHEMA_VERSION = 8
 
 # 使用记录页「模型」筛选下拉的分组阈值：这么久之内用过的算「最近」，其余算「更早」。
 # 只影响下拉的展示分组，不影响筛选结果（两组并集 = 全部用过的模型）。
@@ -288,6 +289,13 @@ class Database:
             """
         )
 
+    def _migration_v8(self):
+        """v8：小体积的用量元数据覆盖索引，避免统计反复扫描含图片的大记录页。
+
+        索引仍统一由 _ensure_indexes 在补齐列后创建，兼容极老库与重入迁移。
+        不截断或重写任何输入、输出、思考链。
+        """
+
     # 迁移注册表：每个条目 = (目标版本号, 迁移函数)。按版本号升序。
     # 后续新增结构 → 在此追加新条目，并在 SCHEMA_VERSION 处 +1。
     _MIGRATIONS = [
@@ -298,6 +306,7 @@ class Database:
         (5, _migration_v5),
         (6, _migration_v6),
         (7, _migration_v7),
+        (8, _migration_v8),
     ]
 
     def _user_version(self) -> int:
@@ -329,13 +338,34 @@ class Database:
         ("idx_usage_ts", "usage_logs", "ts"),
         ("idx_usage_model", "usage_logs", "model"),
         ("idx_usage_account", "usage_logs", "account_uid"),
+        ("idx_usage_protocol_tokens", "usage_logs", "protocol,total_tokens"),
+        ("idx_usage_model_stats", "usage_logs", "model,total_tokens,credits,ts"),
+        ("idx_usage_app_stats", "usage_logs", "app_name,total_tokens,credits"),
+        ("idx_usage_ts_tokens", "usage_logs", "ts,total_tokens"),
+        ("idx_usage_status", "usage_logs", "status"),
     ]
 
     def _ensure_indexes(self):
         """补建查询索引（列存在才建，幂等）。"""
         for name, table, col in self._INDEXES:
-            if col in self._table_columns(table):
+            if set(col.split(',')) <= set(self._table_columns(table)):
                 self._conn.execute(f"CREATE INDEX IF NOT EXISTS {name} ON {table}({col})")
+
+    @contextmanager
+    def _reader(self):
+        """每次查询用独立只读快照，不排在大文本写入/维护的进程内互斥锁后面。
+
+        WAL 允许读连接查看最近已提交数据；同一组统计置于同一事务以保持一致。
+        连接在查询结束即关闭，避免线程池扩张带来的连接泄漏。
+        """
+        conn = sqlite3.connect(str(self.path), timeout=5)
+        conn.row_factory = sqlite3.Row
+        try:
+            conn.execute('PRAGMA query_only=ON')
+            conn.execute('BEGIN')
+            yield conn
+        finally:
+            conn.close()
 
     def _migrate(self):
         """按版本号把数据库升级到 SCHEMA_VERSION（版本化增量迁移 + 兜底补列）。
@@ -460,8 +490,8 @@ class Database:
         return uid
 
     def list_accounts(self) -> list[dict]:
-        with self._lock:
-            rows = self._conn.execute("SELECT * FROM accounts ORDER BY priority DESC, id ASC").fetchall()
+        with self._reader() as conn:
+            rows = conn.execute("SELECT * FROM accounts ORDER BY priority DESC, id ASC").fetchall()
         return [dict(r) for r in rows]
 
     def get_account(self, uid: str) -> dict | None:
@@ -503,8 +533,8 @@ class Database:
 
     def model_blocks(self) -> list[dict]:
         """全部 (账号,模型) 冷却记录（含已过期的，由调用方按 until 过滤）。"""
-        with self._lock:
-            rows = self._conn.execute(
+        with self._reader() as conn:
+            rows = conn.execute(
                 "SELECT uid, model, until, streak, reason FROM model_blocks").fetchall()
         return [dict(r) for r in rows]
 
@@ -540,8 +570,8 @@ class Database:
     # 只做存取；EMA 平滑、过期判定、分层选号策略在 pool.py。
 
     def model_costs(self) -> list[dict]:
-        with self._lock:
-            rows = self._conn.execute(
+        with self._reader() as conn:
+            rows = conn.execute(
                 "SELECT uid, model, cost_per_1k, samples, updated_at FROM model_costs").fetchall()
         return [dict(r) for r in rows]
 
@@ -591,8 +621,8 @@ class Database:
 
     def checkin_dates(self) -> dict[str, str]:
         """返回 {uid: last_checkin_date}（本地记账口径）。"""
-        with self._lock:
-            rows = self._conn.execute("SELECT uid, last_checkin_date FROM accounts").fetchall()
+        with self._reader() as conn:
+            rows = conn.execute("SELECT uid, last_checkin_date FROM accounts").fetchall()
         return {r["uid"]: r["last_checkin_date"] for r in rows if r["last_checkin_date"]}
 
     def set_checkin_status(self, uid: str, today: bool, active: bool, synced_at: float):
@@ -611,8 +641,8 @@ class Database:
         today/active 用 bool | None 表达：None 表示"该列还没写过"，
         与"明确是 False"区分开——前端要靠这个决定是显示真值还是回落本地记账。
         """
-        with self._lock:
-            rows = self._conn.execute(
+        with self._reader() as conn:
+            rows = conn.execute(
                 "SELECT uid, checkin_today, checkin_active, checkin_synced_at FROM accounts"
             ).fetchall()
         out: dict[str, dict] = {}
@@ -680,8 +710,8 @@ class Database:
     }
 
     def get_settings(self) -> dict:
-        with self._lock:
-            rows = self._conn.execute("SELECT key, value FROM settings").fetchall()
+        with self._reader() as conn:
+            rows = conn.execute("SELECT key, value FROM settings").fetchall()
         data = {r["key"]: r["value"] for r in rows}
         merged = dict(self.DEFAULT_SETTINGS)
         merged.update(data)
@@ -691,14 +721,15 @@ class Database:
         """保存设置。仅接受白名单内的 key。"""
         allowed = set(self.DEFAULT_SETTINGS.keys())
         with self._lock:
-            for k, v in kwargs.items():
-                if k in allowed:
-                    self._conn.execute(
-                        "INSERT INTO settings (key, value) VALUES (?,?) "
-                        "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
-                        (k, str(v)),
-                    )
-            self._conn.commit()
+            # 任一写入失败都回滚同批设置，不能留下待下次提交的半批事务。
+            with self._conn:
+                for k, v in kwargs.items():
+                    if k in allowed:
+                        self._conn.execute(
+                            "INSERT INTO settings (key, value) VALUES (?,?) "
+                            "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                            (k, str(v)),
+                        )
 
     # ---- usage_logs ----
     def log_usage(self, *, model, protocol, account_uid, input_tokens=0, output_tokens=0,
@@ -785,34 +816,31 @@ class Database:
 
     def usage_content_stats(self) -> dict:
         """统计 content 体积：总大小、超限条数，供展示瘦身前后对比。"""
-        with self._lock:
-            rows = self._conn.execute(
-                "SELECT input_content, output_content, reasoning_content FROM usage_logs"
-            ).fetchall()
-        total = 0
-        over = 0
-        for r in rows:
-            s = len(r["input_content"] or "") + len(r["output_content"] or "") + len(r["reasoning_content"] or "")
-            total += s
-            if len(r["input_content"] or "") > 4000:
-                over += 1
-        return {"total_chars": total, "over_limit_rows": over, "rows": len(rows)}
+        with self._reader() as conn:
+            # 只返回聚合数值，不把包含图片原文的整个历史库搬入 Python 内存。
+            row = conn.execute("""SELECT COUNT(*) AS rows,
+                COALESCE(SUM(LENGTH(COALESCE(input_content,'')) +
+                             LENGTH(COALESCE(output_content,'')) +
+                             LENGTH(COALESCE(reasoning_content,''))),0) AS total_chars,
+                COALESCE(SUM(CASE WHEN LENGTH(input_content)>4000 THEN 1 ELSE 0 END),0) AS over_limit_rows
+                FROM usage_logs""").fetchone()
+        return dict(row)
 
     def usage_summary(self) -> dict:
         """聚合统计：总数、按协议、按模型、按日、今日 token。"""
-        with self._lock:
-            total = self._conn.execute("SELECT COUNT(*) c, COALESCE(SUM(total_tokens),0) t FROM usage_logs").fetchone()
+        with self._reader() as conn:
+            total = conn.execute("SELECT COUNT(*) c, COALESCE(SUM(total_tokens),0) t FROM usage_logs").fetchone()
             today_start = _local_midnight_ts()
-            today = self._conn.execute(
+            today = conn.execute(
                 "SELECT COUNT(*) c, COALESCE(SUM(total_tokens),0) t FROM usage_logs WHERE ts >= ?", (today_start,)
             ).fetchone()
-            by_protocol = self._conn.execute(
+            by_protocol = conn.execute(
                 "SELECT protocol, COUNT(*) c, COALESCE(SUM(total_tokens),0) t FROM usage_logs GROUP BY protocol"
             ).fetchall()
-            by_model = self._conn.execute(
+            by_model = conn.execute(
                 "SELECT model, COUNT(*) c, COALESCE(SUM(total_tokens),0) t FROM usage_logs GROUP BY model ORDER BY c DESC LIMIT 20"
             ).fetchall()
-            by_app = self._conn.execute(
+            by_app = conn.execute(
                 "SELECT COALESCE(NULLIF(app_name,''),'(未命名)') app, COUNT(*) c, COALESCE(SUM(total_tokens),0) t FROM usage_logs GROUP BY app_name ORDER BY c DESC"
             ).fetchall()
         return {
@@ -873,8 +901,8 @@ class Database:
         where, params = self._usage_where(protocol, model, app_name, status, search)
         params.extend([limit, offset])
         cols = self._USAGE_COLS if light else "*"
-        with self._lock:
-            rows = self._conn.execute(
+        with self._reader() as conn:
+            rows = conn.execute(
                 f"SELECT {cols} FROM usage_logs {where} ORDER BY id DESC LIMIT ? OFFSET ?", params
             ).fetchall()
         return [dict(r) for r in rows]
@@ -884,8 +912,8 @@ class Database:
                     search: str | None = None) -> int:
         """符合筛选条件的使用记录总数（服务端分页用，返回总页数依据）。"""
         where, params = self._usage_where(protocol, model, app_name, status, search)
-        with self._lock:
-            row = self._conn.execute(f"SELECT COUNT(*) c FROM usage_logs {where}", params).fetchone()
+        with self._reader() as conn:
+            row = conn.execute(f"SELECT COUNT(*) c FROM usage_logs {where}", params).fetchone()
         return row["c"]
 
     def get_usage(self, record_id: int) -> dict | None:
@@ -893,8 +921,8 @@ class Database:
 
         记录页列表走 light 投影，点开详情时才按需取这一条的完整 content。
         """
-        with self._lock:
-            row = self._conn.execute("SELECT * FROM usage_logs WHERE id = ?", (record_id,)).fetchone()
+        with self._reader() as conn:
+            row = conn.execute("SELECT * FROM usage_logs WHERE id = ?", (record_id,)).fetchone()
         return dict(row) if row else None
 
     def usage_filters(self) -> dict:
@@ -909,28 +937,27 @@ class Database:
         has_unnamed 标记是否存在无应用归属的旧记录（供"（未记录应用）"筛选项）。
         """
         cutoff = time.time() - MODEL_RECENT_DAYS * 86400
-        with self._lock:
+        with self._reader() as conn:
             def col(field: str) -> list[str]:
-                rows = self._conn.execute(
+                rows = conn.execute(
                     f"SELECT DISTINCT {field} FROM usage_logs "
                     f"WHERE {field} IS NOT NULL AND {field} != '' ORDER BY {field}"
                 ).fetchall()
                 return [str(r[0]) for r in rows]
-            st = self._conn.execute(
+            st = conn.execute(
                 "SELECT DISTINCT status FROM usage_logs WHERE status IS NOT NULL AND status != ''"
             ).fetchall()
-            current_apps = [r["name"] for r in self._conn.execute("SELECT name FROM apps ORDER BY id")]
+            current_apps = [r["name"] for r in conn.execute("SELECT name FROM apps ORDER BY id")]
             used_apps = col("app_name")
             # 每个模型的最后一次使用时间。ts 为空的极旧记录按"更早"处理（0 < cutoff）。
-            model_rows = self._conn.execute(
+            model_rows = conn.execute(
                 "SELECT model, MAX(ts) AS last_ts FROM usage_logs "
                 "WHERE model IS NOT NULL AND model != '' GROUP BY model ORDER BY model"
             ).fetchall()
-            has_unnamed = self._conn.execute(
+            has_unnamed = conn.execute(
                 "SELECT 1 FROM usage_logs WHERE app_name IS NULL OR app_name = '' LIMIT 1"
             ).fetchone() is not None
-            # 全部查询都在锁内完成再返回：原先返回语句里的 col() 调用发生在 with 块之外，
-            # 等于绕过了这把锁（单连接跨线程，理论上能撞上并发写）。
+            # 全部查询在同一读事务内完成，模型、应用和状态来自同一快照。
             current_set = set(current_apps)
             return {
                 "protocols": col("protocol"),
@@ -948,8 +975,8 @@ class Database:
         返回: {models: [{model, credits, tokens}], total_credits, total_tokens}
         只统计 credits > 0 的记录（有真实积分消耗、比例可信的模型）。
         """
-        with self._lock:
-            rows = self._conn.execute(
+        with self._reader() as conn:
+            rows = conn.execute(
                 "SELECT model, COALESCE(SUM(credits),0) c, COALESCE(SUM(total_tokens),0) t "
                 "FROM usage_logs WHERE credits > 0 GROUP BY model ORDER BY c DESC"
             ).fetchall()
@@ -989,8 +1016,8 @@ class Database:
             sql += " AND model = ?"
             args.append(model)
         sql += " GROUP BY bucket_ts"
-        with self._lock:
-            rows = self._conn.execute(sql, args).fetchall()
+        with self._reader() as conn:
+            rows = conn.execute(sql, args).fetchall()
         by_bucket = {r["bucket_ts"]: (r["c"], r["t"]) for r in rows}
 
         # 补齐空桶
@@ -1005,11 +1032,11 @@ class Database:
     # ---- apps（应用 API Key） ----
     def list_apps(self) -> list[dict]:
         """返回应用列表，附带各自累计用量（请求数/tokens/积分）。不返回加密密文。"""
-        with self._lock:
-            rows = self._conn.execute(
+        with self._reader() as conn:
+            rows = conn.execute(
                 "SELECT id, name, key_prefix, note, enabled, created_at FROM apps ORDER BY id ASC"
             ).fetchall()
-            stats = self._conn.execute(
+            stats = conn.execute(
                 "SELECT app_name, COUNT(*) c, COALESCE(SUM(total_tokens),0) t, COALESCE(SUM(credits),0) k "
                 "FROM usage_logs GROUP BY app_name"
             ).fetchall()
@@ -1041,16 +1068,16 @@ class Database:
             return row["id"] if row else None
 
     def find_app_by_key(self, key_hash: str) -> dict | None:
-        with self._lock:
-            r = self._conn.execute(
+        with self._reader() as conn:
+            r = conn.execute(
                 "SELECT * FROM apps WHERE key_hash = ? AND enabled = 1", (key_hash,)
             ).fetchone()
             return dict(r) if r else None
 
     def get_app_key_enc(self, app_id: int) -> str:
         """返回应用的加密 Key token（可能为空，历史应用未加密存储）。"""
-        with self._lock:
-            r = self._conn.execute("SELECT key_enc FROM apps WHERE id = ?", (app_id,)).fetchone()
+        with self._reader() as conn:
+            r = conn.execute("SELECT key_enc FROM apps WHERE id = ?", (app_id,)).fetchone()
             return r["key_enc"] if r and r["key_enc"] else ""
 
     def toggle_app(self, app_id: int) -> bool:

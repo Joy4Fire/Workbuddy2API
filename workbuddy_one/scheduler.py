@@ -349,7 +349,7 @@ class Scheduler:
                                       packages=res.get("packages"))
                 # 持久化最近额度到 DB，进程重启后可恢复（避免额度盲区）
                 if self.db:
-                    self.db.set_account_state(acc.uid, credits_remaining=res["remain"],
+                    await asyncio.to_thread(self.db.set_account_state, acc.uid, credits_remaining=res["remain"],
                                               credits_total=res["total"],
                                               credits_expire_at=res.get("expire_at"))
                 # 余额 > 0 的冷却账号自动解冻（参考 Sliverkiss ReenableIfCredits）
@@ -381,7 +381,7 @@ class Scheduler:
                 ts = time.time()
                 self.pool.set_checkin_status(acc.uid, st["today_checked_in"], st["active"], ts)
                 if self.db:
-                    self.db.set_checkin_status(acc.uid, st["today_checked_in"], st["active"], ts)
+                    await asyncio.to_thread(self.db.set_checkin_status, acc.uid, st["today_checked_in"], st["active"], ts)
             except Exception as e:  # noqa: BLE001
                 logger.warning("签到状态查询失败 %s: %s", acc.uid, e)
 
@@ -436,12 +436,12 @@ class Scheduler:
                 # "今日已签到"，界面出现假阳性，且第二天才自愈。
                 if res.get("ok") or res.get("already"):
                     if self.db:
-                        self.db.set_checkin_date(acc.uid, today)
+                        await asyncio.to_thread(self.db.set_checkin_date, acc.uid, today)
                     # 顺手把上游状态刷新成"今天已签"，界面立刻正确，无需等下一轮同步
                     active = acc.checkin_active if acc.checkin_active is not None else True
                     self.pool.set_checkin_status(acc.uid, True, active, time.time())
                     if self.db:
-                        self.db.set_checkin_status(acc.uid, True, active, time.time())
+                        await asyncio.to_thread(self.db.set_checkin_status, acc.uid, True, active, time.time())
             except Exception as e:  # noqa: BLE001
                 logger.warning("签到失败 %s: %s", acc.uid, e)
                 results.append((acc.uid, {"ok": False, "message": str(e)}))
@@ -1035,7 +1035,7 @@ class Scheduler:
                     self.pool.disable_auto(acc.uid, reason)
                     # 同步落库：否则重启后账号"复活"，坏 session 继续打上游
                     if self.db:
-                        self.db.set_account_state(acc.uid, auto_disabled_reason=reason)
+                        await asyncio.to_thread(self.db.set_account_state, acc.uid, auto_disabled_reason=reason)
                     self._keepalive_fails[acc.uid] = 0  # 禁用后重置，等待用户重新登录
                 else:
                     logger.warning("token 保活 %s: 失败 %d/%d 次（暂不禁用）", acc.uid, fails,
@@ -1263,7 +1263,7 @@ class Scheduler:
             except Exception as e:  # noqa: BLE001
                 logger.warning("积分预警检查异常: %s", e)
             # auths 目录热加载：新增凭证文件自动进池，免手动重启（Sliverkiss 同款思路）
-            self._check_auth_dir_changes()
+            await asyncio.to_thread(self._check_auth_dir_changes)
             # 每日 token 保活
             if now.hour == self._keepalive_hour() and self._last_keepalive_date != today:
                 try:

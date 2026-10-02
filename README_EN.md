@@ -1,5 +1,9 @@
 # WorkBuddy2API
 
+Current version: **0.6.2 / schema v8**. This release unifies streaming and non-streaming failover, attributes retry failures to the actual account, validates truncated streams, enforces connection slot ownership, saves settings atomically, and bounds SSE buffering. It also includes responsive admin reads and cross-region price routing. See [release notes](docs/发布说明-0.6.2.md).
+
+Version 0.6.0 adds Responses `incomplete` terminal states, cache/reasoning token details, preserved image history and tool screenshots, bounded check-in processing retries, and a manual version check under Settings. See [the reference update audit](docs/参考项目更新评估-2026-10-02.md) for pinned upstream evidence and adoption decisions.
+
 > A single-user WorkBuddy API gateway that wraps Tencent WorkBuddy / CodeBuddy credits into a standard **OpenAI Chat + Responses + Anthropic Messages API**, with **SQLite logging** and a **Vue3 admin WebUI**.
 
 A self-built implementation that combines the strengths of several existing WorkBuddy/CodeBuddy conversion projects while avoiding their weaknesses — **single-user, feature-complete, and ready to use out of the box**.

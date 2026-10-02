@@ -1,5 +1,15 @@
 // 后端 /admin/* API 返回的 TS 类型定义
 
+export interface UpdateInfo {
+  current_version: string
+  latest_version: string | null
+  status: 'unchecked' | 'update_available' | 'local_ahead' | 'up_to_date' | 'unavailable'
+  checked_at: number | null
+  error: string
+  project_url: string
+  source_url: string
+}
+
 export interface AccountInfo {
   uid: string
   enabled: boolean

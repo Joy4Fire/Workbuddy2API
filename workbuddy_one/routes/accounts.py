@@ -92,11 +92,8 @@ def register(app: FastAPI, ctx) -> None:
         return {"ok": True, "removed": removed, "uid": uid}
 
     @app.get("/admin/accounts")
-    async def admin_accounts():
-        # 返回前补齐"没有今天数据"的账号：否则刚添加的账号、或跨零点后的首屏
-        # 会回落本地记账口径，显示成「未签到」而与上游不一致。
-        # only_stale=True → 数据新鲜时零上游请求，不会拖慢常规刷新。
-        await scheduler.sync_checkin_status(only_stale=True)
+    def admin_accounts():
+        # 列表只读快照；签到同步由后台预热/刷新执行，不能让页面轮询等待上游。
         return {"accounts": accounts_with_checkin(ctx)}
 
     @app.post("/admin/accounts/{uid}/enable")

@@ -2,13 +2,19 @@
 # 个人自用：包含后端 + 已构建的前端静态资源。
 # 运行时数据（data/、auths/）通过 docker-compose 挂载卷持久化，不入镜像。
 
+FROM ghcr.io/astral-sh/uv:0.11.16 AS uv-bin
+
 FROM python:3.11-slim
+
+COPY --from=uv-bin /uv /usr/local/bin/uv
 
 # 时区（便于签到/定时任务按本地时间触发）
 ENV TZ=Asia/Shanghai \
     PYTHONUNBUFFERED=1 \
     PYTHONDONTWRITEBYTECODE=1 \
-    PIP_NO_CACHE_DIR=1
+    UV_PYTHON_DOWNLOADS=never \
+    UV_LINK_MODE=copy \
+    PATH="/app/.venv/bin:$PATH"
 
 WORKDIR /app
 
@@ -17,29 +23,11 @@ RUN apt-get update \
     && apt-get install -y --no-install-recommends tzdata \
     && rm -rf /var/lib/apt/lists/*
 
-# 安装运行时依赖（pip 安装，版本约束与 pyproject 的 [project].dependencies 一致；
-# tests/test_policy.py 有用例钉住这两处不许漂）。
-#
-# 为什么显式指定国内镜像源：直连 pypi.org 在**国内网络下会间歇性吃 TLS 握手被中断**
-# （实测 `SSLError(SSLEOFError(8, '[SSL: UNEXPECTED_EOF_WHILE_READING]'))`），
-# 表现为 `Could not find a version that satisfies the requirement ... (from versions: none)`
-# —— 看着像"包不存在"，其实是网络。与 pyproject 里 `[[tool.uv.index]]` 的选择保持一致。
-# 需要官方源时：`docker-compose build --build-arg PIP_INDEX_URL=https://pypi.org/simple`
-ARG PIP_INDEX_URL=https://pypi.tuna.tsinghua.edu.cn/simple
-RUN pip install --no-cache-dir -i "$PIP_INDEX_URL" \
-        "fastapi>=0.110" \
-        "uvicorn[standard]>=0.29" \
-        "httpx>=0.27" \
-        "pydantic>=2.6" \
-        "qrcode>=8.2" \
-        "python-multipart>=0.0.32"
-
-# ⚠️ `COPY pyproject.toml` 必须放在 `RUN pip install` **之后**：
-# 放在前面的话，任何对 pyproject 的编辑（哪怕只是改个版本号）都会击穿依赖层缓存、
-# 强制重新联网装一遍全部依赖 —— 2026-09-22 就是这么被 pypi.org 的 TLS 抖动
-# 卡住了一次构建（改版本号 → 依赖层失效 → pip 真的去联网 → 失败）。
-# 它本来也不参与 pip 安装（上面是显式列包的），只是个清单副本。
-COPY pyproject.toml ./
+# 开发与容器共用同一份依赖锁，避免每次构建偷偷升级 FastAPI/Starlette。
+# --no-install-project 保留直接 python -m 启动方式，依赖层不依赖业务源码和版本号。
+# 镜像源已写在 pyproject/uv.lock；更换源需先用 uv 更新锁，不能构建时另造一套依赖。
+COPY pyproject.toml uv.lock ./
+RUN uv sync --frozen --no-dev --no-install-project --no-cache --python /usr/local/bin/python
 
 # 拷贝后端源码与已构建的前端产物
 COPY workbuddy_one/ workbuddy_one/

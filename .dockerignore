@@ -2,6 +2,8 @@
 # 数据库、主密钥 .secret_key 与账号登录凭证——绝不进入构建上下文（哪怕
 # Dockerfile 的 COPY 是选择性的，上下文本身也会整包传给 daemon）。
 .venv/
+.uv-cache/
+.tmp/
 .git/
 data/
 auths/

@@ -194,7 +194,7 @@ onMounted(async () => {
         <a-select-option v-if="filterOptions.has_unnamed" value="">（未记录应用）</a-select-option>
       </a-select>
       <a-select v-model:value="filters.status" placeholder="全部状态" allow-clear style="width: 120px" @change="onFilterChange">
-        <a-select-option v-for="s in filterOptions.statuses" :key="s" :value="s">{{ s === 'ok' ? '成功' : s }}</a-select-option>
+        <a-select-option v-for="s in filterOptions.statuses" :key="s" :value="s">{{ s === 'ok' ? '成功' : s === 'incomplete' ? '未完成' : s }}</a-select-option>
       </a-select>
       <a-input-search
         v-model:value="searchText"
@@ -256,7 +256,7 @@ onMounted(async () => {
         </a-table-column>
         <a-table-column title="状态" key="status" :width="70">
           <template #default="{ record }">
-            <a-tag :color="record.status === 'ok' ? 'green' : 'red'">{{ record.status === 'ok' ? '成功' : record.status }}</a-tag>
+            <a-tag :color="record.status === 'ok' ? 'green' : record.status === 'incomplete' ? 'orange' : 'red'">{{ record.status === 'ok' ? '成功' : record.status === 'incomplete' ? '未完成' : record.status }}</a-tag>
           </template>
         </a-table-column>
         <a-table-column title="操作" key="action" :width="70">

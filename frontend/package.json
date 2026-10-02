@@ -1,6 +1,6 @@
 {
   "name": "workbuddy2api-frontend",
-  "version": "0.5.0",
+  "version": "0.6.2",
   "private": true,
   "type": "module",
   "scripts": {

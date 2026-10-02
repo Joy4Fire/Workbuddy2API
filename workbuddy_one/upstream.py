@@ -96,7 +96,7 @@ async def stream_upstream(headers: dict, body: dict) -> AsyncIterator[str]:
                 yield line
 
 
-async def collect_upstream(headers: dict, body: dict) -> dict:
+async def collect_upstream(headers: dict, body: dict, *, lines=None) -> dict:
     """消费上游 SSE，聚合成单个非流式 chat.completion 对象。
 
     流完整性（吸收 Sliverkiss 空流/截断修复 + Buddy2api 完成标记校验）：
@@ -116,7 +116,7 @@ async def collect_upstream(headers: dict, body: dict) -> dict:
     usage: dict | None = None
     saw_done = False
 
-    async for line in stream_upstream(headers, body):
+    async for line in (lines if lines is not None else stream_upstream(headers, body)):
         data = line[5:].strip()
         if data == "[DONE]":
             saw_done = True

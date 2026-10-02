@@ -5,6 +5,7 @@ import { appsApi } from './apps'
 import { modelsApi } from './models'
 import { settingsApi } from './settings'
 import { usageApi } from './usage'
+import { updatesApi } from './updates'
 
 export const api = {
   ...accountsApi,
@@ -12,6 +13,7 @@ export const api = {
   ...modelsApi,
   ...appsApi,
   ...settingsApi,
+  ...updatesApi,
 }
 
 export { setAdminToken } from './http'

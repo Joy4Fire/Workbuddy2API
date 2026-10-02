@@ -21,7 +21,7 @@ def register(app: FastAPI, ctx) -> None:
         return {"apps": db.list_apps()}
 
     @app.post("/admin/apps")
-    async def admin_create_app(body: dict):
+    def admin_create_app(body: dict):
         name = str(body.get("name") or "").strip()
         if not name:
             raise HTTPException(status_code=400, detail={"error": {"message": "应用名称不能为空"}})

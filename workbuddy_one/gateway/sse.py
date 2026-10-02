@@ -102,18 +102,16 @@ async def with_keepalive(gen, interval: float = 15.0):
     不影响上游。客户端断开时 finally 取消 pump，连带触发内部 gen 的
     CancelledError 分支（断开补记逻辑照常工作）。
     """
-    queue: asyncio.Queue = asyncio.Queue()
+    # 慢客户端必须反压上游，最多缓存 32 个待发块。
+    queue: asyncio.Queue = asyncio.Queue(maxsize=32)
 
     async def pump():
         try:
             async for chunk in gen:
                 await queue.put(("chunk", chunk))
         except (asyncio.CancelledError, GeneratorExit):
-            # pump 自身被取消（客户端断开触发 finally 的 task.cancel()）：
-            # 内部 gen 的 CancelledError 分支已在之前的迭代点执行过补记，
-            # 这里按"流结束"收场——不能把外部的 CancelledError 实例重新
-            # raise 到消费方（Python 3.14 会把它当作对消费任务的取消请求）
-            pass
+            # 队列满时不能再塞 done；外层负责等待取消和关闭内部生成器。
+            raise
         except BaseException as e:  # noqa: BLE001
             await queue.put(("error", e))
         await queue.put(("done", None))
@@ -134,3 +132,10 @@ async def with_keepalive(gen, interval: float = 15.0):
                 return
     finally:
         task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+        finally:
+            # pump 可能取消在 queue.put，此时 gen 还暂停在 yield，必须显式关闭。
+            await gen.aclose()

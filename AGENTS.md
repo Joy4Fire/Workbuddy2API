@@ -3,6 +3,7 @@
 > 本文件面向 AI 编码代理，读完即可安全地修改本项目。
 > **当前待修复问题清单：[CODE_REVIEW_TODO.md](./CODE_REVIEW_TODO.md)**（P0–P3 分级，含位置、修复方案、验收标准——优先按它干活）。
 > 人类向文档：`README.md` / `README_EN.md`。
+> 当前 0.6.2 / schema v8，550 项测试。发布行为与验收见 `docs/发布说明-0.6.2.md`。推理与管理并发、低价选号规则见 `docs/并发响应与低价路由修复-2026-10-02.md`；下方旧轮次记录中的成本分层是历史行为。六项逻辑缺陷与两项性能风险在 0.6.2 修复；实测免费优先属于待决策策略。
 
 ---
 
@@ -28,7 +29,7 @@ app.py 端点
 upstream.py stream_upstream()  # 模块级共享 httpx.AsyncClient，直连腾讯 /v2/chat/completions
   ▼
 流式：逐行清洗/转换回原协议格式 → StreamingResponse
-非流式：collect_upstream() 或 converter 聚合 → JSONResponse
+非流式：同一 _open_upstream() 连接/重试后的流 → collect_upstream() 或 converter 聚合 → JSONResponse
   ▼
 _log_usage()  # 完整输入/输出/思考链入库（刻意全量保留，见 §6 不变量）
 ```
@@ -41,8 +42,8 @@ _log_usage()  # 完整输入/输出/思考链入库（刻意全量保留，见 �
 |---|---|
 | 后端 | Python 3.11+，FastAPI + uvicorn，httpx（全部 `trust_env=False` 绕代理），标准库 sqlite3 |
 | 前端 | Vue 3 + TypeScript + Vite，Ant Design Vue，ECharts（按需引入），hash 路由 |
-| 数据 | 单个 SQLite（WAL 模式，单连接 + `threading.Lock`），schema 用 `PRAGMA user_version` 版本化迁移 |
-| 部署 | Docker（python:3.11-slim）+ compose；宿主机 `data/`、`auths/` 挂载卷持久化 |
+| 数据 | 单个 SQLite（WAL，写连接由锁串行化、读连接使用独立快照），schema v8 用 `PRAGMA user_version` 版本化迁移 |
+| 部署 | Docker（python:3.11-slim）+ compose；uv 按 `uv.lock` 安装运行依赖；宿主机 `data/`、`auths/` 挂载卷持久化 |
 
 ---
 
@@ -61,6 +62,7 @@ Workbuddy2API/
 │   │   ├── models_admin.py   # 模型目录 + AA 评测
 │   │   ├── overview.py       # 概览聚合（含积分预警计算）
 │   │   ├── settings.py       # 设置读写（预警/别名等）
+│   │   ├── updates.py        # GET 只读版本快照 / POST 手动核对源仓库版本
 │   │   └── webui.py          # /health + WebUI 静态托管（catch-all，必须最后注册）
 │   ├── gateway/              # 推理链路可复用逻辑（与路由解耦，函数首参 GatewayContext）
 │   │   ├── inference.py      # 鉴权/选号/限速/请求体增强(别名+裁剪+思考)/上游连接重试/用量记账
@@ -79,6 +81,7 @@ Workbuddy2API/
 │   ├── scheduler.py          # asyncio 后台循环（每 60s）：签到/保活/模型刷新/AA 刷新/每日清理/补签
 │   ├── models.py             # 模型目录：上游动态拉取 + TTL 缓存 + MODALITY_OVERRIDE 权威模态表
 │   ├── benchmarks.py         # Artificial Analysis 评测数据（24h 缓存，key 存 DB settings）
+│   ├── updates.py            # 版本核验：固定本项目 GitHub 源、6h/60s 缓存、并发合并、只读
 │   ├── credentials.py        # auth 文件读取、token 过期判定与自动刷新（原子写回）
 │   ├── oauth.py              # 扫码登录（设备授权流）：oauth_begin / oauth_poll
 │   ├── billing.py            # 额度查询（新三接口+旧接口降级）、每日签到、growth 域（连登/活跃地图/补签卡）
@@ -96,7 +99,7 @@ Workbuddy2API/
 │   ├── src/styles/           # base.css（布局）+ dark-theme.css（antd 深色覆盖，见 §7 前端要点）
 │   ├── src/types/index.ts    # 后端 /admin/* 响应的 TS 类型（改接口记得同步）
 │   └── dist/                 # 构建产物（跟踪进 git；由后端 app.py 直接伺服；改动前端后必须重新 build，见 §4）
-├── tests/                    # unittest 测试（464 个用例；test_policy.py 是错误处置/账号池治理）
+├── tests/                    # unittest 测试（550 个用例；test_policy.py 是错误处置/账号池治理）
 ├── docs/                     # 设计与评估文档（吸收评估、db 迁移、区域 UX、FIX_PLAN）
 ├── scripts/migrate_db.py     # 独立迁移脚本（--check 只查版本）
 ├── data/                     # 运行时数据：workbuddy.db、attachments/、.secret_key   ←机密，见 §8
@@ -117,7 +120,7 @@ Workbuddy2API/
 # 一切命令在 Workbuddy2API/ 目录下执行；Python 一律用 venv 解释器
 cd N:\代码\workbuddy2Api\Workbuddy2API
 
-# 跑测试（unittest，不是 pytest；464 个必须全绿）
+# 跑测试（unittest，不是 pytest；550 个必须全绿）
 .\.venv\Scripts\python.exe -m unittest discover -s tests
 
 # 本地起服务（开发调试用）
@@ -191,6 +194,7 @@ docker-compose up -d --build --force-recreate
   合成一个字符串，但存储上必须分开。
 - **单账号在途并发上限**（`pool.acquire_slot` / `release_slot`，`config.max_in_flight*`）：只覆盖
   「建立连接 → 首字节到达」这段窗口，**不**约束流式输出的整个生命周期（否则长回答会互相饿死）。
+  成功占位才可发送/释放；满载异步等待最多 10 秒；无上限也计数以支持热修改。
   国内版默认 3、国际版单独 2（global 域风控更严，实测同号 global 侧更易触发 403/11140）。
   `0 = 不限制`；设置页留空 = 回落环境变量。**"0" 与 "" 语义不同，禁止用 falsy 判断合并**。
 - **连败降权只喂"没有权威分类"的失败**（`pool.note_failures`）：未知 4xx / 传输层连续 5 次 → 出池 600s。
@@ -200,11 +204,13 @@ docker-compose up -d --build --force-recreate
   非数字（HTTP-Date 格式）与 >2h 的值一律**拒绝**——上游偶尔会回一个明显不合理的值，照信会让账号白停很久。
 - **成本台账与成本分层选号**（`pool.record_cost` / `cost_tier` + `model_costs` 表，迁移 v7）：
   按 `(账号, 模型)` 记每 1k token 的积分消耗，EMA 平滑（α=0.3）、TTL 6h、持久化。
-  选号分三层：tier0 实测免费 → tier1 未测量 → tier2 实测付费。**tier0 与 tier1 必须并列优先**，
-  否则新账号永远没有实测数据、被永久饿死。
+  按用户要求，先从健康/有空闲名额候选里选模型区域报价最低档，粘性不能绕过价格。
+  同报价（或完全无报价）内 tier0 实测免费与 tier1 未测量并列优先，tier2 按数值选最低实际单价。
+  报价未知不当免费；有已知报价时优先已知候选。只有 usage 明确提供 credit 才学习成本，缺字段不伪造免费观测。
 - **双计罚必须防**：`open_upstream` 已经罚过的路径，路由层 `log_usage` 必须传 `update_pool=False`。
+  异常携带实际失败账号及 `policy_applied`；换号异常归实际账号，禁止重复处置。
   否则 CLIENT 类错误 `cooldown=0` 会把刚设好的冷却**清掉**。`open_upstream` 覆盖不到的路径
-  （流中途断开、直接 `collect_upstream`）用 `inference.penalize()` 补罚。
+  （流中途断开或非流式聚合校验失败）用 `inference.penalize()` 补罚。
 - **系统提示词三模式**（`reasoning.apply_prompt_mode`，settings: `prompt_mode` / `prompt_text`）：
   `passthrough`（默认，零改动）/ `custom`（整段替换）/ `append`（插在**开头那几条** system / developer
   消息之后）。`append` 的插法是刻意的——有些客户端把项目规则塞在开头几条 system 消息里，
@@ -312,7 +318,7 @@ docker-compose up -d --build --force-recreate
 
 ## 10. 改完之后的自检清单
 
-1. `.\.venv\Scripts\python.exe -m unittest discover -s tests` → **464 个全绿**（现有基线，不允许变红）。
+1. `.\.venv\Scripts\python.exe -m unittest discover -s tests` → **550 个全绿**（现有基线，不允许变红）。
    顺带自查一遍有没有 `ResourceWarning: unclosed database`——测试里开了 `Database` 不关连接会在 GC 时报，
    在 Windows 上还可能让随后的 `unlink` 偶发失败。用 `addCleanup(db._conn.close)` 兜住
    （`tests/test_policy.py` 的 `_open_db()` 就是干这个的）。
@@ -327,7 +333,12 @@ docker-compose up -d --build --force-recreate
 
 ## 11. 当前状态速览（2026-09 快照）
 
-- 版本 **0.5.0**（唯一真源 = `workbuddy_one/__init__.py`，别在别处写死）；464 个测试全绿；本地 8787 端口跑 uvicorn（Docker 部署见第 9 节的 `docker-compose` 用法）。
+- 版本 **0.6.2**（唯一真源 = `workbuddy_one/__init__.py`，别在别处写死）；550 个测试；当前 8787 由 Docker 部署（见第 9 节的 `docker-compose` 用法）。
+- **2026-10-02 增量吸收**：12 个参考仓库核验为 7 个更新/4 个未变/1 个不可访问，见 `docs/参考项目更新评估-2026-10-02.md` 与同目录 JSON 证据。新增 Responses incomplete 终态、缓存/思考 token 透传、积分保留、多轮图片/工具截图、签到处理中 2/5/10 秒重试、设置页手动版本核验；schema 仍 v7，无新增运行时依赖。
+  - `adapters/usage.py` 是协议用量归一化入口：不能再将 cached_tokens/reasoning_tokens 固定写 0，也不能在 conv_usage 中丢掉 credit。
+  - Responses 必须有 finish_reason 才发正常终态；length/content_filter 属 incomplete，账号池按成功服务处理；已完成请求的终态 yield 在取消补记 try 之外，防客户端读到终态后关流被重复记为 aborted。
+  - 多模态转换保留文本/图片顺序；Anthropic tool_result 先于普通 user 内容；无图片仍是字符串。工具截图只做格式转换，不承诺非视觉模型支持图片。
+  - `/admin/updates` 只读快照，只有 `/admin/updates/check` 主动访问本项目固定 GitHub 版本文件；不执行远端代码，不自动拉代码/安装依赖/重启。状态 unavailable 不能被显示为最新。`.tmp/`、`.uv-cache/` 必须从 Docker 构建上下文排除。
 - `CODE_REVIEW_TODO.md` 的 **P0×4 / P1×4 / P2×11 / P3×13（#20~#32）已全部完成，无遗留项**（每条带实现备注）。
   后续新问题登记在它后面，按优先级做。其中 #24 的**原诊断被实测推翻**（`KNOWN_EFFORTS` 不是冷启动兜底
   而是当前生效的主策略），#29 由"可接受"改判为值得做（照抄 `apps`/`apps_history` 的现成分组先例）。

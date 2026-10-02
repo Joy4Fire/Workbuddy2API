@@ -774,8 +774,7 @@ wheels = [
 ]
 
 [[package]]
-name = "workbuddy-one"
-version = "0.4.0"
+name = "workbuddy2api"
 source = { editable = "." }
 dependencies = [
     { name = "fastapi" },

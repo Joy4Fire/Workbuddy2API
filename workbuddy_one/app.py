@@ -16,7 +16,7 @@ from .db import Database
 from .logsetup import setup_logging
 from .models import ModelRegistry
 from .pool import AccountPool
-from .routes import accounts, apps, inference, models_admin, overview, settings, usage, webui
+from .routes import accounts, apps, inference, models_admin, overview, settings, updates, usage, webui
 from .scheduler import Scheduler
 from . import __version__
 
@@ -212,6 +212,7 @@ def create_app() -> FastAPI:
     models_admin.register(app, ctx)
     overview.register(app, ctx)
     settings.register(app, ctx)
+    updates.register(app, ctx)
     webui.register(app, ctx)
 
     return app

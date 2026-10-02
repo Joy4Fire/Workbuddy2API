@@ -7,6 +7,7 @@
 // 2) 内容已超过一屏且会继续增长（每加一个功能就多一个分组），弹窗只会越来越长。
 // 3) 设置本来就与"账号"无关（模型别名、AA Key），挂在账号页工具栏里是错位的。
 import { ref, onMounted } from 'vue'
+import SystemUpdates from '@/components/SystemUpdates.vue'
 import { message } from 'ant-design-vue'
 import {
   GlobalOutlined, ClockCircleOutlined, DatabaseOutlined, BellOutlined,
@@ -484,6 +485,9 @@ function activeMapActionTag(r: ActiveMapResult): { color: string; text: string }
   <a-spin :spinning="loading">
     <a-card :bordered="false">
       <a-tabs v-model:activeKey="activeTab">
+        <a-tab-pane key="updates" tab="系统更新">
+          <SystemUpdates />
+        </a-tab-pane>
         <!-- ---------- 区域与网络 ---------- -->
         <a-tab-pane key="region">
           <template #tab><span><GlobalOutlined /> 区域与网络</span></template>

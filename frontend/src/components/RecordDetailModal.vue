@@ -50,7 +50,7 @@ function short(s: string | null | undefined, n = 8) {
           {{ Math.round(detail.latency_ms || 0) }}ms
           <template v-if="detail.credits"> · <span style="color: #fbbf24">{{ detail.credits.toFixed(2) }} 积分</span></template>
           · 账号 {{ short(detail.account_uid) }}
-          <a-tag :color="detail.status === 'ok' ? 'green' : 'red'" style="margin-left: 6px">{{ detail.status }}</a-tag>
+          <a-tag :color="detail.status === 'ok' ? 'green' : detail.status === 'incomplete' ? 'orange' : 'red'" style="margin-left: 6px">{{ detail.status === 'incomplete' ? '未完成' : detail.status }}</a-tag>
         </div>
 
         <!-- 思考链 / COT -->

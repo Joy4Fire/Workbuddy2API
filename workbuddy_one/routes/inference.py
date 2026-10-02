@@ -8,7 +8,6 @@ from __future__ import annotations
 import asyncio
 import json
 import time
-from functools import partial
 
 import httpx
 from fastapi import FastAPI, Header, HTTPException, Request
@@ -23,6 +22,19 @@ from ..gateway.errors import conv_usage, err_anthropic, json_error, safe_err
 from ..gateway.sse import delta_parts, sanitize_chat_sse, with_keepalive
 from ..reasoning import estimate_tokens, parse_model_aliases
 from ..upstream import build_upstream_body, collect_upstream, UpstreamError
+
+
+def _usage_logger(ctx, app_name):
+    # 每请求最多启动一次落库。取消 to_thread 不会停止线程，不能再补写 aborted。
+    started = False
+
+    async def write(*args, **kwargs):
+        nonlocal started
+        if started:
+            return
+        started = True
+        await asyncio.to_thread(inference.log_usage, ctx, *args, app_name=app_name, **kwargs)
+    return write
 
 
 def register(app: FastAPI, ctx) -> None:
@@ -59,7 +71,7 @@ def register(app: FastAPI, ctx) -> None:
         刻意不调用上游——这是发正式请求前的预检，打上游又慢又耗配额；
         实际 token 数以模型返回的 usage 为准。
         """
-        inference.check_api_key(ctx, authorization, x_api_key)
+        await asyncio.to_thread(inference.check_api_key, ctx, authorization, x_api_key)
         try:
             body = await request.json()
         except Exception:  # noqa: BLE001
@@ -88,8 +100,8 @@ def register(app: FastAPI, ctx) -> None:
     async def chat_completions(request: Request,
                                authorization: str | None = Header(default=None),
                                x_api_key: str | None = Header(default=None, alias="X-Api-Key")):
-        app_name = inference.check_api_key(ctx, authorization, x_api_key)
-        log_usage = partial(inference.log_usage, ctx, app_name=app_name)
+        app_name = await asyncio.to_thread(inference.check_api_key, ctx, authorization, x_api_key)
+        log_usage = _usage_logger(ctx, app_name)
         try:
             payload = await request.json()
         except Exception:
@@ -99,122 +111,136 @@ def register(app: FastAPI, ctx) -> None:
             raise HTTPException(status_code=400, detail={"error": {"message": "messages is required", "type": "invalid_request_error"}})
 
         client_wants_stream = bool(payload.get("stream"))
-        body = inference.enhance_body(ctx, build_upstream_body(payload))
+        body = await asyncio.to_thread(inference.enhance_body, ctx, build_upstream_body(payload))
         # 选号（含会话粘性）：会话键从原始 payload 提取（白名单会剥掉
         # prompt_cache_key/metadata 等粘性键来源）
         account, session_key = inference.acquire_account(ctx, body, raw=payload)
-        headers = inference.get_headers(ctx, account)
         # 记账用解析后的真实模型名（别名请求按真实模型归因，避免按模型统计被打碎）
         model_name = body.get("model", "auto")
         input_text = await extract_input_text(body)
         t0 = time.time()
 
-        if client_wants_stream:
-            # 预取上游首个事件：失败则直接返回正确 HTTP 状态码
-            # （换号重试后 account 会被重新绑定，gen() 里记账用的就是实际服务的账号）
-            try:
-                it, first, account = await inference.open_upstream(ctx, account, body)
-                # 换号重试后把会话重绑到实际服务的账号（刷新 TTL）
-                if session_key:
-                    ctx.session_router.bind(session_key, account.uid)
-            except UpstreamError as e:
-                # open_upstream 内部已按错误分类表罚过号（含禁用/模型级冷却），
-                # 这里只记账，**不能**再 update_pool——重复施加会把已经设好的
-                # 冷却用 cooldown_for_error 的返回值覆盖掉（对 CLIENT 类是 0，
-                # 等于把刚设的冷却清掉）。
-                log_usage("chat", model_name, account, t0, "error", f"HTTP {e.status_code}", input_content=input_text,
-                          update_pool=False)
-                raise HTTPException(status_code=e.status_code, detail=safe_err(e.raw, e.status_code))
-            except httpx.HTTPError as e:
-                log_usage("chat", model_name, account, t0, "error", str(e), input_content=input_text,
-                          cooldown=inference.COOLDOWN_SOFT)
-                raise HTTPException(status_code=502, detail={"error": {"message": f"upstream error: {e}", "type": "upstream_error"}})
+        # 预取上游首个事件：失败则直接返回正确 HTTP 状态码
+        # （换号重试后 account 会被重新绑定，gen() 里记账用的就是实际服务的账号）
+        try:
+            it, first, account = await inference.open_upstream(ctx, account, body)
+            # 换号重试后把会话重绑到实际服务的账号（刷新 TTL）
+            if session_key:
+                ctx.session_router.bind(session_key, account.uid)
+        except UpstreamError as e:
+            account = getattr(e, "account", account)
+            # open_upstream 内部已按错误分类表罚过号（含禁用/模型级冷却），
+            # 这里只记账，**不能**再 update_pool——重复施加会把已经设好的
+            # 冷却用 cooldown_for_error 的返回值覆盖掉（对 CLIENT 类是 0，
+            # 等于把刚设的冷却清掉）。
+            await log_usage("chat", model_name, account, t0, "error", f"HTTP {e.status_code}", input_content=input_text,
+                      update_pool=False)
+            raise HTTPException(status_code=e.status_code, detail=safe_err(e.raw, e.status_code))
+        except httpx.HTTPError as e:
+            account = getattr(e, "account", account)
+            await log_usage("chat", model_name, account, t0, "error", str(e), input_content=input_text,
+                      cooldown=inference.COOLDOWN_SOFT, update_pool=not getattr(e, "policy_applied", False))
+            raise HTTPException(status_code=502, detail={"error": {"message": f"upstream error: {e}", "type": "upstream_error"}})
 
+        if client_wants_stream:
             async def gen():
-                _usage: dict | None = None
-                _out_parts: list[str] = []
-                _reason_parts: list[str] = []
-                try:
-                    _first_clean = sanitize_chat_sse(first)
-                    if _first_clean:
-                        yield _first_clean + "\n\n"
-                    _c, _r = delta_parts(first)
-                    if _c: _out_parts.append(_c)
-                    if _r: _reason_parts.append(_r)
+                _usage = None
+                _out_parts, _reason_parts, terminal = [], [], []
+                finish_reason = None
+                completed = False
+                async def lines():
+                    yield first
                     async for line in it:
-                        _clean = sanitize_chat_sse(line)
-                        if not _clean:
-                            continue  # 整行只剩空 delta，丢弃
-                        yield _clean + "\n\n"
-                        # 轻量解析：仅提取 usage 块用于本地记账（流经清洗后透传）
-                        if line.startswith("data:") and line[5:].strip() not in ("[DONE]", ""):
-                            try:
-                                _chunk = json.loads(line[5:].strip())
-                            except json.JSONDecodeError:
-                                continue
-                            if _chunk.get("usage"):
-                                _usage = _chunk["usage"]
-                            _c, _r = delta_parts(line)
-                            if _c: _out_parts.append(_c)
-                            if _r: _reason_parts.append(_r)
-                    log_usage("chat", model_name, account, t0, "ok", usage=_usage,
-                               input_content=input_text,
-                               output_content="".join(_out_parts),
-                               reasoning_content="".join(_reason_parts))
+                        yield line
+                try:
+                    async for line in lines():
+                        if line.startswith("data:") and line[5:].strip() == "[DONE]":
+                            break
+                        try:
+                            chunk = json.loads(line[5:].strip()) if line.startswith("data:") else {}
+                        except json.JSONDecodeError:
+                            chunk = {}
+                        if chunk.get("usage"):
+                            _usage = chunk["usage"]
+                        for choice in chunk.get("choices") or []:
+                            if choice.get("finish_reason"):
+                                finish_reason = choice["finish_reason"]
+                        _c, _r = delta_parts(line)
+                        if _c: _out_parts.append(_c)
+                        if _r: _reason_parts.append(_r)
+                        clean = sanitize_chat_sse(line)
+                        if clean:
+                            # 完成块和后续 usage 一起暂存，确保终态发出前记账。
+                            if finish_reason is not None:
+                                terminal.append(clean + "\n\n")
+                            else:
+                                yield clean + "\n\n"
+                    if finish_reason is None:
+                        raise UpstreamError(502, b'{"error":{"message":"upstream stream ended without a finish reason","type":"upstream_error"}}')
+                    status = "incomplete" if finish_reason in ("length", "content_filter") else "ok"
+                    await log_usage("chat", model_name, account, t0, status, usage=_usage,
+                                    input_content=input_text, output_content="".join(_out_parts),
+                                    reasoning_content="".join(_reason_parts))
+                    completed = True
                 except (asyncio.CancelledError, GeneratorExit):
-                    # 客户端中途断开：上游已消耗的积分要补记一条，否则使用记录缺失、
-                    # 积分预测失真。CancelledError 继承自 BaseException，不会被下面的
-                    # except Exception 捕获。断开非账号过错，不计入失败/冷却。
-                    log_usage("chat", model_name, account, t0, "aborted", "client disconnected",
-                              usage=_usage, input_content=input_text,
-                              output_content="".join(_out_parts),
-                              reasoning_content="".join(_reason_parts), update_pool=False)
+                    await log_usage("chat", model_name, account, t0, "aborted", "client disconnected",
+                                    usage=_usage, input_content=input_text,
+                                    output_content="".join(_out_parts), reasoning_content="".join(_reason_parts),
+                                    update_pool=False)
                     raise
                 except UpstreamError as e:
-                    # 流中途断开：这里**不在** open_upstream 的处置范围内，要走
-                    # penalize 施加分类表策略（含禁用/模型级冷却），记账侧只落库。
-                    act = inference.penalize(ctx, account, e.status_code, e.raw, e.headers, model_name)
-                    log_usage("chat", model_name, account, t0, "error", f"HTTP {e.status_code}",
-                              input_content=input_text, cooldown=act.cooldown, update_pool=False)
-                    yield f'data: {json_error(e.status_code, str(e.raw.decode("utf-8", "replace")))}\n\n'.encode()
+                    act = await asyncio.to_thread(inference.penalize, ctx, account, e.status_code, e.raw, e.headers, model_name)
+                    await log_usage("chat", model_name, account, t0, "error", f"HTTP {e.status_code}",
+                                    usage=_usage, input_content=input_text, output_content="".join(_out_parts),
+                                    reasoning_content="".join(_reason_parts), update_pool=False)
+                    yield f'data: {json_error(e.status_code, e.raw.decode("utf-8", "replace"))}\n\n'.encode()
                     yield b"data: [DONE]\n\n"
-                except Exception as e:  # noqa: BLE001
-                    log_usage("chat", model_name, account, t0, "error", str(e), input_content=input_text,
-                              cooldown=inference.COOLDOWN_SOFT)
+                except Exception as e:
+                    await log_usage("chat", model_name, account, t0, "error", str(e), usage=_usage,
+                                    input_content=input_text, output_content="".join(_out_parts),
+                                    reasoning_content="".join(_reason_parts), cooldown=inference.COOLDOWN_SOFT)
                     yield f'data: {json_error(502, str(e))}\n\n'.encode()
+                    yield b"data: [DONE]\n\n"
+                finally:
+                    await it.aclose()
+                if completed:
+                    for chunk in terminal:
+                        yield chunk
                     yield b"data: [DONE]\n\n"
             return StreamingResponse(with_keepalive(gen(), 15.0), media_type="text/event-stream",
                                      headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
 
         try:
-            if config.ratelimit:
-                await inference.limiter(ctx, account.uid).wait_if_needed()
-            # 非流式：没有"连接建立 → 长流"的切分，整段都是阻塞的，所以在途名额
-            # 覆盖整个 collect（比流式路径更严，但方向一致：别让同一账号同时挨多个请求）
-            ctx.pool.acquire_slot(account.uid)
+            async def prefetched():
+                yield first
+                async for line in it:
+                    yield line
             try:
-                collected = await collect_upstream(headers, body)
+                collected = await collect_upstream({}, body, lines=prefetched())
             finally:
-                ctx.pool.release_slot(account.uid)
+                await it.aclose()
             _msg = (collected.get("choices") or [{}])[0].get("message", {})
             # 工具调用摘要并入输出记录（非流式 agent 回复常只有 tool_calls）
             _tc_summary = "".join(
                 f"<tool_call:{(tc.get('function') or {}).get('name', '?')} {(tc.get('function') or {}).get('arguments', '')}>"
                 for tc in _msg.get("tool_calls") or [] if isinstance(tc, dict))
-            log_usage("chat", model_name, account, t0, "ok", usage=collected.get("usage"),
+            status = "incomplete" if (collected.get("choices") or [{}])[0].get("finish_reason") in ("length", "content_filter") else "ok"
+            await log_usage("chat", model_name, account, t0, status, usage=collected.get("usage"),
                        input_content=input_text,
                        output_content=(_msg.get("content") or "") + _tc_summary,
                        reasoning_content=_msg.get("reasoning_content") or "")
             return JSONResponse(content=collected)
         except UpstreamError as e:
-            # 直连 collect_upstream，没走 open_upstream 的处置链 → 这里补上
-            act = inference.penalize(ctx, account, e.status_code, e.raw, e.headers, model_name)
-            log_usage("chat", model_name, account, t0, "error", f"HTTP {e.status_code}",
+            account = getattr(e, "account", account)
+            # 首字节后的聚合错误不在 open_upstream 的处置范围内，这里补上
+            act = await asyncio.to_thread(inference.penalize, ctx, account, e.status_code, e.raw, e.headers, model_name)
+            await log_usage("chat", model_name, account, t0, "error", f"HTTP {e.status_code}",
                       input_content=input_text, cooldown=act.cooldown, update_pool=False)
             raise HTTPException(status_code=e.status_code, detail=safe_err(e.raw, e.status_code))
         except httpx.HTTPError as e:
-            log_usage("chat", model_name, account, t0, "error", str(e), input_content=input_text,
-                      cooldown=inference.COOLDOWN_SOFT)
+            account = getattr(e, "account", account)
+            await log_usage("chat", model_name, account, t0, "error", str(e), input_content=input_text,
+                      cooldown=inference.COOLDOWN_SOFT, update_pool=not getattr(e, "policy_applied", False))
             raise HTTPException(status_code=502, detail={"error": {"message": f"upstream error: {e}", "type": "upstream_error"}})
 
     @app.post("/v1/messages")
@@ -222,14 +248,14 @@ def register(app: FastAPI, ctx) -> None:
                        authorization: str | None = Header(default=None),
                        x_api_key: str | None = Header(default=None, alias="X-Api-Key"),
                        anthropic_version: str | None = Header(default=None, alias="anthropic-version")):
-        app_name = inference.check_api_key(ctx, authorization, x_api_key)
-        log_usage = partial(inference.log_usage, ctx, app_name=app_name)
+        app_name = await asyncio.to_thread(inference.check_api_key, ctx, authorization, x_api_key)
+        log_usage = _usage_logger(ctx, app_name)
         try:
             payload = await request.json()
         except Exception:
             raise HTTPException(status_code=400, detail={"error": {"message": "bad json", "type": "invalid_request_error"}})
 
-        chat_body = inference.enhance_body(ctx, anthropic_request_to_chat(payload))
+        chat_body = await asyncio.to_thread(inference.enhance_body, ctx, anthropic_request_to_chat(payload))
         model_name = chat_body.get("model", "auto")
         input_text = await extract_input_text(chat_body)
         account, session_key = inference.acquire_account(ctx, chat_body, raw=payload)
@@ -247,13 +273,15 @@ def register(app: FastAPI, ctx) -> None:
             if session_key:
                 ctx.session_router.bind(session_key, account.uid)
         except UpstreamError as e:
+            account = getattr(e, "account", account)
             # open_upstream 已罚过号 → 只记账（同 chat 流式路径的注释）
-            log_usage("anthropic", model_name, account, t0, "error", f"HTTP {e.status_code}",
+            await log_usage("anthropic", model_name, account, t0, "error", f"HTTP {e.status_code}",
                       input_content=input_text, update_pool=False)
             raise HTTPException(status_code=e.status_code, detail=safe_err(e.raw, e.status_code))
         except httpx.HTTPError as e:
-            log_usage("anthropic", model_name, account, t0, "error", str(e), input_content=input_text,
-                      cooldown=inference.COOLDOWN_SOFT)
+            account = getattr(e, "account", account)
+            await log_usage("anthropic", model_name, account, t0, "error", str(e), input_content=input_text,
+                      cooldown=inference.COOLDOWN_SOFT, update_pool=not getattr(e, "policy_applied", False))
             raise HTTPException(status_code=502, detail={"error": {"message": f"upstream error: {e}", "type": "upstream_error"}})
 
         # 闭包错误标志：gen 捕获 UpstreamError 后只 yield 错误事件不抛出（流式路径需要），
@@ -274,15 +302,16 @@ def register(app: FastAPI, ctx) -> None:
                     if _r: _reason_parts.append(_r)
                     if evt:
                         yield evt.encode()
-                yield converter.finish().encode()
-                log_usage("anthropic", model_name, account, t0, "ok", usage=conv_usage(converter._usage),
+                terminal = converter.finish().encode()
+                status = "incomplete" if converter._finish_reason in ("length", "content_filter") else "ok"
+                await log_usage("anthropic", model_name, account, t0, status, usage=conv_usage(converter._usage),
                            input_content=input_text,
                            output_content=(getattr(converter, "_text_content", "") or "") + converter.tools_summary(),
                            reasoning_content="".join(_reason_parts))
             except (asyncio.CancelledError, GeneratorExit):
                 # 客户端中途断开：补记已产生的输出（CancelledError 不走 except Exception）；
                 # 断开非账号过错，不计入失败/冷却
-                log_usage("anthropic", model_name, account, t0, "aborted", "client disconnected",
+                await log_usage("anthropic", model_name, account, t0, "aborted", "client disconnected",
                           usage=conv_usage(converter._usage),
                           input_content=input_text,
                           output_content=(getattr(converter, "_text_content", "") or "") + converter.tools_summary(),
@@ -293,17 +322,23 @@ def register(app: FastAPI, ctx) -> None:
                 errored["status"] = e.status_code
                 errored["msg"] = str(e.raw.decode("utf-8", "replace"))
                 # 流中途断开：不在 open_upstream 处置范围内 → 走分类表补罚
-                act = inference.penalize(ctx, account, e.status_code, e.raw, e.headers, model_name)
-                log_usage("anthropic", model_name, account, t0, "error", f"HTTP {e.status_code}",
+                act = await asyncio.to_thread(inference.penalize, ctx, account, e.status_code, e.raw, e.headers, model_name)
+                await log_usage("anthropic", model_name, account, t0, "error", f"HTTP {e.status_code}",
                           input_content=input_text, cooldown=act.cooldown, update_pool=False)
                 yield err_anthropic(e.status_code, errored["msg"]).encode()
             except Exception as e:  # noqa: BLE001
                 errored["flag"] = True
                 errored["status"] = 502
                 errored["msg"] = str(e)
-                log_usage("anthropic", model_name, account, t0, "error", str(e), input_content=input_text,
+                await log_usage("anthropic", model_name, account, t0, "error", str(e), input_content=input_text,
                           cooldown=inference.COOLDOWN_SOFT)
                 yield err_anthropic(502, str(e)).encode()
+
+            finally:
+                await it.aclose()
+
+            if not errored["flag"]:
+                yield terminal
 
         if client_wants_stream:
             return StreamingResponse(with_keepalive(gen(), 15.0), media_type="text/event-stream",
@@ -321,14 +356,14 @@ def register(app: FastAPI, ctx) -> None:
     async def responses(request: Request,
                         authorization: str | None = Header(default=None),
                         x_api_key: str | None = Header(default=None, alias="X-Api-Key")):
-        app_name = inference.check_api_key(ctx, authorization, x_api_key)
-        log_usage = partial(inference.log_usage, ctx, app_name=app_name)
+        app_name = await asyncio.to_thread(inference.check_api_key, ctx, authorization, x_api_key)
+        log_usage = _usage_logger(ctx, app_name)
         try:
             payload = await request.json()
         except Exception:
             raise HTTPException(status_code=400, detail={"error": {"message": "bad json", "type": "invalid_request_error"}})
 
-        chat_body = inference.enhance_body(ctx, responses_request_to_chat(payload))
+        chat_body = await asyncio.to_thread(inference.enhance_body, ctx, responses_request_to_chat(payload))
         model_name = chat_body.get("model", "auto")
         input_text = await extract_input_text(chat_body)
         account, session_key = inference.acquire_account(ctx, chat_body, raw=payload)
@@ -345,13 +380,15 @@ def register(app: FastAPI, ctx) -> None:
             if session_key:
                 ctx.session_router.bind(session_key, account.uid)
         except UpstreamError as e:
+            account = getattr(e, "account", account)
             # open_upstream 已罚过号 → 只记账（同 chat 流式路径的注释）
-            log_usage("responses", model_name, account, t0, "error", f"HTTP {e.status_code}",
+            await log_usage("responses", model_name, account, t0, "error", f"HTTP {e.status_code}",
                       input_content=input_text, update_pool=False)
             raise HTTPException(status_code=e.status_code, detail=safe_err(e.raw, e.status_code))
         except httpx.HTTPError as e:
-            log_usage("responses", model_name, account, t0, "error", str(e), input_content=input_text,
-                      cooldown=inference.COOLDOWN_SOFT)
+            account = getattr(e, "account", account)
+            await log_usage("responses", model_name, account, t0, "error", str(e), input_content=input_text,
+                      cooldown=inference.COOLDOWN_SOFT, update_pool=not getattr(e, "policy_applied", False))
             raise HTTPException(status_code=502, detail={"error": {"message": f"upstream error: {e}", "type": "upstream_error"}})
 
         # 闭包错误标志：用途同 /v1/messages——非流式路径区分正常结束与中途出错
@@ -371,15 +408,18 @@ def register(app: FastAPI, ctx) -> None:
                     if _r: _reason_parts.append(_r)
                     if evt:
                         yield evt.encode()
-                yield converter.finish().encode()
-                log_usage("responses", model_name, account, t0, "ok", usage=conv_usage(converter._usage),
+                terminal = converter.finish().encode()
+                status = "incomplete" if converter.terminal_status() == "incomplete" else "ok"
+                await log_usage("responses", model_name, account, t0, status, usage=conv_usage(converter._usage),
                            input_content=input_text,
                            output_content=(getattr(converter, "_content", "") or "") + converter.tools_summary(),
                            reasoning_content="".join(_reason_parts))
+                # 上游已明确结束且用量已入库；客户端读到终态后关连接不能再记一条 aborted。
+                # 把终态 yield 放在 try 之外，关闭生成器也不会重走取消补记分支。
             except (asyncio.CancelledError, GeneratorExit):
                 # 客户端中途断开：补记已产生的输出（CancelledError 不走 except Exception）；
                 # 断开非账号过错，不计入失败/冷却
-                log_usage("responses", model_name, account, t0, "aborted", "client disconnected",
+                await log_usage("responses", model_name, account, t0, "aborted", "client disconnected",
                           usage=conv_usage(converter._usage),
                           input_content=input_text,
                           output_content=(getattr(converter, "_content", "") or "") + converter.tools_summary(),
@@ -390,8 +430,8 @@ def register(app: FastAPI, ctx) -> None:
                 errored["status"] = e.status_code
                 errored["msg"] = str(e.raw.decode("utf-8", "replace"))
                 # 流中途断开：不在 open_upstream 处置范围内 → 走分类表补罚
-                act = inference.penalize(ctx, account, e.status_code, e.raw, e.headers, model_name)
-                log_usage("responses", model_name, account, t0, "error", f"HTTP {e.status_code}",
+                act = await asyncio.to_thread(inference.penalize, ctx, account, e.status_code, e.raw, e.headers, model_name)
+                await log_usage("responses", model_name, account, t0, "error", f"HTTP {e.status_code}",
                           input_content=input_text, cooldown=act.cooldown, update_pool=False)
                 yield f'data: {json_error(e.status_code, errored["msg"])}\n\n'.encode()
                 yield b"data: [DONE]\n\n"
@@ -399,10 +439,16 @@ def register(app: FastAPI, ctx) -> None:
                 errored["flag"] = True
                 errored["status"] = 502
                 errored["msg"] = str(e)
-                log_usage("responses", model_name, account, t0, "error", str(e), input_content=input_text,
+                await log_usage("responses", model_name, account, t0, "error", str(e), input_content=input_text,
                           cooldown=inference.COOLDOWN_SOFT)
                 yield f'data: {json_error(502, str(e))}\n\n'.encode()
                 yield b"data: [DONE]\n\n"
+
+            finally:
+                await it.aclose()
+
+            if not errored["flag"]:
+                yield terminal
 
         if client_wants_stream:
             return StreamingResponse(with_keepalive(gen(), 15.0), media_type="text/event-stream",

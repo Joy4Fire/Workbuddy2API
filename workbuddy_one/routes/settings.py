@@ -1,6 +1,9 @@
 """设置路由（/admin/settings）：读取/保存。响应不回明文 key。"""
 from __future__ import annotations
 
+import asyncio
+import threading
+
 from fastapi import FastAPI, HTTPException, Request
 
 from ..config import config
@@ -28,6 +31,7 @@ def _validate_hour_field(value, field_name: str) -> str:
 
 def register(app: FastAPI, ctx) -> None:
     db, pool = ctx.db, ctx.pool
+    save_lock = threading.Lock()
 
     def _region_counts() -> list[dict]:
         """账号池的区域分布：设置页要能让用户一眼看出"我现在有哪些区域的账号"。
@@ -97,6 +101,16 @@ def register(app: FastAPI, ctx) -> None:
     @app.post("/admin/settings")
     async def admin_save_settings(request: Request):
         body = await request.json()
+        return await asyncio.to_thread(_save_settings, body)
+
+    def _save_settings(body):
+        with save_lock:
+            return _save_settings_locked(body)
+
+    def _save_settings_locked(body):
+        if not isinstance(body, dict):
+            raise HTTPException(status_code=400, detail={"error": {"message": "设置需为 JSON 对象"}})
+        pending = {}
         checkin_hours = body.get("checkin_hours")
         credit_refresh_min = body.get("credit_refresh_min")
         model_refresh_hour = body.get("model_refresh_hour")
@@ -109,7 +123,7 @@ def register(app: FastAPI, ctx) -> None:
                     raise ValueError
             except Exception:  # noqa: BLE001
                 raise HTTPException(status_code=400, detail={"error": {"message": "签到时间需为 0-23 的小时，逗号分隔"}})
-            db.save_settings(checkin_hours=",".join(str(h) for h in sorted(set(hours))))
+            pending.update(checkin_hours=",".join(str(h) for h in sorted(set(hours))))
         if credit_refresh_min is not None:
             try:
                 v = int(credit_refresh_min)
@@ -117,9 +131,9 @@ def register(app: FastAPI, ctx) -> None:
                     raise ValueError
             except Exception:  # noqa: BLE001
                 raise HTTPException(status_code=400, detail={"error": {"message": "额度刷新间隔需为 1-1440 分钟"}})
-            db.save_settings(credit_refresh_min=str(v))
+            pending.update(credit_refresh_min=str(v))
         if model_refresh_hour is not None:
-            db.save_settings(model_refresh_hour=_validate_hour_field(model_refresh_hour, "模型刷新时间"))
+            pending.update(model_refresh_hour=_validate_hour_field(model_refresh_hour, "模型刷新时间"))
         if "model_ttl_min" in body:
             try:
                 ttl = int(body.get("model_ttl_min"))
@@ -127,42 +141,42 @@ def register(app: FastAPI, ctx) -> None:
                     raise ValueError
             except Exception:  # noqa: BLE001
                 raise HTTPException(status_code=400, detail={"error": {"message": "模型缓存 TTL 需为 1-1440 分钟"}})
-            db.save_settings(model_ttl_min=str(ttl))
+            pending.update(model_ttl_min=str(ttl))
         if "aa_refresh_hour" in body:
-            db.save_settings(aa_refresh_hour=_validate_hour_field(body.get("aa_refresh_hour"), "AA 评测刷新时间"))
+            pending.update(aa_refresh_hour=_validate_hour_field(body.get("aa_refresh_hour"), "AA 评测刷新时间"))
         if keepalive_hour is not None:
-            db.save_settings(keepalive_hour=_validate_hour_field(keepalive_hour, "token 保活时间"))
+            pending.update(keepalive_hour=_validate_hour_field(keepalive_hour, "token 保活时间"))
         if "keepalive_enabled" in body:
             val = str(body.get("keepalive_enabled") or "").strip()
-            db.save_settings(keepalive_enabled="1" if val in ("1", "true", "on") else "0")
+            pending.update(keepalive_enabled="1" if val in ("1", "true", "on") else "0")
         if "makeup_enabled" in body:
             val = str(body.get("makeup_enabled") or "").strip().lower()
-            db.save_settings(makeup_enabled="1" if val in ("1", "true", "on") else "0")
+            pending.update(makeup_enabled="1" if val in ("1", "true", "on") else "0")
         if "makeup_dry_run" in body:
             val = str(body.get("makeup_dry_run") or "").strip().lower()
-            db.save_settings(makeup_dry_run="1" if val in ("1", "true", "on") else "0")
+            pending.update(makeup_dry_run="1" if val in ("1", "true", "on") else "0")
         if "travel_enabled" in body:
             val = str(body.get("travel_enabled") or "").strip().lower()
-            db.save_settings(travel_enabled="1" if val in ("1", "true", "on") else "0")
+            pending.update(travel_enabled="1" if val in ("1", "true", "on") else "0")
         if "travel_dry_run" in body:
             val = str(body.get("travel_dry_run") or "").strip().lower()
-            db.save_settings(travel_dry_run="1" if val in ("1", "true", "on") else "0")
+            pending.update(travel_dry_run="1" if val in ("1", "true", "on") else "0")
         if "active_map_enabled" in body:
             val = str(body.get("active_map_enabled") or "").strip().lower()
-            db.save_settings(active_map_enabled="1" if val in ("1", "true", "on") else "0")
+            pending.update(active_map_enabled="1" if val in ("1", "true", "on") else "0")
         if "active_map_hour" in body:
             # 0~23；非法值直接丢弃（落进"空值=不改"分支），别写一个跑不起来的点
             try:
                 h = int(body.get("active_map_hour"))
                 if 0 <= h <= 23:
-                    db.save_settings(active_map_hour=str(h))
+                    pending.update(active_map_hour=str(h))
             except (TypeError, ValueError):
                 pass
         if "alert_enabled" in body:
             val = str(body.get("alert_enabled") or "").strip().lower()
-            db.save_settings(alert_enabled="1" if val in ("1", "true", "on") else "0")
+            pending.update(alert_enabled="1" if val in ("1", "true", "on") else "0")
         if "alert_webhook_url" in body:
-            db.save_settings(alert_webhook_url=str(body.get("alert_webhook_url") or "").strip())
+            pending.update(alert_webhook_url=str(body.get("alert_webhook_url") or "").strip())
         if "alert_threshold_percent" in body:
             try:
                 v = float(body.get("alert_threshold_percent"))
@@ -170,7 +184,7 @@ def register(app: FastAPI, ctx) -> None:
                     raise ValueError
             except (TypeError, ValueError):
                 raise HTTPException(status_code=400, detail={"error": {"message": "余额预警阈值需为 1-90 的数字"}})
-            db.save_settings(alert_threshold_percent=str(v))
+            pending.update(alert_threshold_percent=str(v))
         if "alert_expiry_days" in body:
             try:
                 v = float(body.get("alert_expiry_days"))
@@ -178,7 +192,7 @@ def register(app: FastAPI, ctx) -> None:
                     raise ValueError
             except (TypeError, ValueError):
                 raise HTTPException(status_code=400, detail={"error": {"message": "到期预警天数需为 1-90 的数字"}})
-            db.save_settings(alert_expiry_days=str(v))
+            pending.update(alert_expiry_days=str(v))
         if "model_aliases" in body:
             raw = str(body.get("model_aliases") or "")
             for ln in raw.splitlines():
@@ -189,47 +203,47 @@ def register(app: FastAPI, ctx) -> None:
                 if not alias.strip() or not real.strip():
                     raise HTTPException(status_code=400,
                                         detail={"error": {"message": f"模型别名格式错误：{ln}（应为 别名=真实模型）"}})
-            db.save_settings(model_aliases=raw)
+            pending.update(model_aliases=raw)
         if "prompt_mode" in body:
             mode = str(body.get("prompt_mode") or "").strip().lower() or "passthrough"
             if mode not in ("passthrough", "custom", "append"):
                 raise HTTPException(status_code=400, detail={"error": {"message":
                     "系统提示词模式需为 passthrough / custom / append"}})
-            db.save_settings(prompt_mode=mode)
+            pending.update(prompt_mode=mode)
         if "prompt_text" in body:
-            db.save_settings(prompt_text=str(body.get("prompt_text") or ""))
+            pending.update(prompt_text=str(body.get("prompt_text") or ""))
         if "aa_api_key" in body:
             aa_key = str(body.get("aa_api_key") or "").strip()
             # 留空且已有配置 → 视为不修改（避免误清空）；显式清除用特殊标记
             if aa_key == "" and db.get_settings().get("aa_api_key"):
                 # 若传了空字符串，表示清除
                 if body.get("clear_aa_api_key"):
-                    db.save_settings(aa_api_key="")
+                    pending.update(aa_api_key="")
                 # 否则忽略（不覆盖）
             else:
-                db.save_settings(aa_api_key=aa_key)
+                pending.update(aa_api_key=aa_key)
         if "backend" in body:
             v = str(body.get("backend") or "").strip().rstrip("/")
             if v and not v.startswith(("http://", "https://")):
                 raise HTTPException(status_code=400, detail={"error": {"message":
                     "BACKEND 需为 http:// 或 https:// 开头的地址；留空表示按账号区域自动选择（推荐）"}})
-            db.save_settings(backend=v)
+            pending.update(backend=v)
         if "proxy" in body:
             v = str(body.get("proxy") or "").strip()
             if v and not v.startswith(("http://", "https://", "socks5://", "socks5h://")):
                 raise HTTPException(status_code=400, detail={"error": {"message":
                     "PROXY 需为 http:// / https:// / socks5:// 开头的地址；留空表示直连"}})
-            db.save_settings(proxy=v)
+            pending.update(proxy=v)
         if "workbuddy_exe" in body:
             # 允许直接粘贴带引号的 Windows 路径（用户从资源管理器复制出来的样子）
-            db.save_settings(workbuddy_exe=str(body.get("workbuddy_exe") or "").strip().strip('"'))
+            pending.update(workbuddy_exe=str(body.get("workbuddy_exe") or "").strip().strip('"'))
         for key, label in (("max_in_flight", "单账号在途并发上限"),
                            ("max_in_flight_global", "国际版在途并发上限")):
             if key not in body:
                 continue
-            v = str(body.get(key) or "").strip()
+            v = "" if body.get(key) is None else str(body[key]).strip()
             if v == "":
-                db.save_settings(**{key: ""})   # 留空 = 回落环境变量
+                pending.update(**{key: ""})   # 留空 = 回落环境变量
                 continue
             try:
                 n = int(v)
@@ -238,9 +252,10 @@ def register(app: FastAPI, ctx) -> None:
             except (TypeError, ValueError):
                 raise HTTPException(status_code=400, detail={"error": {
                     "message": f"{label}需为 0-64 的整数（0 = 不限制；留空 = 用环境变量）"}})
-            db.save_settings(**{key: str(n)})
+            pending.update(**{key: str(n)})
         # 这几项是"每次调用现读"的（区域判定 / 出站客户端 / 解密探测），
         # 所以保存后立刻重载覆盖即可生效，不需要重启进程。
+        db.save_settings(**pending)
         config.load_overrides(db.get_settings())
         # 在途并发上限缓存在账号实例上（pick 持锁时不读配置），改完必须显式刷一次
         pool.apply_capacity_limits()

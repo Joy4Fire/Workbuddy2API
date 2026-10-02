@@ -543,10 +543,6 @@ def err_anthropic(status: int, message: str) -> str:
 
 
 def conv_usage(usage: dict | None) -> dict:
-    """把各协议转换器内部的 usage 归一化为 input/output tokens。"""
-    if not usage:
-        return {}
-    return {
-        "prompt_tokens": usage.get("prompt_tokens", usage.get("input_tokens", 0)),
-        "completion_tokens": usage.get("completion_tokens", usage.get("output_tokens", 0)),
-    }
+    """统一 token 名称并保留积分；丢 credit 会把付费调用错误记为免费。"""
+    from ..adapters.usage import normalize_chat_usage
+    return normalize_chat_usage(usage)

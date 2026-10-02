@@ -16,6 +16,9 @@ import os
 import time
 from typing import Any
 
+from .usage import responses_usage
+from ..upstream import UpstreamError
+
 # ---------------------------------------------------------------------------
 # ID 生成
 # ---------------------------------------------------------------------------
@@ -91,7 +94,7 @@ def _convert_input_items(items: list) -> list[dict]:
     """
     messages: list[dict] = []
     # 临时缓存：合并相邻的 assistant message 和 function_call
-    pending_assistant_content: str | None = None
+    pending_assistant_content: str | list | None = None
     pending_tool_calls: list[dict] = []
 
     def _flush_assistant():
@@ -132,7 +135,7 @@ def _convert_input_items(items: list) -> list[dict]:
         if item_type == "message" and role == "assistant":
             _flush_assistant()
             content_parts = item.get("content", [])
-            text = _extract_output_text(content_parts) if isinstance(content_parts, list) else str(content_parts)
+            text = _content_with_images(content_parts)
             pending_assistant_content = text
             continue
 
@@ -163,7 +166,7 @@ def _convert_input_items(items: list) -> list[dict]:
             messages.append({
                 "role": "tool",
                 "tool_call_id": item.get("call_id", ""),
-                "content": item.get("output", ""),
+                "content": _content_with_images(item.get("output", "")),
             })
             continue
 
@@ -177,22 +180,9 @@ def _convert_input_items(items: list) -> list[dict]:
     return messages
 
 
-def _extract_content(content) -> str:
-    """提取 content（可能是 str / list[{type,text}]）。"""
-    if isinstance(content, str):
-        return content
-    if isinstance(content, list):
-        parts = []
-        for p in content:
-            if isinstance(p, dict):
-                if p.get("type") in ("input_text", "text"):
-                    parts.append(p.get("text", ""))
-                elif p.get("type") == "output_text":
-                    parts.append(p.get("text", ""))
-            elif isinstance(p, str):
-                parts.append(p)
-        return "".join(parts) or str(content)
-    return str(content)
+def _extract_content(content) -> str | list:
+    """历史消息复用相同的多模态转换，避免只在首轮保留图片。"""
+    return _content_with_images(content)
 
 
 def _image_data_url(block: dict) -> str:
@@ -220,30 +210,30 @@ def _content_with_images(content):
     """
     if isinstance(content, str):
         return content
+    if content is None:
+        return ""
     if not isinstance(content, list):
         return str(content)
-    texts: list[str] = []
-    images: list[dict] = []
+    parts: list[dict] = []
+    has_image = False
     for p in content:
         if isinstance(p, str):
-            texts.append(p)
+            parts.append({"type": "text", "text": p})
             continue
         if not isinstance(p, dict):
             continue
         t = p.get("type")
         if t in ("input_text", "text", "output_text"):
-            texts.append(p.get("text", ""))
-        elif t == "input_image":
+            parts.append({"type": "text", "text": p.get("text", "")})
+        elif t in ("input_image", "image_url"):
             url = _image_data_url(p)
             if url:
-                images.append({"type": "image_url", "image_url": {"url": url}})
-    if not images:
-        return "".join(texts)
-    parts: list[dict] = []
-    if texts:
-        parts.append({"type": "text", "text": "".join(texts)})
-    parts.extend(images)
-    return parts
+                image_url = dict(p["image_url"]) if isinstance(p.get("image_url"), dict) else {"url": url}
+                if "detail" in p:
+                    image_url["detail"] = p["detail"]
+                parts.append({"type": "image_url", "image_url": image_url})
+                has_image = True
+    return parts if has_image else "".join(p["text"] for p in parts)
 
 
 def _extract_output_text(content_parts: list) -> str:
@@ -336,7 +326,8 @@ class ResponsesStreamConverter:
         return self._process_chunk(chunk)
 
     def finish(self) -> str:
-        """流结束后，发出收尾事件（done + completed）。"""
+        """有明确结束原因才收尾；达到输出上限和内容过滤都属于未完成。"""
+        status = self.terminal_status()
         events: list[str] = []
 
         # 关闭 text content
@@ -352,7 +343,7 @@ class ResponsesStreamConverter:
         if self._emitted_msg_item:
             events.append(self._evt("response.output_item.done", {
                 "output_index": 0,
-                "item": self._msg_item("completed")
+                "item": self._msg_item(status)
             }))
 
         # 关闭 function calls
@@ -364,18 +355,22 @@ class ResponsesStreamConverter:
                     "output_index": oi, "arguments": tc["args"]
                 }))
                 events.append(self._evt("response.output_item.done", {
-                    "output_index": oi, "item": self._fc_item(tc, "completed")
+                    "output_index": oi, "item": self._fc_item(tc, status)
                 }))
 
-        # response.completed
-        events.append(self._evt("response.completed", {
-            "response": self._response_obj("completed")
+        events.append(self._evt(f"response.{status}", {
+            "response": self._response_obj(status)
         }))
         return "".join(events)
 
     def get_nonstream_response(self) -> dict:
         """流结束后获取完整的非流式 Response 对象。"""
-        return self._response_obj("completed")
+        return self._response_obj(self.terminal_status())
+
+    def terminal_status(self) -> str:
+        if self._finish_reason is None:
+            raise UpstreamError(502, b'{"error":{"message":"upstream stream ended without a finish reason","type":"upstream_error"}}')
+        return "incomplete" if self._finish_reason in ("length", "content_filter") else "completed"
 
     # ---- 内部 ----
 
@@ -503,18 +498,7 @@ class ResponsesStreamConverter:
             if tc.get("emitted"):
                 output.append(self._fc_item(tc, status))
 
-        usage = None
-        if self._usage:
-            u = self._usage
-            usage = {
-                "input_tokens": u.get("prompt_tokens", u.get("input_tokens", 0)),
-                "input_tokens_details": {"cached_tokens": 0},
-                "output_tokens": u.get("completion_tokens", u.get("output_tokens", 0)),
-                "output_tokens_details": {"reasoning_tokens": 0},
-                "total_tokens": u.get("total_tokens", 0),
-            }
-
-        return {
+        response = {
             "id": self.resp_id,
             "object": "response",
             "created_at": self.created_at,
@@ -522,8 +506,12 @@ class ResponsesStreamConverter:
             "model": self.model,
             "output": output,
             "parallel_tool_calls": True,
-            "usage": usage,
+            "usage": responses_usage(self._usage),
         }
+        if status == "incomplete":
+            reason = "max_output_tokens" if self._finish_reason == "length" else "content_filter"
+            response["incomplete_details"] = {"reason": reason}
+        return response
 
     def tools_summary(self) -> str:
         """工具调用摘要（供用量记录）：`<tool_call:name args>` 拼接。无工具调用返回空串。"""

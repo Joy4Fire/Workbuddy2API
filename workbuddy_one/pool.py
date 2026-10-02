@@ -544,10 +544,9 @@ class AccountPool:
         with self._lock:
             for a in self.accounts:
                 if a.uid == uid:
-                    if a.capacity_limit <= 0:
-                        return True
-                    if a.in_flight >= a.capacity_limit:
+                    if a.capacity_limit > 0 and a.in_flight >= a.capacity_limit:
                         return False
+                    # 无上限时也计数，热修改上限不能丢失已有连接的所有权。
                     a.in_flight += 1
                     return True
         return True
@@ -584,10 +583,47 @@ class AccountPool:
     # 到期紧迫阈值（天）：距到期 ≤ 此天数视为「快到期」，进入硬性优先池
     EXPIRY_PRIORITY_DAYS = 7
 
-    def pick(self, regions: set[str] | None = None, model: str = ""):
+    def _eligible(self, now, regions, model):
+        enabled = [a for a in self.accounts if a.enabled and not a.auto_disabled_reason]
+        if regions:
+            scoped = [a for a in enabled if a.region_id in regions]
+            enabled = scoped or enabled
+        if model:
+            enabled = [a for a in enabled if not a.model_cooling(now, model)]
+        return enabled
+
+    @staticmethod
+    def _prefer(candidates, now, model, prices):
+        # 先排除占满的账号，使低价通道繁忙时能由可用的高价通道接手。
+        free = [a for a in candidates if a.capacity_limit <= 0 or a.in_flight < a.capacity_limit]
+        candidates = free or candidates
+        if model and candidates:
+            known = [a for a in candidates if a.region_id in prices]
+            if known:
+                lowest = min(prices[a.region_id] for a in known)
+                candidates = [a for a in known if prices[a.region_id] == lowest]
+            # 同报价内保留免费/未知账号的探索；收费账号按实际单价继续比较。
+            cheap = [a for a in candidates if a.cost_tier(now, model) != 2]
+            if cheap:
+                candidates = cheap
+            else:
+                lowest = min(a.cost_of(now, model) for a in candidates)
+                candidates = [a for a in candidates if a.cost_of(now, model) == lowest]
+        return candidates
+
+    def can_reuse(self, uid, *, regions=None, model="", prices=None) -> bool:
+        """粘性仅在当前优选候选里复用，不能绕过更低价的健康账号。"""
+        with self._lock:
+            now = time.time()
+            candidates = [a for a in self._eligible(now, regions, model) if a.healthy(now)]
+            return any(a.uid == uid for a in self._prefer(candidates, now, model, prices or {}))
+
+    def pick(self, regions: set[str] | None = None, model: str = "", prices: dict | None = None,
+             exclude: set[str] | None = None):
         """加权随机选择下一个健康账号。
 
-        两阶段策略（积分优先消耗）：
+        先限定健康且有空闲名额的候选，再按区域报价选最低档，同价内比较实测成本。
+        粘性复用使用同一候选规则。最后仅在同价池内按积分到期和权重选择：
           阶段 1：存在「快到期」健康账号（到期 ≤ EXPIRY_PRIORITY_DAYS 天）时，
                  只在快到期账号里按 (优先级×额度×成功率) 加权选——先消耗快过期的积分。
           阶段 2：否则在所有健康账号里按全因子（含闲置补偿）加权选。
@@ -605,32 +641,18 @@ class AccountPool:
         """
         with self._lock:
             now = time.time()
-            all_enabled = [a for a in self.accounts if a.enabled and not a.auto_disabled_reason]
-            if regions:
-                scoped = [a for a in all_enabled if a.region_id in regions]
-                # 限定区域内一个可用账号都没有 → 放弃过滤，走原逻辑
-                all_enabled = scoped or all_enabled
-            if model:
-                # 硬过滤：模型被这个账号冷却的组合直接排除（见 docstring）
-                all_enabled = [a for a in all_enabled if not a.model_cooling(now, model)]
+            all_enabled = [a for a in self._eligible(now, regions, model)
+                           if not exclude or a.uid not in exclude]
             candidates = [a for a in all_enabled if a.healthy(now)]
-            if model and candidates:
-                # 成本分层（P2-3）：免费号与"还没测过"的号一起优先，实测收费的作兜底。
-                # 为什么把"没测过"和"免费"并列而不是排在免费之后：新号永远没观测，
-                # 排后面就永远轮不到它 → 永远学不到它的单价 → 永久饿死。
-                # 为什么用"有没有便宜的可用"而不是把单价塞进加权公式：单价与额度、
-                # 到期紧迫度这些因子量纲不同，混在一个乘积里会互相抵消，调不动。
-                cheap = [a for a in candidates if a.cost_tier(now, model) != 2]
-                candidates = cheap or candidates
-            if candidates:
-                free = [a for a in candidates
-                        if a.capacity_limit <= 0 or a.in_flight < a.capacity_limit]
-                candidates = free or candidates
+            candidates = self._prefer(candidates, now, model, prices or {})
             if not candidates:
                 # 没有健康账号：找一个已过期冷却的最早冷却账号（尽量）
                 best = None
                 best_expiry = float("inf")
                 for acc in all_enabled:
+                    # 兜底只能放宽短期冷却，不能绕过额度耗尽或连败摘除。
+                    if acc.degrade_until > now or (acc.credits_remaining is not None and acc.credits_remaining <= 0):
+                        continue
                     if acc.enabled and acc.cooldown_until < best_expiry:
                         best = acc
                         best_expiry = acc.cooldown_until

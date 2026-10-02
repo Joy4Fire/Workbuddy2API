@@ -15,6 +15,7 @@ from .models import ModelRegistry
 from .pool import AccountPool
 from .ratelimit import AsyncAccountRateLimiter
 from .scheduler import Scheduler
+from .updates import UpdateChecker
 
 
 @dataclass
@@ -28,3 +29,4 @@ class GatewayContext:
     limiters: dict[str, AsyncAccountRateLimiter] = field(default_factory=dict)
     session_router: SessionRouter = field(default_factory=SessionRouter)
     auth_files_count: int = 0
+    updates: UpdateChecker = field(default_factory=UpdateChecker)

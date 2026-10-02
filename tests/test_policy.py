@@ -2614,33 +2614,22 @@ class TestVersionSingleSource(unittest.TestCase):
         webui.register(_App(), ctx2)
         self.assertIsNone(routes["/health"]()["migrated_from"])
 
-    def test_dockerfile_dependency_list_matches_pyproject(self):
-        """Dockerfile 里显式列的依赖必须与 pyproject 的 `dependencies` 一致。
-
-        为什么需要：容器里的 `pip install` 读不到 pyproject（装的是显式列出的包），
-        所以依赖清单**存在两份**。只改一处 → 本地 venv 能跑而容器起不来（或反之），
-        而且不会有任何东西报错 —— 又是"多处副本必然漂移"那一类。
-
-        顺带钉住"构建必须可指定镜像源"：直连 pypi.org 在国内网络下会间歇性吃
-        TLS 握手中断（`SSLEOFError ... UNEXPECTED_EOF_WHILE_READING`），
-        表现为 `No matching distribution found`（看着像包不存在，其实是网络）。
-        """
+    def test_dockerfile_uses_the_project_dependency_lock(self):
+        """容器必须使用同一份锁，而不是复制一份最低版本清单并安装最新包。"""
         import re
         import tomllib
         root = self._root()
         deps = tomllib.loads((root / "pyproject.toml").read_text(encoding="utf-8"))["project"]["dependencies"]
         df = (root / "Dockerfile").read_text(encoding="utf-8")
 
-        m = re.search(r"RUN pip install(.*?)(?=\n[A-Z]|\Z)", df, re.S)
-        self.assertIsNotNone(m, "Dockerfile 里找不到 pip install 步骤")
-        block = m.group(1)
-        # 排除 `"$PIP_INDEX_URL"` 这类变量引用，只留真正的包规格
-        listed = [s for s in re.findall(r'"([^"]+)"', block) if not s.startswith("$")]
-        self.assertEqual(sorted(d.strip() for d in listed),
-                         sorted(d.strip() for d in deps),
-                         "Dockerfile 的依赖清单与 pyproject 漂了 —— 两处必须一致")
-        self.assertIn("PIP_INDEX_URL", df,
-                      "构建没提供可覆盖的镜像源 → 国内网络下会间歇性装不上依赖")
+        self.assertIn('COPY pyproject.toml uv.lock ./', df)
+        self.assertIn('uv sync --frozen --no-dev --no-install-project', df)
+        self.assertNotIn('RUN pip install', df)
+        self.assertIn('/app/.venv/bin:', df)
+        lock = tomllib.loads((root / 'uv.lock').read_text(encoding='utf-8'))
+        project = next(p for p in lock['package'] if p['name'] == 'workbuddy2api')
+        expected = sorted(re.split(r'[\[<>=!~]', d)[0].lower() for d in deps)
+        self.assertEqual(sorted(p['name'] for p in project['dependencies']), expected)
 
     def test_database_records_which_version_it_migrated_from(self):
         """`Database.migrated_from`：旧库有值、新库为 None。
