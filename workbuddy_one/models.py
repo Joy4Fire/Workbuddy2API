@@ -1,8 +1,7 @@
 """模型目录服务：从上游动态拉取可用模型并缓存。
 
 参考 Sliverkiss 的 fetchDynamicModels：
-  - GET {backend}{catalog_path}（国内版 /console/enterprises/personal/models，
-    国际版 /v2/enterprises/personal/models，见 region.py）
+  - 合并区域插件目录与官方客户端 /v3/config，只由同区域健康账号获取
   - 取 agents[] 中 name=="cli" 的模型 ID，过滤 disabled，附加上下文/最大输出元数据
   - 1h 正向缓存 + 5min 失败负缓存，避免反复打上游
   - 拉取失败回退到最后一份成功缓存
@@ -72,6 +71,8 @@ class ModelRegistry:
         self._fetched_at: float = 0.0
         self._last_fail: float = 0.0
         self._source: str = "static"   # 当前模型来源：dynamic=上游拉取, static=静态兜底
+        # 各账号、各接口单独保留成功快照，单一路故障不能砍掉另一来源的专属模型。
+        self._catalog_cache: dict[tuple[str, str, str], list] = {}
 
     def _ttl(self) -> int:
         """当前 TTL（秒）：优先读数据库设置 model_ttl_min（分钟），否则用默认值。
@@ -223,30 +224,61 @@ class ModelRegistry:
             return [dict(m) for m in (self._models or [])]
 
     def _fetch_one(self, account) -> list[tuple[dict, dict]] | None:
-        """从单个账号拉取其所在区域的模型目录。失败返回 None（并给该账号上冷却）。"""
+        """合并同一账号的插件与客户端目录，客户端元数据优先。"""
         try:
             headers = account.mgr.get_headers()
             domain = headers.get("X-Domain") or config.domain
-            # Origin/Referer 与模型目录路径都必须按区域选：国际版的 console 路径是
-            # OIDC 页面（302 跳 Keycloak / 认证后 500 HTML），国内版反之。
+            if region.detect_region(domain).id != account.region_id:
+                # 区域标签与实际凭据不符时拒绝入库，不能把另一区域数据冒充当前来源。
+                logger.warning("模型目录账号区域与凭据不符，跳过")
+                return None
             headers.setdefault("Origin", region.origin(domain))
             headers.setdefault("Referer", region.origin(domain) + "/")
-            url = f"{region.chat_base(domain)}{region.catalog_path(domain)}"
-            with net.client(timeout=20) as client:
-                resp = client.get(url, headers=headers)
-                if resp.status_code != 200:
-                    logger.warning("models api status %d (%s)", resp.status_code, account.uid)
-                    self.pool.on_failure(account.uid, 60)
-                    return None
-                data = resp.json()
         except Exception as e:  # noqa: BLE001
-            logger.warning("models fetch error %s: %s", account.uid, e)
+            logger.warning("模型目录凭据获取失败：%s", type(e).__name__)
             self.pool.on_failure(account.uid, 60)
             return None
+        merged = {}
+        fresh = False
+        # 旧目录保留既有模型，新目录补齐 DeepSeek 等客户端模型，并覆盖同 ID 的元数据。
+        for path in (region.catalog_path(domain), "/v3/config"):
+            key = (account.region_id, account.uid, path)
+            fetched = None
+            try:
+                with net.client(timeout=20) as client:
+                    resp = client.get(f"{region.chat_base(domain)}{path}", headers=headers)
+                    if resp.status_code == 200:
+                        fetched = self._parse_catalog(resp.json())
+            except Exception as e:  # noqa: BLE001
+                logger.warning("模型目录接口 %s 获取失败：%s", path, type(e).__name__)
+            with self._lock:
+                if fetched:
+                    self._catalog_cache[key] = fetched
+                    fresh = True
+                entries = fetched or self._catalog_cache.get(key, [])
+            for entry, meta in entries:
+                # 合并阶段会修改 reasoning；不能污染按来源保存的成功快照。
+                copied = dict(entry)
+                copied["reasoning"] = dict(entry.get("reasoning") or {})
+                merged[entry["id"]] = (copied, (meta[0], dict(meta[1])))
+        if not fresh:
+            # 全部来源失败不能伪装为刷新成功；交给区域缓存与失败退避兜底。
+            self.pool.on_failure(account.uid, 60)
+            return None
+        return list(merged.values()) or None
 
-        d = (data.get("data") or {}) if isinstance(data, dict) else {}
+    @classmethod
+    def _parse_catalog(cls, data) -> list[tuple[dict, dict]] | None:
+        """两路接口共享白名单、禁用位及元数据解析，拒绝畸形或业务错误响应。"""
+        if not isinstance(data, dict) or data.get("code") not in (None, 0, "0"):
+            return None
+        d = data.get("data")
+        if not isinstance(d, dict):
+            return None
         models = d.get("models") or []
         agents = d.get("agents") or []
+        if not isinstance(models, list) or not isinstance(agents, list):
+            return None
         # 取 cli agent 的模型 ID
         cli_ids: list[str] = []
         for ag in agents:
@@ -255,13 +287,17 @@ class ModelRegistry:
                 break
         if not cli_ids:
             return None
+        if not isinstance(cli_ids, list):
+            return None
         dyn = {m.get("id"): m for m in models if isinstance(m, dict) and m.get("id")}
         out: list[tuple[dict, dict]] = []
         for mid in cli_ids:
+            if not isinstance(mid, str):
+                continue
             m = dyn.get(mid)
             if not m or m.get("disabled"):
                 continue
-            entry = self._entry(mid, m.get("name", mid), *_capacity(m))
+            entry = cls._entry(mid, m.get("name", mid), *_capacity(m))
             entry["reasoning"] = _extract_reasoning(m)
             entry.update(_extract_caps(m))
             out.append((entry, (mid, _extract_reasoning(m))))
@@ -325,6 +361,8 @@ class ModelRegistry:
         """
         by_region: dict[str, list] = {}
         for acc in self.pool.accounts:
+            if not getattr(acc, "enabled", True) or getattr(acc, "auto_disabled_reason", ""):
+                continue
             by_region.setdefault(acc.region_id, []).append(acc)
 
         prev_by_region = self._entries_by_region()
@@ -340,7 +378,10 @@ class ModelRegistry:
         fresh: set[str] = set()
         stale: set[str] = set()
         for rid in sorted(by_region):
-            acc = self.pool.pick(regions={rid})
+            # 推理选号的 regions 是软过滤，会跨区兜底；目录来源必须严格匹配区域。
+            now = time.time()
+            acc = next((a for a in by_region[rid]
+                        if not callable(getattr(a, "healthy", None)) or a.healthy(now)), None)
             fetched = self._fetch_one(acc) if acc is not None else None
             if not fetched and acc is not None:
                 # 每区域**最多重试一次**。一次瞬时 TLS 失败

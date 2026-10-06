@@ -1,6 +1,6 @@
 # WorkBuddy2API
 
-当前版本 **0.6.2 / schema v8**。本轮完成参考更新吸收、管理界面并发响应、低价路由，以及换号归属、截断校验、并发名额和设置事务修复。升级与验证见 [发布说明](docs/发布说明-0.6.2.md)。
+当前版本 **0.6.3 / schema v8**。模型目录合并插件与官方客户端来源，补齐 DeepSeek；目录拉取严格使用同区域健康账号，修复跨区域回退导致的区域与报价误标。升级与验证见 [模型目录修复说明](docs/模型目录修复-0.6.3.md)。此前的并发响应与低价路由修复见 [0.6.2 发布说明](docs/发布说明-0.6.2.md)。
 
 > 单用户专属的 WorkBuddy API 网关：把腾讯 WorkBuddy / CodeBuddy 额度封装为标准 **OpenAI Chat + Responses + Anthropic Messages 三协议 API**，附带 **SQLite 记录** 与 **Vue3 管理 WebUI**。
 

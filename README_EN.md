@@ -1,6 +1,6 @@
 # WorkBuddy2API
 
-Current version: **0.6.2 / schema v8**. This release unifies streaming and non-streaming failover, attributes retry failures to the actual account, validates truncated streams, enforces connection slot ownership, saves settings atomically, and bounds SSE buffering. It also includes responsive admin reads and cross-region price routing. See [release notes](docs/发布说明-0.6.2.md).
+Current version: **0.6.3 / schema v8**. Model discovery merges plugin and official client catalogs to include DeepSeek. Catalog fetching now uses healthy accounts from the requested region, preventing incorrect region and price labels during cross-region fallback. See [catalog fix notes](docs/模型目录修复-0.6.3.md) and the earlier [0.6.2 reliability release](docs/发布说明-0.6.2.md).
 
 Version 0.6.0 adds Responses `incomplete` terminal states, cache/reasoning token details, preserved image history and tool screenshots, bounded check-in processing retries, and a manual version check under Settings. See [the reference update audit](docs/参考项目更新评估-2026-10-02.md) for pinned upstream evidence and adoption decisions.
 
