@@ -8,4 +8,4 @@
 # 为什么专门强调：改动前有 4 处独立副本，其中 `frontend/package.json` 已经漂到
 # 0.4.0 而后端是 0.4.1 —— 多处副本必然漂移，而且漂移了没有任何东西会报错。
 # `tests/test_policy.py::TestVersionSingleSource` 会钉住这件事。
-__version__ = "0.6.3"
+__version__ = "0.6.4"

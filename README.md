@@ -1,6 +1,6 @@
 # WorkBuddy2API
 
-当前版本 **0.6.3 / schema v8**。模型目录合并插件与官方客户端来源，补齐 DeepSeek；目录拉取严格使用同区域健康账号，修复跨区域回退导致的区域与报价误标。升级与验证见 [模型目录修复说明](docs/模型目录修复-0.6.3.md)。此前的并发响应与低价路由修复见 [0.6.2 发布说明](docs/发布说明-0.6.2.md)。
+当前版本 **0.6.4 / schema v8**。修复设置 `ADMIN_TOKEN` 后局域网访问仍被 Host 校验拦截的问题，Compose 自动透传 Token，兼容 IPv6 回环访问。升级与验证见 [0.6.4 发布说明](docs/发布说明-0.6.4.md)。模型目录合并与区域修复见 [模型目录修复说明](docs/模型目录修复-0.6.3.md)。
 
 > 单用户专属的 WorkBuddy API 网关：把腾讯 WorkBuddy / CodeBuddy 额度封装为标准 **OpenAI Chat + Responses + Anthropic Messages 三协议 API**，附带 **SQLite 记录** 与 **Vue3 管理 WebUI**。
 
@@ -132,7 +132,9 @@ clone 后按以下步骤开始使用：
 ### 管理端点（`/admin/*`）
 
 单用户一体化，默认**仅允许本机回环访问**（无需 Token）。
-如需从局域网/公网访问，设置 `ADMIN_TOKEN`（`Bearer <token>` 或 `X-Admin-Token` 头）。
+如需从局域网/公网访问，设置 `ADMIN_TOKEN`，并让服务监听 `HOST=0.0.0.0`。
+Docker bridge 模式可继续使用：在项目 `.env` 中填写 `ADMIN_TOKEN=<随机长字符串>`，然后执行 `docker-compose up -d --build --force-recreate`；Compose 已配置监听地址、端口映射及 Token 透传。
+打开 `http://<宿主机局域网IP>:8787/` 后，在 WebUI 右上角「Token 管理」填入同一个值。页面与静态资源可直接加载，管理接口仍要求 `Bearer <token>` 或 `X-Admin-Token` 头；推理接口仍使用应用 API Key。
 
 | 端点 | 说明 |
 |---|---|

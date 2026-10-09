@@ -3,7 +3,7 @@
 > 本文件面向 AI 编码代理，读完即可安全地修改本项目。
 > **当前待修复问题清单：[CODE_REVIEW_TODO.md](./CODE_REVIEW_TODO.md)**（P0–P3 分级，含位置、修复方案、验收标准——优先按它干活）。
 > 人类向文档：`README.md` / `README_EN.md`。
-> 当前 0.6.3 / schema v8，568 项测试。模型目录严格同区域获取，并合并插件目录与 `/v3/config` 客户端 CLI 白名单，见 `docs/模型目录修复-0.6.3.md`。此前发布行为与验收见 `docs/发布说明-0.6.2.md`。推理与管理并发、低价选号规则见 `docs/并发响应与低价路由修复-2026-10-02.md`；下方旧轮次记录中的成本分层及尚未合并客户端目录的描述是历史行为。实测免费优先属于待决策策略。
+> 当前 0.6.4 / schema v8，574 项测试。ADMIN_TOKEN 局域网访问与 Compose 透传修复见 `docs/发布说明-0.6.4.md`。模型目录严格同区域获取，并合并插件目录与 `/v3/config` 客户端 CLI 白名单，见 `docs/模型目录修复-0.6.3.md`。此前发布行为与验收见 `docs/发布说明-0.6.2.md`。推理与管理并发、低价选号规则见 `docs/并发响应与低价路由修复-2026-10-02.md`；下方旧轮次记录中的成本分层及尚未合并客户端目录的描述是历史行为。实测免费优先属于待决策策略。
 
 ---
 
@@ -99,7 +99,7 @@ Workbuddy2API/
 │   ├── src/styles/           # base.css（布局）+ dark-theme.css（antd 深色覆盖，见 §7 前端要点）
 │   ├── src/types/index.ts    # 后端 /admin/* 响应的 TS 类型（改接口记得同步）
 │   └── dist/                 # 构建产物（跟踪进 git；由后端 app.py 直接伺服；改动前端后必须重新 build，见 §4）
-├── tests/                    # unittest 测试（568 个用例；test_catalog_sources.py 覆盖目录区域/双来源）
+├── tests/                    # unittest 测试（574 个用例；test_security.py 覆盖远程部署与管理鉴权）
 ├── docs/                     # 设计与评估文档（吸收评估、db 迁移、区域 UX、FIX_PLAN）
 ├── scripts/migrate_db.py     # 独立迁移脚本（--check 只查版本）
 ├── data/                     # 运行时数据：workbuddy.db、attachments/、.secret_key   ←机密，见 §8
@@ -120,7 +120,7 @@ Workbuddy2API/
 # 一切命令在 Workbuddy2API/ 目录下执行；Python 一律用 venv 解释器
 cd N:\代码\workbuddy2Api\Workbuddy2API
 
-# 跑测试（unittest，不是 pytest；568 个必须全绿）
+# 跑测试（unittest，不是 pytest；574 个必须全绿）
 .\.venv\Scripts\python.exe -m unittest discover -s tests
 
 # 本地起服务（开发调试用）
@@ -242,7 +242,7 @@ docker-compose up -d --build --force-recreate
   完全冗余，所以**刻意不塞进 `fetch_streak()` 的返回值**（真要用就反推：
   `tiers[].days − next_tier_remaining`）。
 - **鉴权双轨**：API Key 只存 sha256（`apps` 表）用于校验；`key_enc` 存可逆加密（`_crypto.py`）仅用于 WebUI「查看 Key」功能。主密钥 `data/.secret_key` 丢了则所有 Key 不可还原。
-- **admin 鉴权**：`_security` 中间件 = Host 头回环白名单（防 DNS rebinding）+（可选）ADMIN_TOKEN。无 token 时仅回环可访问管理端（已兼容 Docker 端口映射场景）。**不要放宽**。
+- **admin 鉴权**：未设置 ADMIN_TOKEN 时 Host 只允许 localhost / 127.0.0.1 / [::1]（可带端口，防 DNS rebinding，兼容 Docker 端口映射）。设置 Token 后允许远程加载 WebUI，但所有 `/admin/*` 请求仍需有效 Token；`/v1/*` 仍需应用 API Key。**不要放宽无 Token 的回环限制或跳过管理鉴权**。Compose 自动透传宿主机环境变量或 `.env` 中的 ADMIN_TOKEN，修改后需重建容器。
 - **区域必须成对走对**（`region.py`）：国内版 = `copilot.tencent.com` + `/console/enterprises/personal/models` + Origin `www.codebuddy.cn`；国际版 = `www.workbuddy.ai` + `/v2/enterprises/personal/models` + Origin `www.workbuddy.ai`。三者**不可交叉混用**——国际版打 console 路径会落到 OIDC 页面（302/500 HTML）。区域唯一来源是 auth 文件里的 `auth.domain`，不要引入第二套判定。新增任何出站请求都要用 `region.*(domain)` 取 host/路径，不要直接写死或直接用 `config.backend`（要用 `config.backend_effective`——它才包含 WebUI 里设的覆盖值；`BACKEND` 只是全局覆盖逃生口，默认为空）。
 - **脱敏按区域开关**（`apply_desensitize`）：反审核零宽空格只在国内版账号上施加，国际版没有内容审核、注入只会降低 system prompt 保真度。脱敏必须放在**选号之后**（`open_upstream` 里），不能放回 `enhance_body`——那里账号还未知。
 - **模型 → 区域必须匹配**（混池核心）：两个区域的模型集**大部分不重叠**（实测国际版 18 个 / 国内版 16 个，交集仅 5 个），跨区域用区域专属模型上游会 400（`code=11102 service info not found`）。因此：`models.py` 按区域**分别拉取再合并**并记录 `_model_regions`（模型 → 可用区域集合），`acquire_account` 用 `model_regions()` 把候选账号收敛到正确区域。`regions_for()` 返回**空集表示未知**，此时不要限制区域（否则别名/新模型会直接不可用）；`pool.pick(regions=...)` 在指定区域内无账号时也会**退回不过滤**。
@@ -318,7 +318,7 @@ docker-compose up -d --build --force-recreate
 
 ## 10. 改完之后的自检清单
 
-1. `.\.venv\Scripts\python.exe -m unittest discover -s tests` → **568 个全绿**（现有基线，不允许变红）。
+1. `.\.venv\Scripts\python.exe -m unittest discover -s tests` → **574 个全绿**（现有基线，不允许变红）。
    顺带自查一遍有没有 `ResourceWarning: unclosed database`——测试里开了 `Database` 不关连接会在 GC 时报，
    在 Windows 上还可能让随后的 `unlink` 偶发失败。用 `addCleanup(db._conn.close)` 兜住
    （`tests/test_policy.py` 的 `_open_db()` 就是干这个的）。
@@ -333,7 +333,7 @@ docker-compose up -d --build --force-recreate
 
 ## 11. 当前状态速览（2026-09 快照）
 
-- 版本 **0.6.3**（唯一真源 = `workbuddy_one/__init__.py`，别在别处写死）；568 个测试；当前 8787 由 Docker 部署（见第 9 节的 `docker-compose` 用法）。
+- 版本 **0.6.4**（唯一真源 = `workbuddy_one/__init__.py`，别在别处写死）；574 个测试；当前 8787 由 Docker 部署（见第 9 节的 `docker-compose` 用法）。
 - **2026-10-02 增量吸收**：12 个参考仓库核验为 7 个更新/4 个未变/1 个不可访问，见 `docs/参考项目更新评估-2026-10-02.md` 与同目录 JSON 证据。新增 Responses incomplete 终态、缓存/思考 token 透传、积分保留、多轮图片/工具截图、签到处理中 2/5/10 秒重试、设置页手动版本核验；schema 仍 v7，无新增运行时依赖。
   - `adapters/usage.py` 是协议用量归一化入口：不能再将 cached_tokens/reasoning_tokens 固定写 0，也不能在 conv_usage 中丢掉 credit。
   - Responses 必须有 finish_reason 才发正常终态；length/content_filter 属 incomplete，账号池按成功服务处理；已完成请求的终态 yield 在取消补记 try 之外，防客户端读到终态后关流被重复记为 aborted。

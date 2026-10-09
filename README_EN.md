@@ -1,6 +1,6 @@
 # WorkBuddy2API
 
-Current version: **0.6.3 / schema v8**. Model discovery merges plugin and official client catalogs to include DeepSeek. Catalog fetching now uses healthy accounts from the requested region, preventing incorrect region and price labels during cross-region fallback. See [catalog fix notes](docs/模型目录修复-0.6.3.md) and the earlier [0.6.2 reliability release](docs/发布说明-0.6.2.md).
+Current version: **0.6.4 / schema v8**. Fixes LAN access being rejected by Host validation even with `ADMIN_TOKEN` configured. Compose now forwards the token, and IPv6 loopback access works. See [0.6.4 release notes](docs/发布说明-0.6.4.md) and the earlier [catalog fix notes](docs/模型目录修复-0.6.3.md).
 
 Version 0.6.0 adds Responses `incomplete` terminal states, cache/reasoning token details, preserved image history and tool screenshots, bounded check-in processing retries, and a manual version check under Settings. See [the reference update audit](docs/参考项目更新评估-2026-10-02.md) for pinned upstream evidence and adoption decisions.
 
@@ -136,7 +136,9 @@ Tools/tool_calls and `reasoning_content` (thinking) are supported.
 ### Admin endpoints (`/admin/*`)
 
 Single-user all-in-one: **loopback-only by default** (no token).
-To expose over LAN/public, set `ADMIN_TOKEN` (`Bearer <token>` or `X-Admin-Token` header).
+For LAN/public access, set `ADMIN_TOKEN` and listen on `HOST=0.0.0.0`.
+Docker bridge networking is supported: add `ADMIN_TOKEN=<long random string>` to the project's `.env`, then run `docker-compose up -d --build --force-recreate`. Compose configures the listen address, port mapping, and token forwarding.
+Open `http://<host-LAN-IP>:8787/` and enter the same value in the WebUI's top-right Token Manager. The page and static assets load directly; admin endpoints still require a `Bearer <token>` or `X-Admin-Token` header. Inference endpoints still use application API keys.
 
 | Endpoint | Description |
 |---|---|

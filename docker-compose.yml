@@ -29,9 +29,9 @@ services:
       LOG_LEVEL: "${LOG_LEVEL:-WARNING}"
       # 个人自用（仅本机 localhost 访问）：无需设置 ADMIN_TOKEN。
       # 管理端回环校验已在源码中兼容 Docker 端口映射（Host 为 localhost 即放行）。
-      # 如需从局域网/公网访问，取消下面注释并设置一个随机 token，在 WebUI 右上角
-      # 「Token 管理」里填入即可：
-      # ADMIN_TOKEN: "changeme"
+      # 如需从局域网/公网访问，在宿主机环境变量或 .env 中设置随机 ADMIN_TOKEN，
+      # 重建容器后在 WebUI 右上角「Token 管理」里填入同一个值。
+      ADMIN_TOKEN: "${ADMIN_TOKEN:-}"
     volumes:
       # 持久化宿主机上的运行时数据（数据库/附件/密钥）
       - ./data:/app/data

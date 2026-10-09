@@ -21,6 +21,7 @@ from .scheduler import Scheduler
 from . import __version__
 
 import logging
+import re
 import time
 logger = logging.getLogger("workbuddy_one.app")
 
@@ -144,18 +145,18 @@ def create_app() -> FastAPI:
     # 允许的跨域来源（仅本地开发用 Vite dev server 端口；生产同源无需 CORS）
     _DEV_ORIGINS = {"http://localhost:5173", "http://127.0.0.1:5173"}
 
-    def _is_loopback(host: str) -> bool:
-        return host in ("127.0.0.1", "::1", "localhost", "0.0.0.0")
-
     @app.middleware("http")
     async def _security(request: Request, call_next):
         path = request.url.path
 
-        # Host 头校验：仅允许本机回环 host（防 DNS rebinding / 恶意网站通过域名打到 localhost 管理面）
+        # 未设 token 时保留回环 Host 白名单，防 DNS rebinding；Docker 网桥不改变该规则。
+        # 设了 token 即启用远程访问，页面和静态资源需先加载，管理数据仍由下方鉴权保护。
         host_header = (request.headers.get("Host") or "").strip().lower()
-        host_name = host_header.split(":", 1)[0] if host_header else ""
-        if host_name not in ("127.0.0.1", "::1", "localhost"):
-            return JSONResponse(status_code=403, content={"error": {"message": "Host 不被允许"}})
+        # 按完整 Host 匹配可兼容 IPv6 方括号，并拒绝 localhost.evil.example 等伪装域名。
+        if not config.admin_token and not re.fullmatch(
+                r"(?:localhost|127\.0\.0\.1|\[::1\])(?::[0-9]+)?", host_header):
+            return JSONResponse(status_code=403, content={"error": {
+                "message": "Host 不被允许；局域网/远程访问请在服务端设置 ADMIN_TOKEN 并重启"}})
 
         # 管理接口鉴权（WebUI /admin/*）
         if path.startswith("/admin/"):
@@ -164,16 +165,6 @@ def create_app() -> FastAPI:
                 token = auth[7:].strip() if auth.startswith("Bearer ") else ""
                 if token != config.admin_token and request.headers.get("X-Admin-Token") != config.admin_token:
                     return JSONResponse(status_code=403, content={"error": {"message": "需要有效的 Admin Token"}})
-            else:
-                # 未设置 ADMIN_TOKEN：仅允许本机回环访问管理接口。
-                # 兼容 Docker 端口映射：容器化后客户端 IP 是 Docker 网桥网关（如 172.x.x.1），
-                # 不再等于 127.0.0.1。此时改以“Host 头为回环”为准（上方已校验 Host 只允许
-                # localhost/127.0.0.1/::1，DNS rebinding 防护仍在）；真正的 LAN 直连 Host 会被
-                # 上方拦截，需设 ADMIN_TOKEN 才能从局域网访问。
-                client_host = (request.client.host if request.client else "") or ""
-                if not (_is_loopback(client_host) or _is_loopback(host_name)):
-                    return JSONResponse(status_code=403, content={
-                        "error": {"message": "管理接口仅允许本机访问；局域网访问请设置 ADMIN_TOKEN"}})
 
         # OPTIONS 预检：仅放行允许的跨域来源
         if request.method == "OPTIONS":
